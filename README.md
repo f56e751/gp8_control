@@ -33,8 +33,14 @@ the RL training stack.
   is configured)
 - `esp32_encoder` ROS 2 node publishing `/conveyor/speed` (optional, falls
   back to hardcoded speed)
-- Remote SAM inference server reachable at the IP configured in
-  `app.Config.SERVER_IP`
+- Remote SAM inference server reachable — set its address via env vars
+  before launching:
+  ```bash
+  export GP8_SAM_SERVER_IP=<your-sam-server-ip>
+  export GP8_SAM_SERVER_PORT=7150   # default
+  ```
+  (The public GitHub copy of this repo intentionally ships with
+  `127.0.0.1` as a placeholder so no internal infra IPs leak.)
 - [`uv`](https://astral.sh/uv) for Python venv management
 - ESP32 conveyor encoder on `/dev/ttyUSB0` (user in `dialout` group)
 

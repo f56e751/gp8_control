@@ -57,12 +57,25 @@ from gp8_control.robots.gp8 import GP8
 # Configuration
 # =========================================================================
 
+def _env_default(key: str, default: str) -> str:
+    """Look up a config value from the process environment at import time."""
+    import os as _os  # local import keeps module surface clean
+    return _os.environ.get(key, default)
+
+
 @dataclass
 class Config:
-    # Network
+    # Network — the robot controller uses a private LAN so it's safe to
+    # publish the address. The remote SAM inference IP is a *public* address
+    # on our GPU cluster, so we don't hardcode it in a public repo; set
+    # GP8_SAM_SERVER_IP and GP8_SAM_SERVER_PORT in the launch environment.
     ROBOT_IP: str = "192.168.255.1"
-    SERVER_IP: str = "REDACTED_IP"  # remote SAM inference GPU
-    SERVER_PORT: int = 7150
+    SERVER_IP: str = field(
+        default_factory=lambda: _env_default("GP8_SAM_SERVER_IP", "127.0.0.1")
+    )
+    SERVER_PORT: int = field(
+        default_factory=lambda: int(_env_default("GP8_SAM_SERVER_PORT", "7150"))
+    )
 
     # Workspace
     MAX_REACH: float = 0.65
