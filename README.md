@@ -53,6 +53,11 @@ colcon build --packages-select gp8_control
 
 ## Launch
 
+Needs **two terminals** (plus whatever is already running MotoROS2 /
+micro-ROS Agent / Docker).
+
+### Terminal 1 — bringup (bridge + cameras + MoveIt + gp8_manager)
+
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
@@ -63,6 +68,49 @@ ros2 launch gp8_control gp8_bringup.launch.py
 package's `.venv/bin/python` (found by walking up from the launch file) so
 that torch is available. Override the venv location with
 `GP8_VENV_PYTHON=/path/to/python` if needed.
+
+### Terminal 2 — conveyor encoder (publishes `/conveyor/speed`)
+
+Lives in a sibling package:
+<https://github.com/f56e751/esp32_encoder>
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+ros2 run esp32_encoder conveyor_node
+```
+
+First time only — add the user to `dialout` so the ESP32 USB-UART
+(`/dev/ttyUSB0`) is accessible, then **log out and back in** (group
+changes don't apply to already-running shells):
+
+```bash
+sudo usermod -aG dialout $USER
+```
+
+The encoder node prints a live TUI with belt speed (m/s) and cumulative
+distance, and publishes `/conveyor/speed` (`std_msgs/Float64`) which
+`gp8_manager` subscribes to for conveyor-compensated picking.
+
+If the encoder node is *not* running, `gp8_manager` falls back to
+`Config.CONVEYOR_SPEED` (hardcoded) and logs a warning — picking still
+works but is less accurate when the belt speed drifts.
+
+### Optional: start MotoROS2 micro-ROS Agent (once per boot)
+
+If the agent isn't already running as a system service:
+
+```bash
+sudo docker run -d --rm --net=host --name microros_agent \
+    microros/micro-ros-agent:humble udp4 --port 8888 -v6
+```
+
+Verify the robot connection:
+
+```bash
+sudo docker logs microros_agent 2>&1 | grep -i session
+# should see "session established"
+```
 
 ## Topology
 
