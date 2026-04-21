@@ -17,6 +17,8 @@ Usage:
 
 import os
 import subprocess
+from typing import Dict
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -30,6 +32,27 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
+
+
+def _load_dotenv(path: str) -> Dict[str, str]:
+    """Minimal `.env` parser: KEY=VALUE lines, `#` comments, blank lines.
+
+    No interpolation, no export syntax, no multi-line values. Quotes around
+    the value are stripped. Missing file is silently OK — returns {}.
+    """
+    out: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return out
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
 
 
 def generate_launch_description():
@@ -253,13 +276,33 @@ def generate_launch_description():
 
     _venv_python = _resolve_venv_python()
 
-    # Point PYTHONPATH at ros2_ws/src so `gp8_control` resolves to the live
-    # source tree (no dependency on `iitp_robot_control` anymore).
+    # Load .env from the package source tree (gitignored) so SAM server IP
+    # / port and other infra-specific overrides stay out of the public repo.
+    # Existing process env wins — set GP8_SAM_SERVER_IP before `ros2 launch`
+    # to override whatever is in the file.
+    dotenv_vars = _load_dotenv(os.path.join(_ros2_ws_src, "gp8_control", ".env"))
+    if dotenv_vars:
+        print(
+            f"[gp8_bringup] loaded {len(dotenv_vars)} var(s) from .env: "
+            f"{list(dotenv_vars.keys())}"
+        )
+
+    app_env = {
+        # Point PYTHONPATH at ros2_ws/src so `gp8_control` resolves to the
+        # live source tree (no dependency on `iitp_robot_control` anymore).
+        "PYTHONPATH": _ros2_ws_src + ":" + os.environ.get("PYTHONPATH", ""),
+    }
+    for k, v in dotenv_vars.items():
+        # Don't clobber an already-set value from the launching shell — that
+        # way `GP8_SAM_SERVER_IP=... ros2 launch ...` still takes priority.
+        if k not in os.environ:
+            app_env[k] = v
+
     gp8_app = ExecuteProcess(
         cmd=[_venv_python, "-m", "gp8_control.app"],
         output="screen",
         additional_env={
-            "PYTHONPATH": _ros2_ws_src + ":" + os.environ.get("PYTHONPATH", ""),
+            **app_env,
         },
     )
 
