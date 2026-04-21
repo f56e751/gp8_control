@@ -212,13 +212,18 @@ def generate_launch_description():
     #   1. GP8_VENV_PYTHON environment variable (explicit override)
     #   2. Walk parents of this launch file until we find a `.venv/bin/python`
     #      (works when the package is built with --symlink-install)
-    #   3. Standard developer path `~/Documents/Github/iitp_robot_control/.venv`
+    #   3. Known source-tree locations (this package and the legacy
+    #      iitp_robot_control layout, just in case).
     # =====================================================================
     def _resolve_venv_python() -> str:
         override = os.environ.get("GP8_VENV_PYTHON")
         if override:
             return override
 
+        # 1. Walk up from the real location of this launch file. When colcon
+        #    is built with --symlink-install the install tree points back at
+        #    the package source, so this reaches
+        #    ros2_ws/src/gp8_control/.venv directly.
         launch_dir = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
         d = launch_dir
         for _ in range(10):
@@ -230,15 +235,20 @@ def generate_launch_description():
                 break
             d = parent
 
-        fallback = os.path.expanduser(
-            "~/Documents/Github/iitp_robot_control/.venv/bin/python"
-        )
-        if os.path.isfile(fallback):
-            return fallback
+        # 2. Known standalone package source tree (when colcon copy-build
+        #    puts __file__ inside install/share and the walk-up above can't
+        #    escape back to the repo).
+        for fallback in (
+            os.path.expanduser("~/ros2_ws/src/gp8_control/.venv/bin/python"),
+            os.path.expanduser("~/Documents/Github/iitp_robot_control/.venv/bin/python"),
+        ):
+            if os.path.isfile(fallback):
+                return fallback
 
         raise RuntimeError(
-            "Could not locate .venv/bin/python. Run `uv sync` in the repo "
-            "root or set GP8_VENV_PYTHON to your venv's python."
+            "Could not locate .venv/bin/python. Run `uv sync` inside "
+            "ros2_ws/src/gp8_control or set GP8_VENV_PYTHON to a python "
+            "with torch installed."
         )
 
     _venv_python = _resolve_venv_python()
