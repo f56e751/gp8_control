@@ -1,0 +1,16 @@
+/* Header bar */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.header h1 { font-size: 16px; font-weight: 600; }
+.ws-indicators { display: flex; gap: 14px; }
+.ws-ind { display: flex; align-items: center; gap: 5px; }
+.ws-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4444; transition: background 0.3s; }
+.ws-dot.ok { background: #00ff88; }

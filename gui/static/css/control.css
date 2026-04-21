@@ -1,0 +1,65 @@
+/* Manual Control panel */
+.panel-control {
+  flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-start;
+  gap: 6px; padding: 10px 12px; position: relative;
+  transition: background 0.3s, border-color 0.3s, box-shadow 0.3s;
+}
+.panel-control.active-highlight {
+  background: #1a2a4a;
+  border-color: transparent;
+  animation: glow-border 3s linear infinite;
+}
+@keyframes glow-border {
+  0%   { box-shadow: 0 0 8px #00cc66, inset 0 0 2px #00cc6644; border-color: #00cc66; }
+  33%  { box-shadow: 0 0 8px #4dabf7, inset 0 0 2px #4dabf744; border-color: #4dabf7; }
+  66%  { box-shadow: 0 0 8px #00cc66, inset 0 0 2px #00cc6644; border-color: #00cc66; }
+  100% { box-shadow: 0 0 8px #00cc66, inset 0 0 2px #00cc6644; border-color: #00cc66; }
+}
+
+/* Toggle switch */
+.toggle-row {
+  display: flex; align-items: center; gap: 8px; align-self: flex-start;
+}
+.toggle-label { font-size: 12px; color: #888; font-weight: 600; user-select: none; }
+.toggle-label.on { color: #00ff88; }
+.toggle-switch {
+  position: relative;
+  width: 36px; height: 18px;
+  background: #444;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 0.3s;
+  flex-shrink: 0;
+}
+.toggle-switch.on {
+  background: #00cc66;
+  box-shadow: 0 0 6px #00cc6644;
+}
+.toggle-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 14px; height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.toggle-switch.on::after {
+  transform: translateX(18px);
+}
+
+/* Keyboard layout */
+.key-help { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 12px; align-self: center; }
+.key-row-kb { display: flex; gap: 3px; align-items: center; }
+.key-cell { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.kbd {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 24px;
+  background: #2a2a4a; border: 1px solid #444; border-radius: 4px;
+  font-family: monospace; font-size: 14px; font-weight: 700; color: #ddd;
+  transition: all 0.12s;
+}
+.kbd.space { width: 96px; }
+.kbd.pressed { background: #00cc66; color: #fff; border-color: #00ff88; box-shadow: 0 0 6px #00ff8866; }
+.key-desc { color: #777; font-size: 10px; }
+.kbd-placeholder { width: 28px; height: 24px; }

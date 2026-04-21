@@ -1,0 +1,33 @@
+/* Device Status + Gripper Status */
+.panel-status { flex: 0 0 auto; padding: 0; background: transparent; border: none; }
+.status-row { display: flex; gap: 6px; font-size: 12px; }
+.status-card {
+  flex: 1;
+  background: #16213e;
+  border: 1px solid #0f3460;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.tree { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; line-height: 1.5; }
+.tree-group { margin-bottom: 3px; }
+.tree-label { color: #8888cc; font-weight: 600; font-size: 12px; }
+.tree-item { padding-left: 0; display: flex; align-items: center; justify-content: space-between; font-size: 12px; }
+
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dot.on  { background: #00ff88; box-shadow: 0 0 4px #00ff8866; }
+.dot.off { background: #ff4444; box-shadow: 0 0 4px #ff444466; }
+
+.status-badge {
+  display: inline-block; padding: 1px 7px; border-radius: 9px;
+  font-size: 10px; font-weight: 700; font-family: monospace;
+  line-height: 1.4;
+  transition: all 0.3s;
+}
+.status-badge.online { background: #00ff8822; color: #00ff88; }
+.status-badge.offline { background: #ff444422; color: #ff4444; }
+
+.ee-row { padding-left: 12px; color: #bbb; font-size: 12px; font-family: monospace; }
+
+.suction-badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 700; }
+.suction-badge.on  { background: #00ff8833; color: #00ff88; }
+.suction-badge.off { background: #ff444433; color: #ff4444; }

@@ -1,0 +1,22 @@
+[project]
+name = "gp8_control"
+version = "0.1.0"
+description = "ROS 2 runtime control package for Yaskawa GP8 pick-and-throw (MotoROS2 + name bridge)"
+requires-python = ">=3.10"
+# Runtime dependencies for the non-ROS Python code (torch NN predictor,
+# kinematics, SAM client image handling, etc.). rclpy / cv_bridge /
+# sensor_msgs / motoros2_interfaces come from the system ROS 2 install
+# (source /opt/ros/humble/setup.bash + ros2_ws install) and are *not* listed
+# here — they can't be pip-installed on Humble.
+dependencies = [
+    # Pinned < 2 because cv_bridge (ROS 2 Humble) is compiled against the
+    # numpy 1.x C API; loading numpy 2.x segfaults the first image callback.
+    "numpy<2",
+    "scipy",
+    "torch",
+    "opencv-python",
+]
+
+[tool.uv]
+# `uv sync` creates .venv/ next to this file; launch files auto-detect it
+# by walking up from the launch file location.

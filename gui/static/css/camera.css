@@ -1,0 +1,72 @@
+/* Camera panel */
+.panel-camera {
+  flex: 1;
+  position: relative;
+  background: #0a0a18;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.panel-camera img { width: 100%; height: 100%; object-fit: contain; }
+.camera-overlay {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 0;
+  background: #0a0a18;
+  pointer-events: none;
+  transition: opacity 0.4s;
+}
+.camera-overlay.hidden { opacity: 0; }
+
+/* TV static noise — rendered via canvas */
+.tv-static {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  opacity: 0.35;
+}
+
+/* Scanlines */
+.tv-scanlines {
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0,0,0,0.15) 2px,
+    rgba(0,0,0,0.15) 4px
+  );
+  pointer-events: none;
+}
+
+/* Center text overlay */
+.no-cam-center {
+  position: relative;
+  z-index: 1;
+  display: flex; flex-direction: column;
+  align-items: center; gap: 8px;
+  padding: 20px 36px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid #ff444488;
+  border-radius: 4px;
+}
+.no-cam-text {
+  font-size: 22px;
+  font-weight: 700;
+  color: #ff4444;
+  letter-spacing: 4px;
+  font-family: monospace;
+  animation: no-cam-blink 1.5s ease-in-out infinite;
+}
+.no-cam-sub {
+  font-size: 12px;
+  color: #888;
+  letter-spacing: 1px;
+  font-family: monospace;
+}
+@keyframes no-cam-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

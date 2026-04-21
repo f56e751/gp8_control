@@ -1,0 +1,29 @@
+# Definitions of tags to detect
+# All lengths in meters
+/**:
+  ros__parameters:
+    standalone_tags:
+      [
+        {id: 2, size: 0.05},
+        {id: 10, size: 0.06},
+        {id: 11, size: 0.06},
+        {id: 12, size: 0.06},
+        {id: 13, size: 0.06},
+        {id: 14, size: 0.06},
+        {id: 15, size: 0.06},
+      ]
+    tag_bundles:
+      [
+        {
+          name: 'ROBOT_BASE',
+          layout:
+            [
+              {id: 10, size: 0.06, x: -0.045, y: 0.09},
+              {id: 11, size: 0.06, x: 0.045, y: 0.09},
+              {id: 12, size: 0.06, x: -0.045, y: 0.},
+              {id: 13, size: 0.06, x: 0.045, y: 0.},
+              {id: 14, size: 0.06, x: -0.045, y: -0.09},
+              {id: 15, size: 0.06, x: 0.045, y: -0.09},
+            ]
+        }
+      ]

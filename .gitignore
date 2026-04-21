@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+.env
+*.egg-info/
+
+# colcon build artefacts (also produced outside this tree, but safe to ignore
+# if someone runs from inside the package dir)
+build/
+install/
+log/
+
+.vscode/
+.idea/

@@ -1,0 +1,36 @@
+/* Log terminal */
+.log-wrapper { flex: 0 0 auto; display: flex; flex-direction: column; position: relative; }
+
+.log-resize-handle {
+  height: 6px; cursor: ns-resize;
+  background: #0f3460;
+  border-radius: 4px 4px 0 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.log-resize-handle::after {
+  content: ''; width: 30px; height: 2px;
+  background: #555; border-radius: 1px;
+}
+.log-resize-handle:hover { background: #1a4a80; }
+.log-resize-handle:hover::after { background: #888; }
+
+.log-terminal {
+  padding: 5px 7px;
+  font-size: 12px; font-family: 'Cascadia Code', monospace;
+  background: #0a0a1a; overflow-y: auto; line-height: 1.5;
+  border-radius: 0 0 8px 8px;
+  border: 1px solid #0f3460; border-top: none;
+}
+
+/* Custom scrollbar */
+.log-terminal::-webkit-scrollbar { width: 6px; }
+.log-terminal::-webkit-scrollbar-track { background: transparent; }
+.log-terminal::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+.log-terminal::-webkit-scrollbar-thumb:hover { background: #666; }
+.log-terminal::-webkit-scrollbar-button { display: none; }
+.log-terminal { scrollbar-width: thin; scrollbar-color: #444 transparent; }
+
+.log-line { white-space: pre-wrap; word-break: break-all; }
+.log-line.ok { color: #00ff88; }
+.log-line.err { color: #ff4444; }
+.log-line.info { color: #888; }
