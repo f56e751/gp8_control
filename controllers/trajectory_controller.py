@@ -242,10 +242,11 @@ class TrajectoryController:
         positions[0] 치환 트릭 불필요.
         """
         waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        t_start = time.time()
         if not self._push_waypoints(waypoints):
             return False
-        # 마지막 point time_from_start까지 대기
-        self._wait_trajectory_end(waypoints[-1][2])
+        # 마지막 point time_from_start까지 대기 (push_time만큼 이미 진행됨)
+        self._wait_trajectory_end(waypoints[-1][2], t_start=t_start)
         return True
 
     def send_trajectory_queue_with_release(
@@ -356,6 +357,8 @@ class TrajectoryController:
                 )
                 return False
         if busy_total > 0:
+            # BUSY는 push가 MotoROS2 수신 속도보다 빠를 때 발생하는 정상 신호.
+            # 큐가 깊지 않을 때 흔하며, 재시도로 자연스럽게 흡수됨.
             self._node.get_logger().debug(
                 f"Queue push: {busy_total} BUSY retries across {len(waypoints)} pts"
             )
