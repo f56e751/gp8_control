@@ -13,8 +13,8 @@ SAM/camera/conveyor/AprilTag 의존 없음. 펜던트에서 로봇이 안전하�
   # 먼저 bridge
   ros2 launch gp8_control debug_robot.launch.py
 
-  # 그 다음 throw 테스트
-  ~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.queue_test_throw
+  # 그 다음 throw 테스트 (한 줄)
+  PYTHONPATH=$HOME/ros2_ws/src:$PYTHONPATH ~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.tests.queue_test_throw
 
 ⚠️  주의: 실제 throw 모션입니다 (스윙). 주변 반경 1m 이상 비우고 실행하세요.
 """

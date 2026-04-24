@@ -17,6 +17,7 @@ setup(
         f"{package_name}.mock",
         f"{package_name}.gui",
         f"{package_name}.robots",
+        f"{package_name}.tests",
     ],
     package_dir={
         package_name: ".",
@@ -28,6 +29,7 @@ setup(
         f"{package_name}.mock": "mock",
         f"{package_name}.gui": "gui",
         f"{package_name}.robots": "robots",
+        f"{package_name}.tests": "tests",
     },
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
@@ -53,7 +55,7 @@ setup(
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",
             "terminal_debug = gp8_control.terminal_debug:main",
-            "queue_test = gp8_control.queue_test:main",
+            "queue_test = gp8_control.tests.queue_test:main",
         ],
     },
 )
