@@ -17,8 +17,14 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from builtin_interfaces.msg import Duration
 from rclpy.qos import qos_profile_sensor_data
 from control_msgs.action import FollowJointTrajectory
-from motoros2_interfaces.srv import WriteSingleIO
+from motoros2_interfaces.srv import (
+    QueueTrajPoint,
+    StartPointQueueMode,
+    StartTrajMode,
+    WriteSingleIO,
+)
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 JOINT_NAMES = [
@@ -63,6 +69,25 @@ class TrajectoryController:
         # WriteSingleIO service client (MotoROS2)
         self._io_client = self._node.create_client(
             WriteSingleIO, "/write_single_io",
+            callback_group=cb_group,
+        )
+
+        # Queue Mode clients ---------------------------------------------
+        self._stop_traj_client = self._node.create_client(
+            Trigger, "/stop_traj_mode",
+            callback_group=cb_group,
+        )
+        self._start_traj_client = self._node.create_client(
+            StartTrajMode, "/start_traj_mode",
+            callback_group=cb_group,
+        )
+        self._start_queue_client = self._node.create_client(
+            StartPointQueueMode, "/start_point_queue_mode",
+            callback_group=cb_group,
+        )
+        # bridge가 URDF→raw 번역해서 MotoROS2 /queue_traj_point로 포워딩
+        self._queue_point_client = self._node.create_client(
+            QueueTrajPoint, "/motoman_gp8_controller/queue_traj_point",
             callback_group=cb_group,
         )
 
@@ -159,6 +184,198 @@ class TrajectoryController:
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self._node, result_future)
         return True
+
+    # ------------------------------------------------------------------
+    # Queue Mode (streaming)
+    # ------------------------------------------------------------------
+
+    def enter_queue_mode(self) -> bool:
+        """Trajectory mode 해제 후 Point Queue mode 진입."""
+        self._stop_current_mode()
+        if not self._start_queue_client.wait_for_service(timeout_sec=5.0):
+            self._node.get_logger().error("/start_point_queue_mode unavailable.")
+            return False
+        fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
+        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        res = fut.result()
+        if res is None or res.result_code.value != 1:
+            self._node.get_logger().error(
+                f"start_point_queue_mode failed: "
+                f"{res and res.message or 'timeout'}"
+            )
+            return False
+        self._node.get_logger().info(f"Queue mode entered: {res.message or 'READY'}")
+        return True
+
+    def exit_queue_mode(self) -> bool:
+        """Queue mode → Trajectory mode 복귀 (종료 시 사용)."""
+        self._stop_current_mode()
+        if not self._start_traj_client.wait_for_service(timeout_sec=5.0):
+            return False
+        fut = self._start_traj_client.call_async(StartTrajMode.Request())
+        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        res = fut.result()
+        if res is None or res.result_code.value != 1:
+            return False
+        self._node.get_logger().info("Returned to trajectory mode.")
+        return True
+
+    def _stop_current_mode(self) -> bool:
+        """현재 활성 traj/queue mode 정지. 모드 전환 전 필수."""
+        if not self._stop_traj_client.wait_for_service(timeout_sec=2.0):
+            return False
+        fut = self._stop_traj_client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=5.0)
+        res = fut.result()
+        return bool(res and res.success)
+
+    def send_trajectory_queue(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray | None = None,
+    ) -> bool:
+        """Queue Mode로 trajectory streaming. FJT의 send_trajectory 대체.
+
+        Queue Mode는 INIT_TRAJ_INVALID_STARTING_POS (204) 체크가 없어
+        positions[0] 치환 트릭 불필요.
+        """
+        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        if not self._push_waypoints(waypoints):
+            return False
+        # 마지막 point time_from_start까지 대기
+        self._wait_trajectory_end(waypoints[-1][2])
+        return True
+
+    def send_trajectory_queue_with_release(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray,
+        release_joint: np.ndarray,
+    ) -> bool:
+        """Queue Mode + release_joint 도달 시 suction_off. throw 전용.
+
+        로봇은 첫 point가 큐에 들어가자마자 실행 시작하므로,
+        push 는 최대한 빠르게 하고 동시에 joint_states 모니터링.
+        """
+        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        total_duration = waypoints[-1][2]
+
+        t_start = time.time()
+        if not self._push_waypoints(waypoints):
+            return False
+
+        # 남은 실행 시간 동안 release_joint 도달 감시
+        elapsed = time.time() - t_start
+        remaining = total_duration - elapsed + 0.1
+        if remaining < 0:
+            remaining = 0.1
+        reached = self._wait_for_position(
+            release_joint, tolerance=0.05, timeout_sec=remaining,
+        )
+        self.suction_off()
+        if not reached:
+            self._node.get_logger().warn(
+                f"Release joint not detected within {remaining:.2f}s; "
+                "suction_off fired on timeout fallback."
+            )
+
+        # trajectory 완료까지 대기
+        self._wait_trajectory_end(total_duration, t_start=t_start)
+        return True
+
+    def _build_queue_waypoints(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray | None,
+        extra_time: float = 0.05,
+    ) -> list[tuple[list, list, float]]:
+        """FJT _build_goal과 동일 로직, 단 positions[0] 치환 없음."""
+        positions = traj.T.tolist()
+        velocities = vel.T.tolist()
+        times = timestep.tolist()
+
+        if final_joint is None:
+            final_joint_list = positions[-1]
+        else:
+            final_joint_list = list(final_joint)
+
+        positions.append(final_joint_list)
+        velocities.append([0.0] * 6)
+        times.append(times[-1] + extra_time)
+
+        return list(zip(positions, velocities, times))
+
+    def _push_waypoints(
+        self,
+        waypoints: list[tuple[list, list, float]],
+        busy_retry_delay: float = 0.015,
+        busy_max_retry: int = 5,
+    ) -> bool:
+        """waypoint를 /motoman_gp8_controller/queue_traj_point로 순차 push."""
+        if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
+            self._node.get_logger().error("queue_traj_point service unavailable.")
+            return False
+
+        busy_total = 0
+        for i, (pos, v, t) in enumerate(waypoints):
+            req = QueueTrajPoint.Request()
+            req.joint_names = JOINT_NAMES
+            req.point.positions = [float(x) for x in pos]
+            req.point.velocities = [float(x) for x in v]
+            req.point.time_from_start = _seconds_to_duration(t)
+
+            ok = False
+            for _ in range(busy_max_retry + 1):
+                fut = self._queue_point_client.call_async(req)
+                rclpy.spin_until_future_complete(self._node, fut, timeout_sec=2.0)
+                res = fut.result()
+                if res is None:
+                    self._node.get_logger().error(f"pt {i}: service timeout")
+                    return False
+                code = res.result_code.value
+                if code == 1:  # SUCCESS
+                    ok = True
+                    break
+                if code == 4:  # BUSY
+                    busy_total += 1
+                    time.sleep(busy_retry_delay)
+                    continue
+                self._node.get_logger().error(
+                    f"pt {i}: queue code={code} msg='{res.message}'"
+                )
+                return False
+            if not ok:
+                self._node.get_logger().warn(
+                    f"pt {i}: dropped after {busy_max_retry} BUSY retries"
+                )
+                return False
+        if busy_total > 0:
+            self._node.get_logger().debug(
+                f"Queue push: {busy_total} BUSY retries across {len(waypoints)} pts"
+            )
+        return True
+
+    def _wait_trajectory_end(
+        self,
+        total_duration: float,
+        t_start: float | None = None,
+        tail_buffer: float = 0.1,
+    ) -> None:
+        """time_from_start 기반 trajectory 완료 대기."""
+        if t_start is None:
+            t_start = time.time()
+        remaining = total_duration - (time.time() - t_start) + tail_buffer
+        if remaining > 0:
+            # spin도 같이 돌려 joint_state 캐시 최신화
+            t_end = time.time() + remaining
+            while time.time() < t_end:
+                rclpy.spin_once(self._node, timeout_sec=0.05)
 
     def _wait_for_target(self, target_joint, tolerance: float = 1e-4) -> None:
         """Spin until robot reaches target joint position."""

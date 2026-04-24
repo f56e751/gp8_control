@@ -40,7 +40,6 @@ from gp8_control.perception.apriltag_detector import ApriltagDetector
 from gp8_control.perception.sam_client import SAMClient
 from gp8_control.perception.camera_manager import CameraManager
 from gp8_control.utils.lie_numpy import invSE3
-from motoros2_interfaces.srv import StartTrajMode
 from gp8_control.trajectory.trajectory_primitive import (
     opt_time,
     trajectory,
@@ -333,35 +332,17 @@ class GP8App:
         self.M2 = self.M1 * self.cfg.JOINT_ACCEL_LIMIT_SCALE
 
     def _enable_robot(self) -> None:
-        """Activate MotoROS2's trajectory mode (= servo on + accept FJT goals).
+        """Enable robot in Point Queue Mode (streaming, no start-state check).
 
-        This replaces main_sam7's ``call_rosservice('/robot_enable')`` which
-        depended on ``motoman_driver`` (ROS 1). MotoROS2 exposes
-        ``/start_traj_mode`` instead; success returns MotionReadyEnum.READY = 1.
+        FJT (StartTrajMode)의 INIT_TRAJ_INVALID_STARTING_POS 제약을 피하기 위해
+        Point Queue Mode로 진입. 모든 후속 trajectory 전송은 queue 경로를 탄다.
         """
-        client = self._node.create_client(StartTrajMode, "/start_traj_mode")
-        self._node.get_logger().info("Waiting for /start_traj_mode service...")
-        if not client.wait_for_service(timeout_sec=10.0):
+        self._node.get_logger().info("Enabling robot (point queue mode)...")
+        if not self.traj_ctrl.enter_queue_mode():
             raise RuntimeError(
-                "/start_traj_mode service unavailable; is MotoROS2 up and "
-                "the name bridge connected?"
+                "Failed to enter point queue mode. Check pendant is in REMOTE "
+                "mode with no active alarm and cycle mode AUTO."
             )
-
-        self._node.get_logger().info("Enabling robot (start_traj_mode)...")
-        future = client.call_async(StartTrajMode.Request())
-        rclpy.spin_until_future_complete(self._node, future, timeout_sec=10.0)
-        result = future.result()
-        if result is None:
-            raise RuntimeError("StartTrajMode call timed out.")
-        if result.result_code.value != 1:  # 1 = READY
-            raise RuntimeError(
-                f"StartTrajMode failed: code={result.result_code.value}, "
-                f"msg={result.message}. Check pendant is in REMOTE mode with "
-                f"no active alarm and cycle mode AUTO."
-            )
-        self._node.get_logger().info(
-            f"Trajectory mode enabled: {result.message or 'READY'}"
-        )
         time.sleep(1.0)
 
     def _move_to_initial_pose(self) -> None:
@@ -408,10 +389,10 @@ class GP8App:
             self.M1, self.M2,
             hertz=self.cfg.TRAJ_HZ,
         )
-        self.traj_ctrl.send_trajectory(
+        self.traj_ctrl.send_trajectory_queue(
             traj, vel, timestep, final_joint=initial_joint
         )
-        time.sleep(float(np.sum(timestep)) + 1.0)
+        time.sleep(1.0)
 
     def _wait_for_base_tag(self) -> None:
         time.sleep(0.5)
@@ -638,7 +619,7 @@ class GP8App:
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
         traj_duration = float(np.sum(ts))
-        self.traj_ctrl.send_trajectory(traj, vel, ts, final_joint=grasp_joint)
+        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
         elapsed = time.time() - t_start
 
         observed_overhead = elapsed - traj_duration
@@ -692,7 +673,7 @@ class GP8App:
 
         self._node.get_logger().info(f"Throw T={T:.3f}s eta={eta:.3f}")
 
-        self.traj_ctrl.send_trajectory_with_release(
+        self.traj_ctrl.send_trajectory_queue_with_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=aim_joint2,
             release_joint=pad(release_joint.reshape(1, -1)).ravel(),
@@ -856,6 +837,11 @@ class GP8App:
                     self._node.get_logger().error(f"Epoch {epoch} failed: {e}")
                     time.sleep(0.1)
         finally:
+            try:
+                # queue mode를 걸어둔 채 종료하면 다음 실행 시 FJT가 reject됨
+                self.traj_ctrl.exit_queue_mode()
+            except Exception as e:
+                self._node.get_logger().warn(f"exit_queue_mode failed: {e}")
             self._node.destroy_node()
             rclpy.shutdown()
 
