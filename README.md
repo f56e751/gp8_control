@@ -102,21 +102,24 @@ If the encoder node is *not* running, `gp8_manager` falls back to
 `Config.CONVEYOR_SPEED` (hardcoded) and logs a warning — picking still
 works but is less accurate when the belt speed drifts.
 
-### Optional: start MotoROS2 micro-ROS Agent (once per boot)
+### micro-ROS Agent (once per boot)
 
-If the agent isn't already running as a system service:
-
-```bash
-sudo docker run -d --rm --net=host --name microros_agent \
-    microros/micro-ros-agent:humble udp4 --port 8888 -v6
-```
-
-Verify the robot connection:
+Needed to bridge MotoROS2 ↔ ROS 2. Without it, `/write_single_io` /
+`/start_traj_mode` never appear and nodes hang on *"Waiting for …"*.
 
 ```bash
-sudo docker logs microros_agent 2>&1 | grep -i session
-# should see "session established"
+# 1. Already running?
+sudo docker ps | grep microros_agent
+
+# 2. Start (keep on one line — trailing spaces after \ will break it)
+sudo docker run -d --rm --net=host --name microros_agent microros/micro-ros-agent:humble udp4 --port 8888 -v6
+
+# 3. Verify
+sudo docker logs microros_agent 2>&1 | grep -i session   # "session established"
+ros2 service list | grep write_single_io
 ```
+
+Pendant must be in **REMOTE + AUTO** with no alarms.
 
 ## Topology
 

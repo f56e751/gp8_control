@@ -52,6 +52,7 @@ setup(
             "mock_robot = gp8_control.mock.mock_robot:main",
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",
+            "terminal_debug = gp8_control.terminal_debug:main",
         ],
     },
 )

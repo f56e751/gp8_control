@@ -42,6 +42,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from control_msgs.action import FollowJointTrajectory
+from motoros2_interfaces.srv import QueueTrajPoint
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -126,9 +127,25 @@ class NameBridge(Node):
             callback_group=cb_group,
         )
 
+        # Queue point proxy -----------------------------------------------
+        # /motoman_gp8_controller/queue_traj_point (URDF names)
+        #   → translate joint_names URDF→raw
+        #   → /queue_traj_point (MotoROS2, raw names)
+        self._queue_upstream = self.create_client(
+            QueueTrajPoint, "/queue_traj_point",
+            callback_group=cb_group,
+        )
+        self._queue_server = self.create_service(
+            QueueTrajPoint,
+            "/motoman_gp8_controller/queue_traj_point",
+            self._on_queue_traj_point,
+            callback_group=cb_group,
+        )
+
         self.get_logger().info(
             "Name bridge ready: /joint_states_urdf, "
-            "/motoman_gp8_controller/follow_joint_trajectory"
+            "/motoman_gp8_controller/follow_joint_trajectory, "
+            "/motoman_gp8_controller/queue_traj_point"
         )
 
     # ------------------------------------------------------------------
@@ -221,6 +238,41 @@ class NameBridge(Node):
             goal_handle.abort()
 
         return state["result"] or FollowJointTrajectory.Result()
+
+    # ------------------------------------------------------------------
+    # Queue point proxy
+    # ------------------------------------------------------------------
+
+    def _on_queue_traj_point(self, request, response):
+        """Translate URDF joint_names → raw and forward to MotoROS2."""
+        if not self._queue_upstream.service_is_ready():
+            # queue_traj_point 응답 타입 규약: result_code=UNSPECIFIED fallback
+            # (MotoROS2 QueueResultEnum has no such code; use 3=INIT_FAILURE)
+            response.result_code.value = 3
+            response.message = "Upstream /queue_traj_point not ready."
+            return response
+
+        forwarded = QueueTrajPoint.Request()
+        forwarded.joint_names = [URDF_TO_RAW.get(n, n) for n in request.joint_names]
+        forwarded.point = request.point
+
+        fut = self._queue_upstream.call_async(forwarded)
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=5.0):
+            response.result_code.value = 3
+            response.message = "Upstream /queue_traj_point timed out."
+            return response
+
+        upstream_res = fut.result()
+        if upstream_res is None:
+            response.result_code.value = 3
+            response.message = "Upstream returned None."
+            return response
+
+        response.result_code = upstream_res.result_code
+        response.message = upstream_res.message
+        return response
 
 
 def main() -> None:
