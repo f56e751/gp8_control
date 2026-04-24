@@ -30,7 +30,7 @@ from rclpy.node import Node
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.robots.gp8 import GP8
 from gp8_control.trajectory.predictor import TrajectoryPredictor
-from gp8_control.trajectory.trajectory_primitive import new_trajectory, pad
+from gp8_control.trajectory.trajectory_primitive import new_trajectory, pad, trajectory
 
 
 # app.py Config와 동일
@@ -42,8 +42,14 @@ ETA_MAX = 0.95
 
 # Throw 입력 파라미터 (NN에 넣을 값)
 GRASP_XY_OFFSET = (0.0, 0.0)     # 현재 EE 기준 (상대 좌표 없음 — 절대 xy 사용)
-TARGET_XY = (0.7, 0.0)           # 70cm 전방, 중앙
-TARGET_DISTANCE = 0.5            # 50cm throw distance
+TARGET_XY = (0.0, 0.0)           # 70cm 전방, 중앙
+TARGET_DISTANCE = 1.0            # 50cm throw distance
+
+# Pick→Throw 연속 테스트 파라미터
+JOINT_VEL_SCALE = 0.3            # queue_test.py 와 동일
+JOINT_ACCEL_SCALE = 0.5
+# 현재 EE 위치에서의 오프셋(m) — (dx, dy, dz). 여기로 이동 후 throw 시작.
+PICK_APPROACH_OFFSET = (0, 0.0, -0.1)
 
 
 def _show_throw_plan(
@@ -82,17 +88,13 @@ def test_throw(
     current_T = gp8.forward_kinematics(current_q)
     grasp_xy = (float(current_T[0, 3]), float(current_T[1, 3]))
 
-    # grasp_joint = 현재 위치. aim_joint2 = throw 후 복귀 위치 (작게 뒤로)
+    # grasp_joint = 현재 위치. aim_joint2 = grasp 동일 (제자리 복귀).
+    # 테스트용: net 변위 0 → NN swing arc 자체만 관찰. throw 방향은
+    # 스윙 도중 release 시점의 tip velocity로 결정됨 (grasp→aim 방향이 아님).
     grasp_joint = current_q.copy()
     grasp_joint[-1] = 0.0
-    aim_T = current_T.copy()
-    aim_T[0, 3] -= 0.05  # -5cm X
-    aim_q = gp8.inverse_kinematics(aim_T)
-    if aim_q is None:
-        print("  IK failed for aim pose.")
-        return
-    aim_joint2 = np.asarray(aim_q, dtype=float)
-    aim_joint2[-1] = 0.0
+    aim_T = current_T.copy()          # aim == grasp
+    aim_joint2 = grasp_joint.copy()
 
     # NN 추론
     params = predictor.predict(grasp_xy, TARGET_XY, TARGET_DISTANCE)
@@ -139,6 +141,115 @@ def test_throw(
           f"theoretical={duration:.3f}s, overhead={overhead_ms:+.0f}ms")
 
 
+def test_pick_then_throw(
+    ctrl: TrajectoryController,
+    node: Node,
+    gp8: GP8,
+    predictor: TrajectoryPredictor,
+) -> None:
+    """Phase 1: 현재 → grasp point 이동 / Phase 2: throw 스윙. 연속 실행.
+
+    두 궤적을 back-to-back으로 쏴서 가운데 gap 측정.
+    gap 이 작으면 Queue Mode 연속성이 잘 동작한다는 증거.
+    """
+    # 최신 joint
+    for _ in range(5):
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if ctrl.current_joints is None:
+        print("  No joint states available.")
+        return
+
+    current_q = np.array(ctrl.current_joints)
+    current_T = gp8.forward_kinematics(current_q)
+
+    # ---------- Phase 1: current → grasp point ----------
+    dx, dy, dz = PICK_APPROACH_OFFSET
+    grasp_T = current_T.copy()
+    grasp_T[0, 3] += dx
+    grasp_T[1, 3] += dy
+    grasp_T[2, 3] += dz
+    grasp_q_raw = gp8.inverse_kinematics(grasp_T)
+    if grasp_q_raw is None:
+        print("  IK failed for grasp approach pose.")
+        return
+    grasp_q = np.asarray(grasp_q_raw, dtype=float)
+    grasp_q[-1] = 0.0
+
+    M1 = np.asarray(gp8.velocity_limits, dtype=float) * JOINT_VEL_SCALE
+    M2 = M1 * JOINT_ACCEL_SCALE
+    zero = np.zeros_like(M1)
+    pick_traj, pick_vel, pick_ts = trajectory(
+        current_q, zero, grasp_q, zero, M1, M2, hertz=TRAJ_HZ,
+    )
+    pick_duration = float(pick_ts[-1])
+
+    # ---------- Phase 2: throw (grasp에서 다시 grasp로) ----------
+    # NN 입력 grasp_xy 는 phase 1 도착 지점 기준
+    grasp_xy = (float(grasp_T[0, 3]), float(grasp_T[1, 3]))
+    params = predictor.predict(grasp_xy, TARGET_XY, TARGET_DISTANCE)
+    w = params[:-2].reshape(-1, 5)
+    T = float(np.exp(params[-2])) * THROW_TIME_SCALE
+    eta = 1.0 / (1.0 + np.exp(-params[-1]))
+    eta = float(np.clip(eta - RELEASE_EARLY_SHIFT, ETA_MIN, ETA_MAX))
+
+    n_steps = max(2, int(T * TRAJ_HZ))
+    s = np.linspace(0.0, 1.0, n_steps + 1)
+    s_ext = np.concatenate((s, [eta]))
+
+    traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
+        s_ext, grasp_q[:5], grasp_q[:5], w, T,   # start == end (제자리 스윙)
+    )
+    throw_traj = pad(traj_ext[:-1, :]).T
+    throw_vel = pad(vel_ext[:-1, :]).T
+    throw_ts = ts_ext[:-1]
+    release_joint = traj_ext[-1, :]
+    throw_duration = float(throw_ts[-1])
+
+    # ---------- Show plan ----------
+    print(f"\n=== Pick → Throw Plan ===")
+    print(f"  Phase 1 (pick approach Δ=({dx*100:+.1f}, {dy*100:+.1f}, {dz*100:+.1f})cm): "
+          f"{pick_traj.shape[1]} pts over {pick_duration:.3f}s")
+    print(f"  Phase 2 (throw swing @ grasp pose)     : "
+          f"{throw_traj.shape[1]} pts over {throw_duration:.3f}s")
+    print(f"  NN output: T={T:.3f}s, eta={eta:.3f}")
+    print(f"  Theoretical total (no gap): {pick_duration + throw_duration:.3f}s")
+
+    ans = input("\nExecute? (y/N) > ").strip().lower()
+    if ans != "y":
+        print("  Cancelled.")
+        return
+
+    # ---------- Execute back-to-back ----------
+    t0 = time.time()
+    ok1 = ctrl.send_trajectory_queue(
+        pick_traj, pick_vel, pick_ts, final_joint=grasp_q,
+    )
+    t_phase1_end = time.time()
+    if not ok1:
+        print("  Phase 1 failed.")
+        return
+
+    ok2 = ctrl.send_trajectory_queue_with_release(
+        throw_traj, throw_vel, throw_ts,
+        final_joint=grasp_q,
+        release_joint=pad(release_joint.reshape(1, -1)).ravel(),
+    )
+    t_end = time.time()
+
+    phase1_elapsed = t_phase1_end - t0
+    phase2_elapsed = t_end - t_phase1_end
+    total_elapsed = t_end - t0
+    gap = total_elapsed - pick_duration - throw_duration
+
+    print(f"\n  Phase 1 elapsed: {phase1_elapsed:.3f}s "
+          f"(theoretical {pick_duration:.3f}s, overhead {(phase1_elapsed-pick_duration)*1000:+.0f}ms)")
+    print(f"  Phase 2 elapsed: {phase2_elapsed:.3f}s "
+          f"(theoretical {throw_duration:.3f}s, overhead {(phase2_elapsed-throw_duration)*1000:+.0f}ms)")
+    print(f"  Total elapsed  : {total_elapsed:.3f}s")
+    print(f"  Gap (total - 두 궤적 이론치): {gap*1000:+.0f}ms "
+          f"← pick↔throw 사이 '끊김' 지표 (작을수록 연속적)")
+
+
 def main() -> None:
     rclpy.init()
     node = Node("queue_throw_test")
@@ -176,13 +287,16 @@ def main() -> None:
             print("    Ctrl+C to abort at any prompt.\n")
             while True:
                 print("\n=== Queue Mode Throw Test (torch NN) ===")
-                print("  t: run throw trajectory")
+                print("  t: run throw trajectory (제자리 스윙)")
+                print("  p: pick → throw 연속 (gap 측정)")
                 print("  q: quit (return to FJT mode)")
                 choice = input("select > ").strip().lower()
                 if choice == "q":
                     break
                 elif choice == "t":
                     test_throw(ctrl, node, gp8, predictor)
+                elif choice == "p":
+                    test_pick_then_throw(ctrl, node, gp8, predictor)
                 else:
                     print(f"  unknown: {choice}")
         finally:
