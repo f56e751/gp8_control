@@ -51,6 +51,11 @@ JOINT_ACCEL_SCALE = 0.5
 # 현재 EE 위치에서의 오프셋(m) — (dx, dy, dz). 여기로 이동 후 throw 시작.
 PICK_APPROACH_OFFSET = (0, 0.0, -0.1)
 
+# Dual pick-throw 테스트 파라미터 — 시작 원점(스크립트 실행 시점의 current)
+# 기준으로 두 grasp point 를 설정. throw target은 둘 다 TARGET_XY 공통.
+GRASP1_OFFSET = (0.05, 0.05, -0.1)   # (dx, dy, dz) in meters
+GRASP2_OFFSET = (0.05, -0.05, -0.1)
+
 
 def _show_throw_plan(
     grasp_xy: tuple[float, float],
@@ -250,6 +255,194 @@ def test_pick_then_throw(
           f"← pick↔throw 사이 '끊김' 지표 (작을수록 연속적)")
 
 
+def _build_throw(
+    gp8: GP8,
+    predictor: TrajectoryPredictor,
+    grasp_q: np.ndarray,
+    grasp_xy: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """grasp_q 에서 시작해 제자리 복귀하는 throw 궤적 생성.
+
+    Returns: (traj_throw, vel_throw, timestep_throw, release_joint, T)
+    """
+    params = predictor.predict(grasp_xy, TARGET_XY, TARGET_DISTANCE)
+    w = params[:-2].reshape(-1, 5)
+    T = float(np.exp(params[-2])) * THROW_TIME_SCALE
+    eta = 1.0 / (1.0 + np.exp(-params[-1]))
+    eta = float(np.clip(eta - RELEASE_EARLY_SHIFT, ETA_MIN, ETA_MAX))
+
+    n_steps = max(2, int(T * TRAJ_HZ))
+    s = np.linspace(0.0, 1.0, n_steps + 1)
+    s_ext = np.concatenate((s, [eta]))
+
+    traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
+        s_ext, grasp_q[:5], grasp_q[:5], w, T,
+    )
+    traj_throw = pad(traj_ext[:-1, :]).T
+    vel_throw = pad(vel_ext[:-1, :]).T
+    timestep_throw = ts_ext[:-1]
+    release_joint = pad(traj_ext[-1, :].reshape(1, -1)).ravel()
+    return traj_throw, vel_throw, timestep_throw, release_joint, T
+
+
+def _plan_move(
+    gp8: GP8, q_start: np.ndarray, q_end: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """q_start → q_end 단순 이동 궤적."""
+    M1 = np.asarray(gp8.velocity_limits, dtype=float) * JOINT_VEL_SCALE
+    M2 = M1 * JOINT_ACCEL_SCALE
+    zero = np.zeros_like(M1)
+    return trajectory(q_start, zero, q_end, zero, M1, M2, hertz=TRAJ_HZ)
+
+
+def _offset_pose_to_joint(
+    gp8: GP8, base_T: np.ndarray, offset: tuple[float, float, float],
+) -> np.ndarray | None:
+    """base_T 에서 (dx, dy, dz) 만큼 이동한 pose 의 joint 값. IK 실패 시 None."""
+    T = base_T.copy()
+    T[0, 3] += offset[0]
+    T[1, 3] += offset[1]
+    T[2, 3] += offset[2]
+    q = gp8.inverse_kinematics(T)
+    if q is None:
+        return None
+    q = np.asarray(q, dtype=float)
+    q[-1] = 0.0
+    return q
+
+
+def test_dual_pick_throw(
+    ctrl: TrajectoryController,
+    node: Node,
+    gp8: GP8,
+    predictor: TrajectoryPredictor,
+) -> None:
+    """Origin → grasp1 → throw1 → grasp2 → throw2 → origin 5단계 연속.
+
+    두 grasp point 모두 같은 target (TARGET_XY) 으로 throw.
+    전체 궤적을 back-to-back 으로 쏴서 5개 trajectory 간 gap 측정.
+    """
+    for _ in range(5):
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if ctrl.current_joints is None:
+        print("  No joint states available.")
+        return
+
+    # 원점 = 스크립트 실행 시점의 현재 자세
+    origin_q = np.array(ctrl.current_joints)
+    origin_q_norm = origin_q.copy()
+    origin_q_norm[-1] = 0.0
+    origin_T = gp8.forward_kinematics(origin_q)
+
+    # Grasp 1, 2 joint 계산
+    grasp1_q = _offset_pose_to_joint(gp8, origin_T, GRASP1_OFFSET)
+    grasp2_q = _offset_pose_to_joint(gp8, origin_T, GRASP2_OFFSET)
+    if grasp1_q is None or grasp2_q is None:
+        print(f"  IK failed: grasp1={grasp1_q is not None}, grasp2={grasp2_q is not None}")
+        return
+
+    # 각 grasp 의 XY (NN 입력용)
+    grasp1_T = origin_T.copy()
+    grasp1_T[0, 3] += GRASP1_OFFSET[0]
+    grasp1_T[1, 3] += GRASP1_OFFSET[1]
+    grasp1_T[2, 3] += GRASP1_OFFSET[2]
+    grasp2_T = origin_T.copy()
+    grasp2_T[0, 3] += GRASP2_OFFSET[0]
+    grasp2_T[1, 3] += GRASP2_OFFSET[1]
+    grasp2_T[2, 3] += GRASP2_OFFSET[2]
+
+    grasp1_xy = (float(grasp1_T[0, 3]), float(grasp1_T[1, 3]))
+    grasp2_xy = (float(grasp2_T[0, 3]), float(grasp2_T[1, 3]))
+
+    # 5개 궤적 계획
+    m1_traj, m1_vel, m1_ts = _plan_move(gp8, origin_q, grasp1_q)    # origin → grasp1
+    th1_traj, th1_vel, th1_ts, th1_rel, th1_T = _build_throw(
+        gp8, predictor, grasp1_q, grasp1_xy,                         # throw at grasp1
+    )
+    m2_traj, m2_vel, m2_ts = _plan_move(gp8, grasp1_q, grasp2_q)    # grasp1 → grasp2
+    th2_traj, th2_vel, th2_ts, th2_rel, th2_T = _build_throw(
+        gp8, predictor, grasp2_q, grasp2_xy,                         # throw at grasp2
+    )
+    m3_traj, m3_vel, m3_ts = _plan_move(gp8, grasp2_q, origin_q_norm)  # grasp2 → origin
+
+    durations = [
+        float(m1_ts[-1]), float(th1_ts[-1]),
+        float(m2_ts[-1]), float(th2_ts[-1]),
+        float(m3_ts[-1]),
+    ]
+    total_theoretical = sum(durations)
+
+    print(f"\n=== Dual Pick-Throw Plan ===")
+    print(f"  Grasp1 XY = {grasp1_xy}, offset = {GRASP1_OFFSET}")
+    print(f"  Grasp2 XY = {grasp2_xy}, offset = {GRASP2_OFFSET}")
+    print(f"  Target XY = {TARGET_XY}, distance = {TARGET_DISTANCE}")
+    print(f"  Phases    :")
+    print(f"    1) origin → grasp1 : {m1_traj.shape[1]} pts, {durations[0]:.3f}s")
+    print(f"    2) throw at grasp1 : {th1_traj.shape[1]} pts, {durations[1]:.3f}s (T={th1_T:.3f}s)")
+    print(f"    3) grasp1 → grasp2 : {m2_traj.shape[1]} pts, {durations[2]:.3f}s")
+    print(f"    4) throw at grasp2 : {th2_traj.shape[1]} pts, {durations[3]:.3f}s (T={th2_T:.3f}s)")
+    print(f"    5) grasp2 → origin : {m3_traj.shape[1]} pts, {durations[4]:.3f}s")
+    print(f"  Theoretical total (no gap): {total_theoretical:.3f}s")
+
+    ans = input("\nExecute full cycle? (y/N) > ").strip().lower()
+    if ans != "y":
+        print("  Cancelled.")
+        return
+
+    # 5 phase 연속 실행 + 각 구간 시간 측정
+    phase_names = [
+        "origin→grasp1", "throw1", "grasp1→grasp2", "throw2", "grasp2→origin",
+    ]
+    elapsed_list: list[float] = []
+    t_total_start = time.time()
+
+    # Phase 1
+    t0 = time.time()
+    if not ctrl.send_trajectory_queue(m1_traj, m1_vel, m1_ts, final_joint=grasp1_q):
+        print(f"  Phase 1 ({phase_names[0]}) failed."); return
+    elapsed_list.append(time.time() - t0)
+
+    # Phase 2
+    t0 = time.time()
+    if not ctrl.send_trajectory_queue_with_release(
+        th1_traj, th1_vel, th1_ts, final_joint=grasp1_q, release_joint=th1_rel,
+    ):
+        print(f"  Phase 2 ({phase_names[1]}) failed."); return
+    elapsed_list.append(time.time() - t0)
+
+    # Phase 3
+    t0 = time.time()
+    if not ctrl.send_trajectory_queue(m2_traj, m2_vel, m2_ts, final_joint=grasp2_q):
+        print(f"  Phase 3 ({phase_names[2]}) failed."); return
+    elapsed_list.append(time.time() - t0)
+
+    # Phase 4
+    t0 = time.time()
+    if not ctrl.send_trajectory_queue_with_release(
+        th2_traj, th2_vel, th2_ts, final_joint=grasp2_q, release_joint=th2_rel,
+    ):
+        print(f"  Phase 4 ({phase_names[3]}) failed."); return
+    elapsed_list.append(time.time() - t0)
+
+    # Phase 5
+    t0 = time.time()
+    if not ctrl.send_trajectory_queue(m3_traj, m3_vel, m3_ts, final_joint=origin_q_norm):
+        print(f"  Phase 5 ({phase_names[4]}) failed."); return
+    elapsed_list.append(time.time() - t0)
+
+    total_elapsed = time.time() - t_total_start
+    total_gap = total_elapsed - total_theoretical
+
+    print("\n  === Per-phase elapsed ===")
+    for name, dur, el in zip(phase_names, durations, elapsed_list):
+        overhead = (el - dur) * 1000
+        print(f"    {name:<20s}: {el:.3f}s (theor {dur:.3f}s, overhead {overhead:+.0f}ms)")
+    print(f"\n  Total elapsed         : {total_elapsed:.3f}s")
+    print(f"  Theoretical total     : {total_theoretical:.3f}s")
+    print(f"  Accumulated gap       : {total_gap*1000:+.0f}ms "
+          f"(5개 궤적 사이 전체 끊김 — 작을수록 연속적)")
+
+
 def main() -> None:
     rclpy.init()
     node = Node("queue_throw_test")
@@ -287,8 +480,9 @@ def main() -> None:
             print("    Ctrl+C to abort at any prompt.\n")
             while True:
                 print("\n=== Queue Mode Throw Test (torch NN) ===")
-                print("  t: run throw trajectory (제자리 스윙)")
+                print("  t: throw trajectory (제자리 스윙)")
                 print("  p: pick → throw 연속 (gap 측정)")
+                print("  d: dual pick-throw 사이클 (origin→grasp1→throw→grasp2→throw→origin)")
                 print("  q: quit (return to FJT mode)")
                 choice = input("select > ").strip().lower()
                 if choice == "q":
@@ -297,6 +491,8 @@ def main() -> None:
                     test_throw(ctrl, node, gp8, predictor)
                 elif choice == "p":
                     test_pick_then_throw(ctrl, node, gp8, predictor)
+                elif choice == "d":
+                    test_dual_pick_throw(ctrl, node, gp8, predictor)
                 else:
                     print(f"  unknown: {choice}")
         finally:
