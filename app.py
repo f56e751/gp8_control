@@ -370,7 +370,26 @@ class GP8App:
     # Epoch stages
     # ------------------------------------------------------------------
     def _intake_new_detections(self, now: float) -> None:
-        """Stage 1: poll SAM (subject to frame-gate cooldown)."""
+        """Stage 1: poll SAM (subject to frame-gate cooldown).
+
+        TODO(duplicate-detection): SAM does not emit object identity, so
+        successive frames re-detect the same physical object as new
+        TrackedObjects → robot picks the same item multiple times. The
+        current ``FrameGate`` is a coarse time-based workaround that caps
+        total throughput (1 poll per cooldown_distance/belt_speed seconds)
+        and cannot distinguish "same object" from "new object at similar
+        position". Better fixes, in order of preference:
+          1. Spatial association at intake — match new detection to
+             existing TrackedObject within ε of its conveyor-compensated
+             position; merge instead of adding. Cheap (~15 LOC), removes
+             cooldown, enables EMA pose refinement as a bonus.
+          2. Persistence threshold — require N consecutive frames before
+             locking; combine with (1) for noise rejection.
+          3. **SAM server change** — add per-track identity (ReID feature
+             or tracking ID) to the detection output. May be the cleanest
+             long-term fix; needs upstream cooperation since this client
+             only consumes positions/class_names.
+        """
         v_now = self.conveyor.current
         if not self.frame_gate.should_poll(now, v_now):
             time.sleep(self.cfg.TIME_STEP)
