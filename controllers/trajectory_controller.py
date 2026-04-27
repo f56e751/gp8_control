@@ -249,6 +249,50 @@ class TrajectoryController:
         self._wait_trajectory_end(waypoints[-1][2], t_start=t_start)
         return True
 
+    def send_trajectory_queue_with_attach(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray,
+        attach_target_joint: np.ndarray,
+        attach_tolerance: float = 0.05,
+    ) -> bool:
+        """Queue Mode + attach_target_joint 근접 시 suction_on. pick 전용.
+
+        ROS1 customcontroller.publish_trajectory(suction_on=True) 와 동일한
+        의도: trajectory 실행 중 grasp pose 직전(diff<tolerance)에 미리
+        suction_on을 발사해 공압 지연(밸브 열림 ~ 진공 형성)을 보정.
+        보통 attach_target_joint 는 final_joint 와 동일 (grasp_joint).
+
+        Push 는 최대한 빠르게 하고 동시에 joint_states 모니터링.
+        """
+        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        total_duration = waypoints[-1][2]
+
+        t_start = time.time()
+        if not self._push_waypoints(waypoints):
+            return False
+
+        # 남은 실행 시간 동안 attach_target 근접 감시
+        elapsed = time.time() - t_start
+        remaining = total_duration - elapsed + 0.1
+        if remaining < 0:
+            remaining = 0.1
+        reached = self._wait_for_position(
+            attach_target_joint, tolerance=attach_tolerance, timeout_sec=remaining,
+        )
+        self.suction_on()
+        if not reached:
+            self._node.get_logger().warn(
+                f"Attach target not detected within {remaining:.2f}s; "
+                "suction_on fired on timeout fallback."
+            )
+
+        # trajectory 완료까지 대기
+        self._wait_trajectory_end(total_duration, t_start=t_start)
+        return True
+
     def send_trajectory_queue_with_release(
         self,
         traj: np.ndarray,

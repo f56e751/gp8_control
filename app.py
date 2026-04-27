@@ -121,8 +121,6 @@ class Config:
         [0.0,  0.0, 0.0,  1.0],
     ]))
 
-    SUCTION_ATTACH_WAIT: float = 0.1
-
     def throw_decoding(self) -> ThrowDecodingConfig:
         return ThrowDecodingConfig(
             throw_time_scale=self.THROW_TIME_SCALE,
@@ -322,7 +320,13 @@ class GP8App:
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
         traj_duration = float(np.sum(ts))
-        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+        # Pick: ROS1 customcontroller와 동일하게 grasp pose 직전(diff<0.05)에
+        # 미리 suction_on 발사 — 공압 지연 보정. 도착 후 별도 attach wait 불필요.
+        self.traj_ctrl.send_trajectory_queue_with_attach(
+            traj, vel, ts,
+            final_joint=grasp_joint,
+            attach_target_joint=grasp_joint,
+        )
         elapsed = time.time() - t_start
 
         observed_overhead = elapsed - traj_duration
@@ -460,13 +464,12 @@ class GP8App:
         T_aim2: np.ndarray,
         theta: float,
     ) -> None:
-        """Stage 5: pick → attach suction → throw."""
+        """Stage 5: pick (suction fires mid-trajectory) → throw."""
+        # _execute_pick uses send_trajectory_queue_with_attach, which fires
+        # suction_on while the arm is still approaching (diff<0.05) — matches
+        # ROS1 customcontroller. No post-arrival sleep needed; vacuum has
+        # been forming during the final approach.
         self._execute_pick(current_joint, aim_joint1, grasp_joint1)
-
-        # Suction is toggled here (after the FJT action returns) since
-        # send_trajectory blocks; the brief sleep lets vacuum build.
-        self.traj_ctrl.suction_on()
-        time.sleep(self.cfg.SUCTION_ATTACH_WAIT)
 
         params = self.planner.compute_throw_params(T_grasp1, T_aim2, theta)
         self._execute_transfer(grasp_joint1, aim_joint2, params)
