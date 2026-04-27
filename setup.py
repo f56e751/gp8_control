@@ -17,6 +17,8 @@ setup(
         f"{package_name}.mock",
         f"{package_name}.gui",
         f"{package_name}.robots",
+        f"{package_name}.tracking",
+        f"{package_name}.planning",
         f"{package_name}.tests",
     ],
     package_dir={
@@ -29,6 +31,8 @@ setup(
         f"{package_name}.mock": "mock",
         f"{package_name}.gui": "gui",
         f"{package_name}.robots": "robots",
+        f"{package_name}.tracking": "tracking",
+        f"{package_name}.planning": "planning",
         f"{package_name}.tests": "tests",
     },
     data_files=[
