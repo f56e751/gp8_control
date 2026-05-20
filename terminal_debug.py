@@ -19,6 +19,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from datetime import datetime
@@ -49,6 +50,7 @@ BIG_STEP_SIZE = 0.05      # 5cm (Shift + 키)
 MOVE_DURATION = 0.5       # 이동 시간 (초)
 FAST_MAX_VELOCITY = 1.0   # 최저점/안전높이 이동용 최대 속도 (m/s)
 FAST_MIN_DURATION = 0.3   # 최저점/안전높이 이동 최소 시간 (초)
+FLOOR_SLOW_VELOCITY = 0.3 # 'z' 키 후반(감속) 구간 속도 (m/s)
 SAFE_HEIGHT = 0.10        # 'x' 키 상승 목표 높이 (m)
 ANGLE_STEP = np.radians(5.0)       # 회전 기본 스텝
 BIG_ANGLE_STEP = np.radians(15.0)  # 회전 Shift 스텝
@@ -76,7 +78,7 @@ JOINT_NAMES = [
 WORKSPACE = {
     "x": (0.0, 0.65),
     "y": (-0.65, 0.65),
-    "z": (-0.04, 0.40),
+    "z": (-0.00, 0.40),
 }
 
 
@@ -160,11 +162,12 @@ T_CHAIN_INV = np.linalg.inv(T_CHAIN)
 class RobotDebugger(Node):
     """키보드로 EE 이동 + 석션 제어하는 디버그 노드."""
 
-    def __init__(self) -> None:
+    def __init__(self, floor_z: float | None = None) -> None:
         super().__init__("robot_debugger")
         self._robot = GP8()
         self._suction_on = False
         self._current_joints: list | None = None
+        self._floor_z_override = floor_z
 
         cb_group = ReentrantCallbackGroup()
 
@@ -638,7 +641,7 @@ class RobotDebugger(Node):
         )
 
     def move_to_floor(self) -> None:
-        """EE를 workspace z 최저점까지 현재 자세 유지한 채로 최대 속도로 내림."""
+        """EE를 workspace z 최저점까지 내림. 절반까지는 빠르게, 나머지 절반은 감속."""
         if self._current_joints is None:
             self.get_logger().error("Joint states not available.")
             return
@@ -646,7 +649,7 @@ class RobotDebugger(Node):
         current_q = np.array(self._current_joints)
         current_T = self._robot.forward_kinematics(current_q)
         current_pos = current_T[:3, 3]
-        floor_z = WORKSPACE["z"][0]
+        floor_z = self._floor_z_override if self._floor_z_override is not None else WORKSPACE["z"][0]
 
         if current_pos[2] <= floor_z + 1e-3:
             self.get_logger().info(
@@ -663,12 +666,24 @@ class RobotDebugger(Node):
             return
 
         distance = current_pos[2] - floor_z
-        duration = max(FAST_MIN_DURATION, distance / FAST_MAX_VELOCITY)
+        half = distance * 0.5
+        # 절반 지점은 joint space 선형 보간 — z 단일 축 이동이라 IK 결과와 사실상 일치하고 더 안정적
+        mid_q = (current_q + target_q) * 0.5
 
-        self._send_joint_goal(current_q, target_q, duration)
+        # Phase 1: 절반까지 빠르게
+        t1 = max(FAST_MIN_DURATION, half / FAST_MAX_VELOCITY)
+        self._send_joint_goal(current_q, mid_q, t1)
+
+        # Phase 2: 나머지 절반은 감속해서 천천히. traj[0]은 최신 joint state로 잡아 tolerance 회피
+        for _ in range(5):
+            rclpy.spin_once(self, timeout_sec=0.05)
+        actual_mid_q = np.array(self._current_joints) if self._current_joints is not None else mid_q
+        t2 = max(FAST_MIN_DURATION, half / FLOOR_SLOW_VELOCITY)
+        self._send_joint_goal(actual_mid_q, target_q, t2)
+
         self.get_logger().info(
-            f"[{timestamp()}] EE descended to floor: z={floor_z:.3f} "
-            f"(Δ={distance*100:.1f}cm, {duration:.2f}s)"
+            f"[{timestamp()}] EE descended to floor with decel: z={floor_z:.3f} "
+            f"(Δ={distance*100:.1f}cm, fast {t1:.2f}s + slow {t2:.2f}s)"
         )
 
     def level_suction(self) -> None:
@@ -755,7 +770,15 @@ class RobotDebugger(Node):
 
 def main():
     rclpy.init()
-    node = RobotDebugger()
+    cli_args = rclpy.utilities.remove_ros_args(args=sys.argv)[1:]
+    parser = argparse.ArgumentParser(prog="terminal_debug", add_help=True)
+    parser.add_argument(
+        "-z", "--floor-z", type=float, default=None,
+        help=f"'z' 키로 내려갈 바닥 높이 (m). 기본: WORKSPACE z 최저값 ({WORKSPACE['z'][0]:.2f})",
+    )
+    args = parser.parse_args(cli_args)
+
+    node = RobotDebugger(floor_z=args.floor_z)
 
     if not node.wait_for_servers():
         node.destroy_node()
@@ -784,7 +807,9 @@ def main():
     print(f"  o/l   : Yaw   +/-{np.degrees(ANGLE_STEP):.0f}°   (Shift: +/-{np.degrees(BIG_ANGLE_STEP):.0f}°)")
     print("  SPACE : Suction toggle")
     print("  g     : Gripper level (수직 정렬)")
-    print(f"  z     : Descend to floor z={WORKSPACE['z'][0]:.2f}m (max {FAST_MAX_VELOCITY:.1f} m/s)")
+    _floor_z_print = args.floor_z if args.floor_z is not None else WORKSPACE['z'][0]
+    print(f"  z     : Descend to floor z={_floor_z_print:.2f}m "
+          f"(fast {FAST_MAX_VELOCITY:.1f}→slow {FLOOR_SLOW_VELOCITY:.1f} m/s, decel from halfway)")
     print(f"  x     : Raise to safe height z={SAFE_HEIGHT:.2f}m (max {FAST_MAX_VELOCITY:.1f} m/s)")
     print(f"  h     : Home pose (0.4m forward, tool-down)")
     print(f"  t     : [TEST] Queue Mode X sweep ±{QUEUE_TEST_AMPLITUDE*100:.0f}cm ({QUEUE_TEST_DURATION:.0f}s)")
