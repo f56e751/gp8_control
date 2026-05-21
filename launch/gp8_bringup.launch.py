@@ -3,11 +3,12 @@
 Launches all nodes needed for GP8 pick-and-throw operation:
   1. Robot state publisher (URDF -> TF)
   2. MoveIt 2
-  3. RealSense camera
-  4. Camera calibration publisher
-  5. Image rectification
-  6. AprilTag detector
-  7. Main control app
+  3. Main control app
+
+Perception runs entirely on the camera PC, which exposes an HTTP NDJSON
+detection stream. The robot PC consumes it via the app's
+StreamDetectionSource (set GP8_PERCEPTION_URL), so no local RealSense /
+camera-calibration / AprilTag nodes are launched here.
 
 MotoROS2 runs on the robot controller firmware — no node needed here.
 
@@ -28,7 +29,7 @@ from launch.actions import (
     SetEnvironmentVariable,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
@@ -57,16 +58,6 @@ def _load_dotenv(path: str) -> Dict[str, str]:
 
 def generate_launch_description():
 
-    # Package path for config files
-    # After colcon build: configs are in share/gp8_control/config/
-    # During development with symlink: fall back to source tree
-    try:
-        pkg_share = get_package_share_directory("gp8_control")
-        config_dir = os.path.join(pkg_share, "config")
-    except Exception:
-        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        config_dir = os.path.join(pkg_dir, "config")
-
     # =====================================================================
     # Environment
     # =====================================================================
@@ -90,13 +81,6 @@ def generate_launch_description():
         "robot_ip", default_value="192.168.255.1",
         description="Yaskawa controller IP address",
     )
-    camera_info_path_arg = DeclareLaunchArgument(
-        "camera_info_path",
-        default_value=os.path.join(config_dir, "realsense_camera_info.yaml"),
-        description="Path to camera calibration YAML",
-    )
-
-    camera_info_path = LaunchConfiguration("camera_info_path")
 
     # =====================================================================
     # 1. Robot model (URDF -> TF)
@@ -160,71 +144,13 @@ def generate_launch_description():
     ])
 
     # =====================================================================
-    # 4. RealSense camera
-    # =====================================================================
-    realsense_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            PathJoinSubstitution([
-                FindPackageShare("realsense2_camera"),
-                "launch", "rs_launch.py",
-            ])
-        ]),
-        launch_arguments={
-            "align_depth.enable": "true",
-            "pointcloud.enable": "true",
-            # Default ROS 2 realsense driver publishes under
-            # {camera_namespace}/{camera_name}/... which gives /camera/camera/...
-            # All downstream consumers (apriltag, camera_info_publisher,
-            # sam_client) expect /camera/color/... so collapse the namespace.
-            "camera_namespace": "",
-        }.items(),
-    )
-
-    # =====================================================================
-    # 5. Camera calibration publisher
-    # =====================================================================
-    camera_info_publisher = Node(
-        package="gp8_control",
-        executable="camera_info_publisher",
-        name="camera_info_publisher",
-        namespace="camera/color",
-        parameters=[{
-            "camera_info_path": camera_info_path,
-            "sync_topic": "image_raw",
-        }],
-        output="screen",
-    )
-
-    # =====================================================================
-    # 6. Image rectification — not wired up.
-    # ---------------------------------------------------------------------
-    # The main_sam7 pipeline does all perception on the remote SAM GPU
-    # server using raw images (/camera/color/image_raw) and AprilTag is not
-    # used at runtime, so local rectification would just produce an unused
-    # topic and spam "topics not synchronized" warnings every second. Keep
-    # this note as a reminder in case someone re-enables it; if you do,
-    # remember to also remap `image` → `image_raw` for image_proc.
+    # Perception (RealSense camera, camera-info publisher, AprilTag) runs on
+    # the camera PC, which serves detections over HTTP. Nothing to launch on
+    # the robot PC; the app connects to GP8_PERCEPTION_URL on its own.
     # =====================================================================
 
     # =====================================================================
-    # 7. AprilTag detector
-    # =====================================================================
-    apriltag_node = Node(
-        package="apriltag_ros",
-        executable="apriltag_node",
-        name="apriltag_node",
-        remappings=[
-            ("image_rect", "/camera/color/image_raw"),
-            ("camera_info", "/camera/color/camera_info"),
-        ],
-        parameters=[
-            os.path.join(config_dir, "apriltag_settings.yaml"),
-        ],
-        output="screen",
-    )
-
-    # =====================================================================
-    # 8. Main control app
+    # 3. Main control app
     # ---------------------------------------------------------------------
     # The app imports `torch` (via gp8_control.trajectory.predictor). System
     # python doesn't have torch, so launch it with the repo's uv-managed
@@ -276,10 +202,10 @@ def generate_launch_description():
 
     _venv_python = _resolve_venv_python()
 
-    # Load .env from the package source tree (gitignored) so SAM server IP
-    # / port and other infra-specific overrides stay out of the public repo.
-    # Existing process env wins — set GP8_SAM_SERVER_IP before `ros2 launch`
-    # to override whatever is in the file.
+    # Load .env from the package source tree (gitignored) so the perception
+    # stream URL and other infra-specific overrides stay out of the public
+    # repo. Existing process env wins — set GP8_PERCEPTION_URL before
+    # `ros2 launch` to override whatever is in the file.
     dotenv_vars = _load_dotenv(os.path.join(_ros2_ws_src, "gp8_control", ".env"))
     if dotenv_vars:
         print(
@@ -294,7 +220,7 @@ def generate_launch_description():
     }
     for k, v in dotenv_vars.items():
         # Don't clobber an already-set value from the launching shell — that
-        # way `GP8_SAM_SERVER_IP=... ros2 launch ...` still takes priority.
+        # way `GP8_PERCEPTION_URL=... ros2 launch ...` still takes priority.
         if k not in os.environ:
             app_env[k] = v
 
@@ -312,12 +238,8 @@ def generate_launch_description():
     return LaunchDescription([
         set_pythonpath,
         robot_ip_arg,
-        camera_info_path_arg,
         name_bridge,
         robot_state_publisher,
         moveit_launch,
-        realsense_launch,
-        camera_info_publisher,
-        apriltag_node,
         gp8_app,
     ])

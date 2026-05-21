@@ -17,10 +17,10 @@ the RL training stack.
 | `trajectory/trajectory_primitive.py` | `opt_time`, `trajectory_3points`, `new_trajectory`, etc. |
 | `controllers/trajectory_controller.py` | FJT action client with suction release-on-pass logic. |
 | `controllers/moveit_controller.py` | MoveIt 2 wrapper (used only for initial-pose planning). |
-| `perception/` | SAM ZMQ client, AprilTag subscriber, RealSense camera manager, calibrated CameraInfo publisher. |
+| `perception/` | HTTP NDJSON detection stream client + source adapter, camera→robot intake/transform, conveyor speed tracker. |
 | `mock/mock_robot.py` | Fake MotoROS2 for dev work without the physical robot. |
 | `gui/` | Flask-based web GUI for manual EE jogging and status. |
-| `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, RealSense, AprilTag, `gp8_manager`. |
+| `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, `gp8_manager` (perception streamed from the camera PC). |
 | `launch/debug_robot.launch.py` | Minimal bringup (bridge + TF + MoveIt) for interactive scripts. |
 | `terminal_debug.py` | 키보드 기반 EE jog / 회전 / home / 석션 / Queue Mode sweep / FJT mismatch 테스트 도구. |
 | `tests/queue_test.py` | TrajectoryController Queue 메서드 3가지 시나리오 분리 검증. |
@@ -36,14 +36,15 @@ the RL training stack.
   is configured)
 - `esp32_encoder` ROS 2 node publishing `/conveyor/speed` (optional, falls
   back to hardcoded speed)
-- Remote SAM inference server reachable — set its address via env vars
+- Camera PC's HTTP detection stream reachable — set its URL via env var
   before launching:
   ```bash
-  export GP8_SAM_SERVER_IP=<your-sam-server-ip>
-  export GP8_SAM_SERVER_PORT=7150   # default
+  export GP8_PERCEPTION_URL=http://<camera-pc-ip>:8080/detections/stream
   ```
-  (The public GitHub copy of this repo intentionally ships with
-  `127.0.0.1` as a placeholder so no internal infra IPs leak.)
+  Perception (RealSense + SAM/DINO) runs entirely on the camera PC; the
+  robot PC consumes the NDJSON stream via `StreamDetectionSource`. The
+  public GitHub copy ships with a placeholder URL so no internal infra IPs
+  leak.
 - [`uv`](https://astral.sh/uv) for Python venv management
 - ESP32 conveyor encoder on `/dev/ttyUSB0` (user in `dialout` group)
 
@@ -225,7 +226,7 @@ MotoROS2 (on YRC1000micro)  ─ /joint_states (joint_1..6, BEST_EFFORT)
   gp8_manager (app.py)
    ├─ /joint_states_urdf      (subscribe)
    ├─ /conveyor/speed          (subscribe — esp32_encoder)
-   ├─ SAM ZMQ client → remote GPU
+   ├─ HTTP NDJSON detection stream ← camera PC (GP8_PERCEPTION_URL)
    └─ FJT action → bridge → MotoROS2
 ```
 

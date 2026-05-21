@@ -1,12 +1,15 @@
-"""SAM polling + camera-to-robot pose conversion.
+"""Detection polling + camera-to-robot pose conversion.
 
-Wraps the non-blocking poll of ``SAMClient`` and the per-detection
+Wraps the non-blocking poll of a perception source and the per-detection
 camera→robot transform that used to live as private methods on
 ``GP8App``. The output is a list of ``GraspCandidate`` ready to be added
 to the tracked-object queue.
 
-The caller spins ROS 2 callbacks; this class just pokes the SAM client
-buffers each tick during the polling window.
+The source is duck-typed: it only needs ``.positions`` / ``.class_names`` /
+``.delay`` attributes. Both the old ROS-callback-driven ``SAMClient`` and the
+HTTP-stream ``StreamDetectionSource`` satisfy this. When ``node`` is None
+(the stream source needs no ROS spinning), ``poll`` just reads the latest
+snapshot instead of pumping ROS callbacks.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ class GraspCandidate:
 class DetectionIntake:
     def __init__(
         self,
-        node: Node,
+        node: Node | None,
         sam_client,
         T_robot2base: np.ndarray,
         T_base2cam: np.ndarray,
@@ -97,7 +100,14 @@ class DetectionIntake:
         delay = 0.0
 
         while time.time() - s_time < time_to_check:
-            rclpy.spin_once(self._node, timeout_sec=0.01)
+            if self._node is not None:
+                # Old SAMClient path: pump ROS callbacks so the camera_info
+                # subscription can populate the buffers.
+                rclpy.spin_once(self._node, timeout_sec=0.01)
+            else:
+                # Stream-source path: no ROS callbacks to pump. Pace the loop
+                # so a cold start (no record yet) doesn't busy-wait a core.
+                time.sleep(self._time_step)
             p = self._sam.positions
             n = self._sam.class_names
             if p is not None and n is not None:

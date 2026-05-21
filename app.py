@@ -20,9 +20,7 @@ from rclpy.executors import MultiThreadedExecutor
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
 from gp8_control.controllers.pick_delay_tracker import PickDelayTracker
-from gp8_control.perception.apriltag_detector import ApriltagDetector
-from gp8_control.perception.sam_client import SAMClient
-from gp8_control.perception.camera_manager import CameraManager
+from gp8_control.perception.stream_detection_source import StreamDetectionSource
 from gp8_control.perception.conveyor_speed import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import (
@@ -61,12 +59,14 @@ def _env_default(key: str, default: str) -> str:
 class Config:
     # Network
     ROBOT_IP: str = "192.168.255.1"
-    SERVER_IP: str = field(
-        default_factory=lambda: _env_default("GP8_SAM_SERVER_IP", "127.0.0.1")
+    # Perception is consumed from the camera PC's HTTP NDJSON stream
+    # (see perception/perception_client.py for the wire contract).
+    PERCEPTION_URL: str = field(
+        default_factory=lambda: _env_default(
+            "GP8_PERCEPTION_URL", "http://147.46.175.15:8080/detections/stream"
+        )
     )
-    SERVER_PORT: int = field(
-        default_factory=lambda: int(_env_default("GP8_SAM_SERVER_PORT", "7150"))
-    )
+    PERCEPTION_RECONNECT_DELAY: float = 2.0
 
     # Workspace
     MAX_REACH: float = 0.65
@@ -170,9 +170,7 @@ class GP8App:
         self._executor: MultiThreadedExecutor | None = None
         self.traj_ctrl: TrajectoryController | None = None
         self.moveit_ctrl: MoveItController | None = None
-        self.sam_client: SAMClient | None = None
-        self.apriltag: ApriltagDetector | None = None
-        self.camera: CameraManager | None = None
+        self.detection_source: StreamDetectionSource | None = None
         self.conveyor: ConveyorSpeedTracker | None = None
         self.intake: DetectionIntake | None = None
 
@@ -196,9 +194,12 @@ class GP8App:
 
         self.traj_ctrl = TrajectoryController(self._node)
         self.moveit_ctrl = MoveItController(self._node)
-        self.sam_client = SAMClient(self._node, self.cfg.SERVER_IP, self.cfg.SERVER_PORT)
-        self.apriltag = ApriltagDetector(self._node)
-        self.camera = CameraManager(self._node)
+        self.detection_source = StreamDetectionSource(
+            self.cfg.PERCEPTION_URL,
+            reconnect_delay=self.cfg.PERCEPTION_RECONNECT_DELAY,
+            logger=self._node.get_logger(),
+        )
+        self.detection_source.start()
         self.conveyor = ConveyorSpeedTracker(
             self._node,
             self.cfg.CONVEYOR_TOPIC,
@@ -216,8 +217,8 @@ class GP8App:
         self._node.get_logger().info("Forcing suction OFF at startup.")
         self.traj_ctrl.suction_off()
         self._move_to_initial_pose()
-        # main_sam7 trusts the hardcoded extrinsic; the apriltag node still
-        # runs so verification is possible separately.
+        # main_sam7 trusts the hardcoded extrinsic. Perception now runs on the
+        # camera PC (HTTP stream); no local AprilTag/RealSense handshake here.
         self._node.get_logger().info(
             "Using hardcoded T_base2cam (no AprilTag handshake)."
         )
@@ -245,9 +246,11 @@ class GP8App:
         )
 
     def _build_intake(self) -> None:
+        # node=None: the stream source is fed by its own background thread,
+        # so poll() reads the latest snapshot without pumping ROS callbacks.
         self.intake = DetectionIntake(
-            node=self._node,
-            sam_client=self.sam_client,
+            node=None,
+            sam_client=self.detection_source,
             T_robot2base=self.cfg.T_ROBOT2BASE,
             T_base2cam=self.cfg.T_BASE2CAM.copy(),
             offset_aim=self.cfg.DETECTION_OFFSET_AIM,
@@ -497,6 +500,12 @@ class GP8App:
     # Main loop
     # ------------------------------------------------------------------
     def run_epoch(self, epoch: int) -> None:
+        # Pump ROS callbacks so joint_states and conveyor speed stay fresh.
+        # Previously DetectionIntake.poll() spun every epoch; with the HTTP
+        # stream source it no longer does, so this is now the only spin on
+        # idle epochs (trajectory execution still spins during pick/throw).
+        rclpy.spin_once(self._node, timeout_sec=0.0)
+
         current_joint_list = self.traj_ctrl.current_joints
         if current_joint_list is None:
             self._node.get_logger().warn("Joints not available yet.")
