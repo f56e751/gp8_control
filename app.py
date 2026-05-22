@@ -84,6 +84,11 @@ class Config:
     FIXED_DELAY_THROW: float = 0.2
     DELAY_EMA_ALPHA: float = 0.3
 
+    # Pick-lead convergence guard: cap on how far ahead (seconds) plan_pick
+    # projects the object before aiming. Bounds the fixed-point iteration so
+    # it can't diverge to the reach boundary. Set near the real pick time.
+    MAX_PICK_LEAD: float = 1.2
+
     # Trajectory sampling / joint limit scales
     TRAJ_HZ: float = 20.0
     JOINT_VEL_LIMIT_SCALE: float = 0.8
@@ -243,6 +248,7 @@ class GP8App:
             max_reach=self.cfg.MAX_REACH,
             target_distance=self.cfg.TARGET_DISTANCE,
             decoding=self.cfg.throw_decoding(),
+            max_pick_lead=self.cfg.MAX_PICK_LEAD,
         )
 
     def _build_intake(self) -> None:

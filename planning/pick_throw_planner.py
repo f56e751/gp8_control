@@ -69,6 +69,9 @@ class PickThrowPlanner:
         max_reach: float,
         target_distance: float,
         decoding: ThrowDecodingConfig,
+        max_pick_lead: float = 1.2,
+        lead_relax: float = 0.5,
+        lead_iters: int = 5,
     ) -> None:
         self.robot = robot
         self.predictor = predictor
@@ -77,6 +80,11 @@ class PickThrowPlanner:
         self.max_reach = max_reach
         self.target_distance = target_distance
         self.decoding = decoding
+        # Pick-lead convergence guards (prevent the fixed-point iteration in
+        # plan_pick from diverging — see that method for the mechanism).
+        self.max_pick_lead = max_pick_lead   # cap on the predictive lead [s]
+        self.lead_relax = lead_relax         # under-relaxation factor (0,1]
+        self.lead_iters = lead_iters         # max fixed-point iterations
 
     # ------------------------------------------------------------------
     # Pick (main_sam7.dynamic_adjustments)
@@ -108,9 +116,22 @@ class PickThrowPlanner:
         wait_time = None
         neg_wait_time = None
 
-        traj_time = 1.0  # initial estimate
-        for _ in range(3):
-            offset = traj_time + fixed_delay
+        # Fixed-point iteration for the lead time. ``traj_time`` is how far
+        # ahead we project the object before aiming; that projection sets the
+        # arm pose, whose opt_time becomes the next ``traj_time``. Without
+        # guards this positive feedback diverges: a larger lead pushes the
+        # aim toward the reach boundary, inflating opt_time, inflating the
+        # lead again (observed: 1s -> 2s -> 3.5s -> 4.5s). Two guards fix it:
+        #   1. cap the lead used for projection (``max_pick_lead``) so the aim
+        #      can never run away to the boundary — bounds opt_time, kills the
+        #      feedback;
+        #   2. under-relax so the estimate converges smoothly instead of
+        #      jumping each iteration.
+        traj_time = min(1.0, self.max_pick_lead)  # initial estimate, within cap
+        prev_traj_time = None
+        for _ in range(self.lead_iters):
+            lead = min(traj_time, self.max_pick_lead)
+            offset = lead + fixed_delay
             T_aim_pred = T_aim_base.copy()
             T_aim_pred[1, 3] -= v * offset
             T_grasp_pred = T_grasp_base.copy()
@@ -132,7 +153,14 @@ class PickThrowPlanner:
             zero = np.zeros_like(self.M1)
             traj_time1 = opt_time(current_joint, zero, aim_j, zero, self.M1, self.M2)
             traj_time2 = opt_time(aim_j, zero, grasp_j, zero, self.M1, self.M2)
-            traj_time = traj_time1 + traj_time2
+            new_traj_time = traj_time1 + traj_time2
+
+            # under-relaxation: blend toward the new estimate
+            traj_time = (1.0 - self.lead_relax) * traj_time + self.lead_relax * new_traj_time
+
+            if prev_traj_time is not None and abs(traj_time - prev_traj_time) < 1e-3:
+                break
+            prev_traj_time = traj_time
 
         return T_aim_tmp, T_grasp_tmp, traj_time, wait_time, neg_wait_time
 
