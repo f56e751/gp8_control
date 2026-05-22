@@ -98,6 +98,11 @@ class Config:
     #   "moving" — legacy predictive-intercept pick (plan_pick + lock).
     PICK_STRATEGY: str = "ambush"
     GRASP_INTERCEPT_Y: float = 0.0      # belt-frame Y where the arm waits [m]
+    # Grasp height [m]: belt-surface contact Z, anchored to a manually
+    # verified pose (terminal_debug: EE x=0.508 y=0.000 z=0.067, suction ON).
+    # Overrides the often-noisy detected Z; the approach (aim) keeps its
+    # relative height above this.
+    GRASP_Z: float = 0.067
     SUCTION_LEAD: float = 0.05          # fire suction this early (pneumatic lag) [s]
     AMBUSH_MAX_WAIT: float = 12.0       # give up waiting for arrival after this [s]
 
@@ -452,12 +457,16 @@ class GP8App:
             )
             return
 
-        # Freeze belt-Y to the intercept line; X/Z (lateral, height) are
-        # unchanged by travel along Y, so the detected values still hold.
+        # Freeze belt-Y to the intercept line; keep the detected lateral X.
+        # Anchor grasp height to GRASP_Z (detected Z is noisy) and preserve the
+        # approach pose's relative height above the grasp.
         T_grasp = target.T_grasp_base.copy()
-        T_grasp[1, 3] = intercept_y
         T_aim = target.T_aim_base.copy()
+        approach_dz = T_aim[2, 3] - T_grasp[2, 3]
+        T_grasp[1, 3] = intercept_y
         T_aim[1, 3] = intercept_y
+        T_grasp[2, 3] = self.cfg.GRASP_Z
+        T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
 
         if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
             self.queue.pop_head()
