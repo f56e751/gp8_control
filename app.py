@@ -564,33 +564,39 @@ class GP8App:
         )
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
 
+    def _sleep_until(self, deadline: float) -> None:
+        """Block until ``deadline`` (wall clock), staying responsive to shutdown."""
+        while rclpy.ok() and time.time() < deadline:
+            time.sleep(min(0.05, deadline - time.time()))
+
     def _wait_for_arrival_and_suction(
         self, target: TrackedObject, intercept_y: float
     ) -> None:
-        """One-shot wait: compute arrival time once (remaining distance / belt
-        speed), sleep that long, then fire suction.
+        """One-shot wait, parked at the grasp pose. Suction fires SUCTION_LEAD
+        seconds before the object arrives so the vacuum is already pulling, but
+        this method only returns at the predicted arrival — so the caller's
+        lift/throw motion starts on time (at eta), not early.
 
-        No per-tick recompute — the eta is fixed at the start using the belt
-        speed sampled now. Assumes the belt speed stays roughly constant during
-        the wait (true for a steady conveyor); if it varies a lot, an encoder
-        distance-integration trigger would be more accurate.
+        eta is computed once here from remaining distance / belt speed sampled
+        now (no per-tick recompute). Assumes a roughly steady belt.
         """
         now = time.time()
         v = self.conveyor.current
         obj_y = self._object_y_now(target, now, v)
-        wait_time = (obj_y - intercept_y) / (v + 1e-6) - self.cfg.SUCTION_LEAD
-        wait_time = max(0.0, min(wait_time, self.cfg.AMBUSH_MAX_WAIT))
+        eta = (obj_y - intercept_y) / (v + 1e-6)
+        eta = max(0.0, min(eta, self.cfg.AMBUSH_MAX_WAIT))
+        lead = min(self.cfg.SUCTION_LEAD, eta)   # can't fire before now
         self._node.get_logger().info(
-            f"Ambush wait {wait_time:.2f}s (dist {obj_y - intercept_y:.3f} m / "
-            f"belt {v:.3f} m/s - lead {self.cfg.SUCTION_LEAD:.2f}s), then suction"
+            f"Ambush: suction in {eta - lead:.2f}s, arrival/lift in {eta:.2f}s "
+            f"(dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s, lead {lead:.2f}s)"
         )
 
-        # Sleep in small chunks so the node stays responsive (shutdown/Ctrl-C),
-        # but do NOT recompute the eta — this is the fixed one-shot wait.
-        deadline = now + wait_time
-        while rclpy.ok() and time.time() < deadline:
-            time.sleep(min(0.05, deadline - time.time()))
+        # 1) park until SUCTION_LEAD before arrival, then suction ON (still parked)
+        self._sleep_until(now + eta - lead)
         self.traj_ctrl.suction_on()
+        # 2) keep sucking, parked, until the object actually arrives — then return
+        #    so the lift/throw motion begins at eta.
+        self._sleep_until(now + eta)
 
     # ------------------------------------------------------------------
     # Epoch stages
