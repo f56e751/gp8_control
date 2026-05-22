@@ -104,7 +104,9 @@ class Config:
     # relative height above this.
     GRASP_Z: float = 0.067
     SUCTION_LEAD: float = 0.05          # fire suction this early (pneumatic lag) [s]
-    AMBUSH_MAX_WAIT: float = 12.0       # give up waiting for arrival after this [s]
+    # Must exceed the camera->pick travel time: belt-Y ~2.48 m at ~0.19 m/s
+    # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
+    AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
 
     # Trajectory sampling / joint limit scales
     TRAJ_HZ: float = 20.0
@@ -137,7 +139,10 @@ class Config:
         [0.0, 0.0, 0.0, 1.0],
     ]))
     T_BASE2CAM: np.ndarray = field(default_factory=lambda: np.array([
-        [0.0, -1.0, 0.0, -2.255],
+        # X = -2.245 so a centered detection maps to belt-Y = 2.48 m
+        # (measured camera->pick belt-direction length): 2.245 + 0.235 (the
+        # T_ROBOT2BASE Y offset) = 2.48.
+        [0.0, -1.0, 0.0, -2.245],
         [-1.0, 0.0, 0.0,  0.450],
         [0.0,  0.0, -1.0, 0.650],
         [0.0,  0.0, 0.0,  1.0],
