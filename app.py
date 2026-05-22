@@ -314,8 +314,15 @@ class GP8App:
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
-    def _execute_pick(self, current_joint, aim_joint, grasp_joint) -> None:
-        """Send pick trajectory and update PickDelayTracker with measured overhead."""
+    def _execute_pick(self, current_joint, aim_joint, grasp_joint, plan_time) -> None:
+        """Send pick trajectory and update PickDelayTracker with measured overhead.
+
+        ``plan_time`` is the epoch's ``now`` — the instant the target position
+        was predicted. Logging ``t_start - plan_time`` exposes the planning/IK
+        compute latency that is *not* folded into ``fixed_delay`` (which only
+        measures from ``t_start`` onward), the prime suspect for a consistent
+        downstream pick offset.
+        """
         t_start = time.time()
         zero = np.zeros_like(self.M1)
         traj, vel, ts = trajectory_3points(
@@ -333,12 +340,24 @@ class GP8App:
         elapsed = time.time() - t_start
 
         observed_overhead = elapsed - traj_duration
-        prev = self.pick_delay.value
+        compute_latency = t_start - plan_time           # now -> traj send (Δc), uncompensated
+        prev = self.pick_delay.value                    # fixed_delay actually used this pick
         self.pick_delay.update(observed_overhead)
+
+        v = self.conveyor.current
+        predicted_lead = traj_duration + prev           # what the planner aimed with
+        actual_lead = compute_latency + elapsed         # now -> grasp arrival
+        shortfall = actual_lead - predicted_lead        # >0 => arm arrives downstream (late)
         self._node.get_logger().info(
-            f"Pick overhead: {observed_overhead*1000:+.0f}ms "
-            f"(smoothed {prev*1000:.0f} -> {self.pick_delay.value*1000:.0f}ms, "
-            f"predicted traj {traj_duration*1000:.0f}ms, actual {elapsed*1000:.0f}ms)"
+            "Pick timing diagnostics:\n"
+            f"  belt speed       : {v:7.3f} m/s\n"
+            f"  predicted traj   : {traj_duration*1000:7.0f} ms\n"
+            f"  actual traj+oh   : {elapsed*1000:7.0f} ms   (overhead {observed_overhead*1000:+.0f} ms)\n"
+            f"  compute lag Δc   : {compute_latency*1000:7.0f} ms   (now->send; NOT in fixed_delay)\n"
+            f"  fixed_delay used : {prev*1000:7.0f} ms   -> next {self.pick_delay.value*1000:.0f} ms\n"
+            f"  predicted lead   : {predicted_lead*1000:7.0f} ms   (traj + fixed_delay)\n"
+            f"  actual lead      : {actual_lead*1000:7.0f} ms   (now -> grasp arrival)\n"
+            f"  => shortfall     : {shortfall*1000:+7.0f} ms = {v*shortfall*1000:+.1f} mm downstream"
         )
 
     def _execute_transfer(
@@ -485,13 +504,14 @@ class GP8App:
         T_grasp1: np.ndarray,
         T_aim2: np.ndarray,
         theta: float,
+        plan_time: float,
     ) -> None:
         """Stage 5: pick (suction fires mid-trajectory) → throw."""
         # _execute_pick uses send_trajectory_queue_with_attach, which fires
         # suction_on while the arm is still approaching (diff<0.05) — matches
         # ROS1 customcontroller. No post-arrival sleep needed; vacuum has
         # been forming during the final approach.
-        self._execute_pick(current_joint, aim_joint1, grasp_joint1)
+        self._execute_pick(current_joint, aim_joint1, grasp_joint1, plan_time)
 
         params = self.planner.compute_throw_params(T_grasp1, T_aim2, theta)
         self._execute_transfer(grasp_joint1, aim_joint2, params)
@@ -563,7 +583,7 @@ class GP8App:
         self._node.get_logger().info(f"Target locked: {target_obj.class_name}")
         self._execute_cycle(
             current_joint, aim_joint1, grasp_joint1, aim_joint2,
-            T_grasp1, T_aim2, theta,
+            T_grasp1, T_aim2, theta, now,
         )
 
     def run(self) -> None:
