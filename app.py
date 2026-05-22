@@ -132,7 +132,7 @@ class Config:
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
-    RELEASE_EARLY_SHIFT: float = 0.15
+    RELEASE_EARLY_SHIFT: float = 0.0
     ETA_MIN: float = 0.13
     ETA_MAX: float = 0.95
 
