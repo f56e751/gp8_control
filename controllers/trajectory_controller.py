@@ -353,17 +353,27 @@ class TrajectoryController:
         total_duration = waypoints[-1][2]
 
         state = {"fired": False}
+        t_start = time.time()
+        self.last_throw = {
+            "throw_start": t_start,
+            "release_wall": None,
+            "io_ms": None,
+            "release_index": release_index,
+            "n_waypoints": len(waypoints),
+        }
 
         def _release() -> None:
             t_io = time.time()
             self.suction_off()                   # synchronous WriteSingleIO round-trip
+            io_ms = (time.time() - t_io) * 1000.0
             state["fired"] = True
+            self.last_throw["release_wall"] = self.last_suction_off_t
+            self.last_throw["io_ms"] = io_ms
             self._node.get_logger().info(
                 f"Release: suction_off after waypoint {release_index}/{len(waypoints)} "
-                f"(IO round-trip {(time.time() - t_io) * 1000.0:.0f} ms)"
+                f"(IO round-trip {io_ms:.0f} ms)"
             )
 
-        t_start = time.time()
         if not self._push_waypoints(
             waypoints, release_index=release_index, release_fn=_release
         ):
@@ -536,9 +546,11 @@ class TrajectoryController:
     # ------------------------------------------------------------------
 
     def suction_on(self) -> None:
+        self.last_suction_on_t = time.time()   # for the pick-cycle timing log
         self._call_io(SUCTION_IO_ADDRESS, 0)
 
     def suction_off(self) -> None:
+        self.last_suction_off_t = time.time()
         self._call_io(SUCTION_IO_ADDRESS, 1)
 
     def _call_io(self, address: int, value: int) -> None:

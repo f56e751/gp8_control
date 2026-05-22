@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import sys
 import time
+import csv
+import os
+import datetime
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -109,6 +112,11 @@ class Config:
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
     RELEASE_LEAD: float = 0.0           # [s]
+
+    # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
+    PICK_LOG_CSV: str = field(
+        default_factory=lambda: os.path.expanduser("~/gp8_pick_log.csv")
+    )
     # Must exceed the camera->pick travel time: belt-Y ~2.48 m at ~0.19 m/s
     # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
@@ -452,6 +460,10 @@ class GP8App:
             final_joint=aim_joint2,
             release_index=release_idx,
         )
+        self._last_throw_meta = {
+            "T": params.T, "eta": params.eta,
+            "release_idx": release_idx, "n_steps": n_steps,
+        }
 
     # ------------------------------------------------------------------
     # Ambush pick (park at a fixed intercept line; suction on arrival)
@@ -570,6 +582,7 @@ class GP8App:
 
         params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
         self._execute_transfer(grasp_joint, aim_joint2, params)
+        self._log_throw_cycle(target)
 
     def _move_through(
         self, current_joint: np.ndarray, aim_joint: np.ndarray, grasp_joint: np.ndarray
@@ -615,6 +628,46 @@ class GP8App:
         # 2) keep sucking, parked, until the object actually arrives — then return
         #    so the lift/throw motion begins at eta.
         self._sleep_until(now + eta)
+
+    def _log_throw_cycle(self, target: TrackedObject) -> None:
+        """Append one pick-cycle timing row to PICK_LOG_CSV: suction-on ->
+        throw-start -> release, for offline analysis of the release timing."""
+        path = self.cfg.PICK_LOG_CSV
+        if not path:
+            return
+        lt = getattr(self.traj_ctrl, "last_throw", {}) or {}
+        meta = getattr(self, "_last_throw_meta", {}) or {}
+        son = getattr(self.traj_ctrl, "last_suction_on_t", None)
+        t0 = lt.get("throw_start")
+        trel = lt.get("release_wall")
+
+        def _d(a, b):
+            return round(a - b, 4) if (a is not None and b is not None) else ""
+
+        row = {
+            "iso_time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "class": target.class_name,
+            "belt_mps": round(self.conveyor.current, 4),
+            "suction_on_t": round(son, 4) if son else "",
+            "throw_start_t": round(t0, 4) if t0 else "",
+            "release_t": round(trel, 4) if trel else "",
+            "on_to_throwstart_s": _d(t0, son),
+            "throwstart_to_release_s": _d(trel, t0),
+            "throw_T_s": round(meta.get("T", 0.0), 3),
+            "eta": round(meta.get("eta", 0.0), 3),
+            "release_idx": meta.get("release_idx", ""),
+            "n_steps": meta.get("n_steps", ""),
+            "io_ms": round(lt["io_ms"], 1) if lt.get("io_ms") is not None else "",
+        }
+        try:
+            new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new_file:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as e:
+            self._node.get_logger().warn(f"pick-log write failed: {e}")
 
     # ------------------------------------------------------------------
     # Epoch stages
