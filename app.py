@@ -566,26 +566,29 @@ class GP8App:
     def _wait_for_arrival_and_suction(
         self, target: TrackedObject, intercept_y: float
     ) -> None:
-        """Block until the object reaches the intercept line, then suction on.
+        """One-shot wait: compute arrival time once (remaining distance / belt
+        speed), sleep that long, then fire suction.
 
-        Position is predicted from detect_time + live belt speed each tick, so
-        it self-corrects if the belt speed drifts during the wait.
+        No per-tick recompute — the eta is fixed at the start using the belt
+        speed sampled now. Assumes the belt speed stays roughly constant during
+        the wait (true for a steady conveyor); if it varies a lot, an encoder
+        distance-integration trigger would be more accurate.
         """
-        lead = self.cfg.SUCTION_LEAD
-        deadline = time.time() + self.cfg.AMBUSH_MAX_WAIT
-        while rclpy.ok():
-            rclpy.spin_once(self._node, timeout_sec=0.0)  # keep belt speed fresh
-            now = time.time()
-            v = self.conveyor.current
-            eta = (self._object_y_now(target, now, v) - intercept_y) / (v + 1e-6)
-            if eta <= lead:
-                break
-            if now >= deadline:
-                self._node.get_logger().warn(
-                    "Ambush wait timed out; firing suction on fallback"
-                )
-                break
-            time.sleep(min(self.cfg.TIME_STEP, max(0.0, eta - lead)))
+        now = time.time()
+        v = self.conveyor.current
+        obj_y = self._object_y_now(target, now, v)
+        wait_time = (obj_y - intercept_y) / (v + 1e-6) - self.cfg.SUCTION_LEAD
+        wait_time = max(0.0, min(wait_time, self.cfg.AMBUSH_MAX_WAIT))
+        self._node.get_logger().info(
+            f"Ambush wait {wait_time:.2f}s (dist {obj_y - intercept_y:.3f} m / "
+            f"belt {v:.3f} m/s - lead {self.cfg.SUCTION_LEAD:.2f}s), then suction"
+        )
+
+        # Sleep in small chunks so the node stays responsive (shutdown/Ctrl-C),
+        # but do NOT recompute the eta — this is the fixed one-shot wait.
+        deadline = now + wait_time
+        while rclpy.ok() and time.time() < deadline:
+            time.sleep(min(0.05, deadline - time.time()))
         self.traj_ctrl.suction_on()
 
     # ------------------------------------------------------------------
