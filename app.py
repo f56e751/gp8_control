@@ -433,20 +433,32 @@ class GP8App:
         # start of the throw. Fire suction_off on a timer at that moment
         # instead of joint-proximity detection (which kept timing out and
         # releasing late, at the end of the motion).
-        release_time = params.eta * params.T
-        # Fire early by RELEASE_LEAD to cover IO service round-trip + vent lag.
-        fire_time = max(0.0, release_time - self.cfg.RELEASE_LEAD)
+        # Release at the most-extended point of the swing (max EE reach from
+        # the base), found via FK over the throw joints. The suction_off is
+        # then interleaved into the point-push at that waypoint (see
+        # send_trajectory_queue_with_timed_release) so it fires mid-swing, not
+        # after the whole trajectory is queued. Shift earlier by RELEASE_LEAD
+        # (converted to trajectory steps) to cover IO round-trip + vent lag.
+        reach = [
+            float(np.linalg.norm(
+                self.robot.forward_kinematics(np.concatenate([q5, [0.0]]))[:3, 3]
+            ))
+            for q5 in traj_ext
+        ]
+        ext_idx = int(np.argmax(reach))
+        lead_steps = int(round(self.cfg.RELEASE_LEAD * self.cfg.TRAJ_HZ))
+        release_idx = max(0, ext_idx - lead_steps)
 
         self._node.get_logger().info(
-            f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release at "
-            f"{release_time:.3f}s, suction_off fired at {fire_time:.3f}s "
-            f"(lead {self.cfg.RELEASE_LEAD:.2f}s)"
+            f"Throw T={params.T:.3f}s eta={params.eta:.3f}; max-extension at "
+            f"step {ext_idx}/{len(reach)} (t={ts_ext[ext_idx]:.3f}s); release after "
+            f"step {release_idx} (lead {self.cfg.RELEASE_LEAD:.2f}s)"
         )
 
         self.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=aim_joint2,
-            release_time=fire_time,
+            release_index=release_idx,
         )
 
     # ------------------------------------------------------------------

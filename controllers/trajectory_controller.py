@@ -338,36 +338,39 @@ class TrajectoryController:
         vel: np.ndarray,
         timestep: np.ndarray,
         final_joint: np.ndarray,
-        release_time: float,
+        release_index: int,
     ) -> bool:
-        """Queue Mode + suction_off at a fixed TIME after execution start.
+        """Queue Mode + suction_off interleaved into the point-push.
 
-        ``release_time`` is the NN-provided release instant (eta * T) in
-        seconds from the start of the throw. Unlike the joint-proximity
-        variant, this fires suction_off purely on a timer, so the release
-        lands at the intended mid-throw moment instead of falling back to a
-        late timeout when joint detection misses the fast release point.
+        Fires suction_off right after the ``release_index`` waypoint is queued,
+        instead of after the whole trajectory. The old "push everything then
+        suction_off" path fired late because the BUSY-throttled push takes ~the
+        full swing duration, so suction_off landed at the end. The point-queue
+        and IO are independent services, so inserting the IO command mid-push
+        is safe (no collision/drop).
         """
         waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
         total_duration = waypoints[-1][2]
 
-        t_start = time.time()
-        if not self._push_waypoints(waypoints):
-            return False
+        state = {"fired": False}
 
-        # Execution begins as the first point hits the queue (~t_start). Fire
-        # suction_off at t_start + release_time (the push time already counts
-        # toward elapsed execution).
-        wait = release_time - (time.time() - t_start)
-        if wait > 0:
-            time.sleep(wait)
-        t_io = time.time()
-        self.suction_off()                       # synchronous WriteSingleIO round-trip
-        io_ms = (time.time() - t_io) * 1000.0
-        self._node.get_logger().info(
-            f"Timed release: suction_off issued at {release_time:.3f}s into throw "
-            f"(IO round-trip {io_ms:.0f} ms)"
-        )
+        def _release() -> None:
+            t_io = time.time()
+            self.suction_off()                   # synchronous WriteSingleIO round-trip
+            state["fired"] = True
+            self._node.get_logger().info(
+                f"Release: suction_off after waypoint {release_index}/{len(waypoints)} "
+                f"(IO round-trip {(time.time() - t_io) * 1000.0:.0f} ms)"
+            )
+
+        t_start = time.time()
+        if not self._push_waypoints(
+            waypoints, release_index=release_index, release_fn=_release
+        ):
+            return False
+        if not state["fired"]:
+            # release_index beyond the pushed points — fire now as a fallback.
+            _release()
 
         self._wait_trajectory_end(total_duration, t_start=t_start)
         return True
@@ -401,8 +404,15 @@ class TrajectoryController:
         waypoints: list[tuple[list, list, float]],
         busy_retry_delay: float = 0.015,
         busy_max_retry: int = 5,
+        release_index: int | None = None,
+        release_fn=None,
     ) -> bool:
-        """waypoint를 /motoman_gp8_controller/queue_traj_point로 순차 push."""
+        """waypoint를 /motoman_gp8_controller/queue_traj_point로 순차 push.
+
+        ``release_index``/``release_fn`` 지정 시, 해당 인덱스 waypoint를 큐에
+        넣은 직후 ``release_fn``을 1회 호출 — throw 도중 석션 OFF를 포인트
+        명령들 사이에 끼워넣는 용도.
+        """
         if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
             self._node.get_logger().error("queue_traj_point service unavailable.")
             return False
@@ -440,6 +450,13 @@ class TrajectoryController:
                     f"pt {i}: dropped after {busy_max_retry} BUSY retries"
                 )
                 return False
+
+            # Interleave the release: once the release waypoint is queued,
+            # fire suction_off (the IO command rides between point commands).
+            if release_fn is not None and release_index is not None and i >= release_index:
+                release_fn()
+                release_fn = None  # fire once
+
         if busy_total > 0:
             # BUSY는 push가 MotoROS2 수신 속도보다 빠를 때 발생하는 정상 신호.
             # 큐가 깊지 않을 때 흔하며, 재시도로 자연스럽게 흡수됨.
