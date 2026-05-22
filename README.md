@@ -45,6 +45,19 @@ the RL training stack.
   robot PC consumes the NDJSON stream via `StreamDetectionSource`. The
   public GitHub copy ships with a placeholder URL so no internal infra IPs
   leak.
+
+  > **카메라 PC 송출이 켜져 있어야 picking이 동작합니다.** 송출이 꺼져
+  > 있어도 `app.py`는 죽지 않고 (백그라운드 스레드가 2초마다 재접속 시도)
+  > 노드는 뜨지만, 탐지 결과가 계속 비어 있어 **물체를 집지 못합니다.**
+  > 노드 기동/디버깅만이면 카메라 없이도 실행됩니다.
+  >
+  > 로봇 PC에서 스트림 도달 여부 확인:
+  > ```bash
+  > curl -N "$GP8_PERCEPTION_URL" | head
+  > ```
+  > JSON 라인이 흐르면 OK. 연결 거부면 카메라 PC 송출이 꺼졌거나 IP/포트가
+  > 다른 것 — 송출 서버 코드는 이 repo가 아니라 카메라 PC에 있는 별도
+  > 코드이며, 스트림 와이어 규약은 `perception/perception_client.py` 참고.
 - [`uv`](https://astral.sh/uv) for Python venv management
 - ESP32 conveyor encoder on `/dev/ttyUSB0` (user in `dialout` group)
 
