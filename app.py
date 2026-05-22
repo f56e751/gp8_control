@@ -98,11 +98,12 @@ class Config:
     #   "moving" — legacy predictive-intercept pick (plan_pick + lock).
     PICK_STRATEGY: str = "ambush"
     GRASP_INTERCEPT_Y: float = 0.0      # belt-frame Y where the arm waits [m]
-    # Grasp height [m]: belt-surface contact Z, anchored to a manually
-    # verified pose (terminal_debug: EE x=0.508 y=0.000 z=0.067, suction ON).
+    # Grasp height [m]: belt-surface contact Z. Manually verified pose was
+    # z=0.067 (terminal_debug: EE x=0.508 y=0.000, suction ON); lowered ~5 mm
+    # to 0.062 for firmer contact.
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
-    GRASP_Z: float = 0.067
+    GRASP_Z: float = 0.062
     SUCTION_LEAD: float = 0.05          # fire suction this early (pneumatic lag) [s]
     # Must exceed the camera->pick travel time: belt-Y ~2.48 m at ~0.19 m/s
     # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
@@ -139,10 +140,10 @@ class Config:
         [0.0, 0.0, 0.0, 1.0],
     ]))
     T_BASE2CAM: np.ndarray = field(default_factory=lambda: np.array([
-        # X = -2.245 so a centered detection maps to belt-Y = 2.48 m
-        # (measured camera->pick belt-direction length): 2.245 + 0.235 (the
-        # T_ROBOT2BASE Y offset) = 2.48.
-        [0.0, -1.0, 0.0, -2.245],
+        # X = -2.235 so a centered detection maps to belt-Y = 2.47 m
+        # (measured camera->pick belt-direction length): 2.235 + 0.235 (the
+        # T_ROBOT2BASE Y offset) = 2.47.
+        [0.0, -1.0, 0.0, -2.235],
         [-1.0, 0.0, 0.0,  0.450],
         [0.0,  0.0, -1.0, 0.650],
         [0.0,  0.0, 0.0,  1.0],
