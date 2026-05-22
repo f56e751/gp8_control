@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 import rclpy
@@ -27,6 +28,7 @@ from gp8_control.trajectory.trajectory_primitive import (
     trajectory,
     trajectory_3points,
     new_trajectory,
+    opt_time,
     pad,
 )
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -89,6 +91,16 @@ class Config:
     # it can't diverge to the reach boundary. Set near the real pick time.
     MAX_PICK_LEAD: float = 1.2
 
+    # Pick strategy:
+    #   "ambush" — park the arm at a fixed intercept line (GRASP_INTERCEPT_Y)
+    #              ahead of time and fire suction when the object arrives.
+    #              Avoids moving-intercept lead timing entirely.
+    #   "moving" — legacy predictive-intercept pick (plan_pick + lock).
+    PICK_STRATEGY: str = "ambush"
+    GRASP_INTERCEPT_Y: float = 0.0      # belt-frame Y where the arm waits [m]
+    SUCTION_LEAD: float = 0.05          # fire suction this early (pneumatic lag) [s]
+    AMBUSH_MAX_WAIT: float = 12.0       # give up waiting for arrival after this [s]
+
     # Trajectory sampling / joint limit scales
     TRAJ_HZ: float = 20.0
     JOINT_VEL_LIMIT_SCALE: float = 0.8
@@ -147,6 +159,24 @@ THETA_MAP = {
     "transparent": -np.pi / 12.0,
     "metal":       -np.pi * 25.0 / 180.0,
 }
+
+
+class PickWaitMode(Enum):
+    """How the arm waits at the ambush intercept before suction fires.
+
+    Extension point: map object classes to a wait mode in ``PICK_WAIT_MODE``
+    so e.g. fragile classes can hover-and-descend while flat ones park at
+    grasp height. Only WAIT_AT_GRASP is implemented today; HOVER_DESCEND
+    falls back to it with a warning until added.
+    """
+    WAIT_AT_GRASP = "wait_at_grasp"   # cup parked at grasp height; suction on arrival
+    HOVER_DESCEND = "hover_descend"   # park above, descend + suction on arrival (TODO)
+
+
+# Per-class wait mode (class_name -> PickWaitMode). Classes not listed use
+# DEFAULT_PICK_WAIT_MODE. Mirrors THETA_MAP: app-boundary policy.
+PICK_WAIT_MODE: dict[str, PickWaitMode] = {}
+DEFAULT_PICK_WAIT_MODE = PickWaitMode.WAIT_AT_GRASP
 
 
 # =========================================================================
@@ -395,6 +425,156 @@ class GP8App:
         )
 
     # ------------------------------------------------------------------
+    # Ambush pick (park at a fixed intercept line; suction on arrival)
+    # ------------------------------------------------------------------
+    def _object_y_now(self, target: TrackedObject, now: float, v: float) -> float:
+        """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases)."""
+        return target.T_grasp_base[1, 3] - v * (now - target.detect_time)
+
+    def _run_ambush_pick(self, now: float, current_joint: np.ndarray) -> None:
+        """Pre-position at GRASP_INTERCEPT_Y and fire suction when the object
+        arrives — no moving-intercept lead timing.
+
+        The arm parks at a fixed intercept pose (the object's lateral X and
+        height, but a constant belt-Y); suction fires when the object, whose
+        position is predicted from ``detect_time`` + live belt speed, reaches
+        the cup.
+        """
+        target = self.queue.head()
+        v = self.conveyor.current
+        intercept_y = self.cfg.GRASP_INTERCEPT_Y
+
+        obj_y = self._object_y_now(target, now, v)
+        if obj_y <= intercept_y:
+            self.queue.pop_head()
+            self._node.get_logger().info(
+                f"Object at/past intercept (y={obj_y:.3f} <= {intercept_y:.3f}); dropping"
+            )
+            return
+
+        # Freeze belt-Y to the intercept line; X/Z (lateral, height) are
+        # unchanged by travel along Y, so the detected values still hold.
+        T_grasp = target.T_grasp_base.copy()
+        T_grasp[1, 3] = intercept_y
+        T_aim = target.T_aim_base.copy()
+        T_aim[1, 3] = intercept_y
+
+        if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
+            self.queue.pop_head()
+            self._node.get_logger().info("Intercept pose out of reach; dropping")
+            return
+
+        aim_joint = self.robot.inverse_kinematics(T_aim)
+        grasp_joint = self.robot.inverse_kinematics(T_grasp)
+        if aim_joint is None or grasp_joint is None:
+            self.queue.pop_head()
+            self._node.get_logger().warn("Ambush IK failed; dropping")
+            return
+        aim_joint = np.asarray(aim_joint, dtype=float); aim_joint[-1] = 0.0
+        grasp_joint = np.asarray(grasp_joint, dtype=float); grasp_joint[-1] = 0.0
+
+        # Positioning-vs-arrival check is advisory only: opt_time is known to
+        # over-estimate the real move time here, so a hard drop would reject
+        # catchable objects. We warn if it looks tight but still attempt — a
+        # genuine late arrival just yields a missed grab, not a hazard.
+        zero = np.zeros_like(self.M1)
+        move_time = (
+            opt_time(current_joint, zero, aim_joint, zero, self.M1, self.M2)
+            + opt_time(aim_joint, zero, grasp_joint, zero, self.M1, self.M2)
+        )
+        eta = (obj_y - intercept_y) / (v + 1e-6)
+        if eta < move_time:
+            self._node.get_logger().warn(
+                f"Intercept may be tight: eta {eta:.2f}s < est. move {move_time:.2f}s "
+                "(opt_time over-estimates; attempting anyway)"
+            )
+
+        secondary = self.queue.peek_next() if self.queue.has_next() else None
+        self.queue.pop_head()
+        self._node.get_logger().info(
+            f"Ambush lock: {target.class_name} @ y={intercept_y:.3f} "
+            f"(eta {eta:.2f}s, move {move_time:.2f}s)"
+        )
+        self._execute_ambush_pick(
+            target, current_joint, aim_joint, grasp_joint, T_aim, T_grasp, secondary
+        )
+
+    def _execute_ambush_pick(
+        self,
+        target: TrackedObject,
+        current_joint: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+        T_aim: np.ndarray,
+        T_grasp: np.ndarray,
+        secondary: TrackedObject | None,
+    ) -> None:
+        """Pre-position (mode-dependent), wait for arrival + suction, then throw."""
+        mode = PICK_WAIT_MODE.get(target.class_name, DEFAULT_PICK_WAIT_MODE)
+        if mode == PickWaitMode.HOVER_DESCEND:
+            self._node.get_logger().warn(
+                "HOVER_DESCEND wait mode not implemented yet; using WAIT_AT_GRASP"
+            )
+            mode = PickWaitMode.WAIT_AT_GRASP
+
+        self.traj_ctrl.suction_off()
+
+        # WAIT_AT_GRASP: drive all the way to the grasp pose and park there.
+        self._move_through(current_joint, aim_joint, grasp_joint)
+
+        # Wait until the predicted object position reaches the intercept line,
+        # then fire suction (slightly early to cover pneumatic lag).
+        self._wait_for_arrival_and_suction(target, T_grasp[1, 3])
+
+        # Lift + throw — same path as the moving strategy.
+        theta = THETA_MAP.get(target.class_name, 0.0)
+        T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
+        aim_joint2 = self.robot.inverse_kinematics(T_aim2)
+        if aim_joint2 is None:
+            self._node.get_logger().warn("Throw IK failed after grab; lifting in place")
+            aim_joint2, T_aim2 = aim_joint, T_aim
+        aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
+
+        params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
+        self._execute_transfer(grasp_joint, aim_joint2, params)
+
+    def _move_through(
+        self, current_joint: np.ndarray, aim_joint: np.ndarray, grasp_joint: np.ndarray
+    ) -> None:
+        """Queue-mode move current -> aim -> grasp, no suction (pre-position)."""
+        zero = np.zeros_like(self.M1)
+        traj, vel, ts = trajectory_3points(
+            current_joint, zero, aim_joint, zero, grasp_joint, zero,
+            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+        )
+        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+
+    def _wait_for_arrival_and_suction(
+        self, target: TrackedObject, intercept_y: float
+    ) -> None:
+        """Block until the object reaches the intercept line, then suction on.
+
+        Position is predicted from detect_time + live belt speed each tick, so
+        it self-corrects if the belt speed drifts during the wait.
+        """
+        lead = self.cfg.SUCTION_LEAD
+        deadline = time.time() + self.cfg.AMBUSH_MAX_WAIT
+        while rclpy.ok():
+            rclpy.spin_once(self._node, timeout_sec=0.0)  # keep belt speed fresh
+            now = time.time()
+            v = self.conveyor.current
+            eta = (self._object_y_now(target, now, v) - intercept_y) / (v + 1e-6)
+            if eta <= lead:
+                break
+            if now >= deadline:
+                self._node.get_logger().warn(
+                    "Ambush wait timed out; firing suction on fallback"
+                )
+                break
+            time.sleep(min(self.cfg.TIME_STEP, max(0.0, eta - lead)))
+        self.traj_ctrl.suction_on()
+
+    # ------------------------------------------------------------------
     # Epoch stages
     # ------------------------------------------------------------------
     def _intake_new_detections(self, now: float) -> None:
@@ -547,6 +727,10 @@ class GP8App:
         if not self.queue:
             self.frame_gate.reset()
             time.sleep(self.cfg.TIME_STEP)
+            return
+
+        if self.cfg.PICK_STRATEGY == "ambush":
+            self._run_ambush_pick(now, current_joint)
             return
 
         # Capture the secondary throw target *before* lock_or_drop_head
