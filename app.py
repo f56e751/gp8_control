@@ -433,26 +433,18 @@ class GP8App:
         # start of the throw. Fire suction_off on a timer at that moment
         # instead of joint-proximity detection (which kept timing out and
         # releasing late, at the end of the motion).
-        # Release at the most-extended point of the swing (max EE reach from
-        # the base), found via FK over the throw joints. The suction_off is
-        # then interleaved into the point-push at that waypoint (see
-        # send_trajectory_queue_with_timed_release) so it fires mid-swing, not
-        # after the whole trajectory is queued. Shift earlier by RELEASE_LEAD
-        # (converted to trajectory steps) to cover IO round-trip + vent lag.
-        reach = [
-            float(np.linalg.norm(
-                self.robot.forward_kinematics(np.concatenate([q5, [0.0]]))[:3, 3]
-            ))
-            for q5 in traj_ext
-        ]
-        ext_idx = int(np.argmax(reach))
+        # NN-provided release fraction (eta) -> waypoint index. The interleave
+        # fix (firing suction_off mid-push) removed the late-release bug, so we
+        # can use the NN's learned release instant directly instead of a
+        # geometric heuristic. Shift earlier by RELEASE_LEAD steps for IO
+        # round-trip + pneumatic vent lag.
+        eta_idx = int(round(params.eta * n_steps))
         lead_steps = int(round(self.cfg.RELEASE_LEAD * self.cfg.TRAJ_HZ))
-        release_idx = max(0, ext_idx - lead_steps)
+        release_idx = max(0, min(eta_idx - lead_steps, n_steps))
 
         self._node.get_logger().info(
-            f"Throw T={params.T:.3f}s eta={params.eta:.3f}; max-extension at "
-            f"step {ext_idx}/{len(reach)} (t={ts_ext[ext_idx]:.3f}s); release after "
-            f"step {release_idx} (lead {self.cfg.RELEASE_LEAD:.2f}s)"
+            f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
+            f"{release_idx}/{n_steps} (eta step {eta_idx}, lead {self.cfg.RELEASE_LEAD:.2f}s)"
         )
 
         self.traj_ctrl.send_trajectory_queue_with_timed_release(
