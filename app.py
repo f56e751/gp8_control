@@ -416,23 +416,29 @@ class GP8App:
         """Build and dispatch throw trajectory using already-decoded ThrowParams."""
         n_steps = max(2, int(params.T * self.cfg.TRAJ_HZ))
         s = np.linspace(0.0, 1.0, n_steps + 1)
-        s_ext = np.concatenate((s, [params.eta]))
 
         traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
-            s_ext, grasp_joint[:5], aim_joint2[:5], params.w, params.T,
+            s, grasp_joint[:5], aim_joint2[:5], params.w, params.T,
         )
 
-        traj_throw = pad(traj_ext[:-1, :]).T
-        vel_throw = pad(vel_ext[:-1, :]).T
-        timestep_throw = ts_ext[:-1]
-        release_joint = traj_ext[-1, :]
+        traj_throw = pad(traj_ext).T
+        vel_throw = pad(vel_ext).T
+        timestep_throw = ts_ext
 
-        self._node.get_logger().info(f"Throw T={params.T:.3f}s eta={params.eta:.3f}")
+        # NN-provided release instant: normalized eta -> time eta*T from the
+        # start of the throw. Fire suction_off on a timer at that moment
+        # instead of joint-proximity detection (which kept timing out and
+        # releasing late, at the end of the motion).
+        release_time = params.eta * params.T
 
-        self.traj_ctrl.send_trajectory_queue_with_release(
+        self._node.get_logger().info(
+            f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release at {release_time:.3f}s"
+        )
+
+        self.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=aim_joint2,
-            release_joint=pad(release_joint.reshape(1, -1)).ravel(),
+            release_time=release_time,
         )
 
     # ------------------------------------------------------------------

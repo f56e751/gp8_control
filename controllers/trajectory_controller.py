@@ -332,6 +332,43 @@ class TrajectoryController:
         self._wait_trajectory_end(total_duration, t_start=t_start)
         return True
 
+    def send_trajectory_queue_with_timed_release(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray,
+        release_time: float,
+    ) -> bool:
+        """Queue Mode + suction_off at a fixed TIME after execution start.
+
+        ``release_time`` is the NN-provided release instant (eta * T) in
+        seconds from the start of the throw. Unlike the joint-proximity
+        variant, this fires suction_off purely on a timer, so the release
+        lands at the intended mid-throw moment instead of falling back to a
+        late timeout when joint detection misses the fast release point.
+        """
+        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        total_duration = waypoints[-1][2]
+
+        t_start = time.time()
+        if not self._push_waypoints(waypoints):
+            return False
+
+        # Execution begins as the first point hits the queue (~t_start). Fire
+        # suction_off at t_start + release_time (the push time already counts
+        # toward elapsed execution).
+        wait = release_time - (time.time() - t_start)
+        if wait > 0:
+            time.sleep(wait)
+        self.suction_off()
+        self._node.get_logger().info(
+            f"Timed release: suction_off at {release_time:.3f}s into throw"
+        )
+
+        self._wait_trajectory_end(total_duration, t_start=t_start)
+        return True
+
     def _build_queue_waypoints(
         self,
         traj: np.ndarray,
