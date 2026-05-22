@@ -564,6 +564,16 @@ class GP8App:
 
         self.traj_ctrl.suction_off()
 
+        # Re-enter point queue mode each cycle. MotoROS2 leaves queue mode once
+        # the previous trajectory's queue drains, so the next pick's points are
+        # rejected ("Must call start_point_queue_mode") — which is why only the
+        # first object worked. Re-entering here makes every cycle self-contained.
+        if not self.traj_ctrl.enter_queue_mode():
+            self._node.get_logger().error(
+                "Failed to (re)enter queue mode; skipping this pick"
+            )
+            return
+
         # WAIT_AT_GRASP: drive all the way to the grasp pose and park there.
         self._move_through(current_joint, aim_joint, grasp_joint)
 
