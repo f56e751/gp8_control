@@ -104,7 +104,7 @@ class Config:
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
     GRASP_Z: float = 0.062
-    SUCTION_LEAD: float = 0.05          # fire suction this early (pneumatic lag) [s]
+    SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
     # Must exceed the camera->pick travel time: belt-Y ~2.48 m at ~0.19 m/s
     # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
