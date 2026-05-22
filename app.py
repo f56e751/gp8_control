@@ -105,6 +105,10 @@ class Config:
     # relative height above this.
     GRASP_Z: float = 0.062
     SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
+    # Fire throw-release suction_off this early to cover the WriteSingleIO
+    # service round-trip + pneumatic vent lag (object releases after the
+    # command is issued). Tune from the measured "IO call" latency in the log.
+    RELEASE_LEAD: float = 0.1           # [s]
     # Must exceed the camera->pick travel time: belt-Y ~2.48 m at ~0.19 m/s
     # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
@@ -430,15 +434,19 @@ class GP8App:
         # instead of joint-proximity detection (which kept timing out and
         # releasing late, at the end of the motion).
         release_time = params.eta * params.T
+        # Fire early by RELEASE_LEAD to cover IO service round-trip + vent lag.
+        fire_time = max(0.0, release_time - self.cfg.RELEASE_LEAD)
 
         self._node.get_logger().info(
-            f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release at {release_time:.3f}s"
+            f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release at "
+            f"{release_time:.3f}s, suction_off fired at {fire_time:.3f}s "
+            f"(lead {self.cfg.RELEASE_LEAD:.2f}s)"
         )
 
         self.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=aim_joint2,
-            release_time=release_time,
+            release_time=fire_time,
         )
 
     # ------------------------------------------------------------------

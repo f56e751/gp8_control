@@ -361,9 +361,12 @@ class TrajectoryController:
         wait = release_time - (time.time() - t_start)
         if wait > 0:
             time.sleep(wait)
-        self.suction_off()
+        t_io = time.time()
+        self.suction_off()                       # synchronous WriteSingleIO round-trip
+        io_ms = (time.time() - t_io) * 1000.0
         self._node.get_logger().info(
-            f"Timed release: suction_off at {release_time:.3f}s into throw"
+            f"Timed release: suction_off issued at {release_time:.3f}s into throw "
+            f"(IO round-trip {io_ms:.0f} ms)"
         )
 
         self._wait_trajectory_end(total_duration, t_start=t_start)
