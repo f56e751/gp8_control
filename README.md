@@ -66,6 +66,16 @@ colcon build --packages-select gp8_control
 Needs **two terminals** (plus whatever is already running MotoROS2 /
 micro-ROS Agent / Docker).
 
+### Quick Start (순서 중요)
+
+1. **micro-ROS Agent (docker)** — 부팅당 1회. 없으면 `/write_single_io` /
+   `/start_traj_mode` 가 안 뜨고 노드가 *"Waiting for …"* 에서 멈춤.
+2. **Terminal 1 — bringup** (bridge + cameras + MoveIt + gp8_manager)
+3. **Terminal 2 — conveyor encoder** (`/conveyor/speed` 발행, 선택)
+
+펜던트는 **REMOTE + AUTO**, 알람 없는 상태여야 함. 자세한 명령은 아래 각
+섹션 참고.
+
 ### Terminal 1 — bringup (bridge + cameras + MoveIt + gp8_manager)
 
 ```bash
