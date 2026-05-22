@@ -108,7 +108,7 @@ class Config:
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
-    RELEASE_LEAD: float = 0.3           # [s]
+    RELEASE_LEAD: float = 0.0           # [s]
     # Must exceed the camera->pick travel time: belt-Y ~2.48 m at ~0.19 m/s
     # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
