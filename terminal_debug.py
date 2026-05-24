@@ -50,7 +50,6 @@ BIG_STEP_SIZE = 0.05      # 5cm (Shift + 키)
 MOVE_DURATION = 0.5       # 이동 시간 (초)
 FAST_MAX_VELOCITY = 1.0   # 최저점/안전높이 이동용 최대 속도 (m/s)
 FAST_MIN_DURATION = 0.3   # 최저점/안전높이 이동 최소 시간 (초)
-FLOOR_SLOW_VELOCITY = 0.3 # 'z' 키 후반(감속) 구간 속도 (m/s)
 SAFE_HEIGHT = 0.10        # 'x' 키 상승 목표 높이 (m)
 ANGLE_STEP = np.radians(5.0)       # 회전 기본 스텝
 BIG_ANGLE_STEP = np.radians(15.0)  # 회전 Shift 스텝
@@ -641,7 +640,7 @@ class RobotDebugger(Node):
         )
 
     def move_to_floor(self) -> None:
-        """EE를 workspace z 최저점까지 내림. 절반까지는 빠르게, 나머지 절반은 감속."""
+        """EE를 workspace z 최저점까지 일정 속도로 내림."""
         if self._current_joints is None:
             self.get_logger().error("Joint states not available.")
             return
@@ -666,24 +665,13 @@ class RobotDebugger(Node):
             return
 
         distance = current_pos[2] - floor_z
-        half = distance * 0.5
-        # 절반 지점은 joint space 선형 보간 — z 단일 축 이동이라 IK 결과와 사실상 일치하고 더 안정적
-        mid_q = (current_q + target_q) * 0.5
-
-        # Phase 1: 절반까지 빠르게
-        t1 = max(FAST_MIN_DURATION, half / FAST_MAX_VELOCITY)
-        self._send_joint_goal(current_q, mid_q, t1)
-
-        # Phase 2: 나머지 절반은 감속해서 천천히. traj[0]은 최신 joint state로 잡아 tolerance 회피
-        for _ in range(5):
-            rclpy.spin_once(self, timeout_sec=0.05)
-        actual_mid_q = np.array(self._current_joints) if self._current_joints is not None else mid_q
-        t2 = max(FAST_MIN_DURATION, half / FLOOR_SLOW_VELOCITY)
-        self._send_joint_goal(actual_mid_q, target_q, t2)
+        # 끝까지 일정 속도로 한 번에 이동
+        t = max(FAST_MIN_DURATION, distance / FAST_MAX_VELOCITY)
+        self._send_joint_goal(current_q, target_q, t)
 
         self.get_logger().info(
-            f"[{timestamp()}] EE descended to floor with decel: z={floor_z:.3f} "
-            f"(Δ={distance*100:.1f}cm, fast {t1:.2f}s + slow {t2:.2f}s)"
+            f"[{timestamp()}] EE descended to floor: z={floor_z:.3f} "
+            f"(Δ={distance*100:.1f}cm, {t:.2f}s)"
         )
 
     def level_suction(self) -> None:
@@ -809,7 +797,7 @@ def main():
     print("  g     : Gripper level (수직 정렬)")
     _floor_z_print = args.floor_z if args.floor_z is not None else WORKSPACE['z'][0]
     print(f"  z     : Descend to floor z={_floor_z_print:.2f}m "
-          f"(fast {FAST_MAX_VELOCITY:.1f}→slow {FLOOR_SLOW_VELOCITY:.1f} m/s, decel from halfway)")
+          f"(constant {FAST_MAX_VELOCITY:.1f} m/s)")
     print(f"  x     : Raise to safe height z={SAFE_HEIGHT:.2f}m (max {FAST_MAX_VELOCITY:.1f} m/s)")
     print(f"  h     : Home pose (0.4m forward, tool-down)")
     print(f"  t     : [TEST] Queue Mode X sweep ±{QUEUE_TEST_AMPLITUDE*100:.0f}cm ({QUEUE_TEST_DURATION:.0f}s)")
