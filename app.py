@@ -622,14 +622,18 @@ class GP8App:
             )
             eta = (obj_y - intercept_y) / (v + 1e-6)
 
-            # Feasibility: drop the head if the object will pass the intercept
-            # before we can position. opt_time over-estimates, so scale by
-            # PICK_FEASIBILITY_FACTOR (default 0.5) to avoid over-rejection.
-            if eta < move_time * factor:
+            # Feasibility: the arm must be parked at the intercept by the time
+            # suction fires (= eta - SUCTION_LEAD), not just by the time the
+            # object actually arrives. Drop heads we can't position in time.
+            # opt_time over-estimates the real move (~2x), so scale by
+            # PICK_FEASIBILITY_FACTOR (default 0.5).
+            needed = move_time * factor + self.cfg.SUCTION_LEAD
+            if eta < needed:
                 self.queue.pop_head()
                 self._node.get_logger().info(
                     f"Drop {candidate.class_name}: too late to catch "
-                    f"(eta {eta:.2f}s < move {move_time:.2f}s × {factor:.2f})"
+                    f"(eta {eta:.2f}s < move {move_time:.2f}s × {factor:.2f} "
+                    f"+ suction lead {self.cfg.SUCTION_LEAD:.2f}s = {needed:.2f}s)"
                 )
                 continue
 
