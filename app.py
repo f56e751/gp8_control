@@ -462,40 +462,87 @@ class GP8App:
         grasp_joint: np.ndarray,
         aim_joint2: np.ndarray,
         params,
+        next_intercept_joint: np.ndarray | None = None,
     ) -> None:
-        """Build and dispatch throw trajectory using already-decoded ThrowParams."""
+        """Build and dispatch throw trajectory using already-decoded ThrowParams.
+
+        The release motion (grasp → release sample at eta) is unchanged from
+        the NN trajectory; what used to be the follow-through to aim_joint2
+        is **replaced** with a smooth transition from the release joint state
+        (carrying the throw's release velocity) to a ready pose:
+          - ``next_intercept_joint`` when supplied (next pick's intercept), or
+          - ``grasp_joint`` (the current pick's intercept) as a sensible
+            fallback when there's no known next pick — keeps the arm low and
+            over the belt instead of parked at the high aim_joint2 hover.
+        """
         n_steps = max(2, int(params.T * self.cfg.TRAJ_HZ))
         s = np.linspace(0.0, 1.0, n_steps + 1)
 
         traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
             s, grasp_joint[:5], aim_joint2[:5], params.w, params.T,
         )
+        # traj_ext, vel_ext: (n_steps+1, 5); ts_ext: (n_steps+1,)
 
-        traj_throw = pad(traj_ext).T
-        vel_throw = pad(vel_ext).T
-        timestep_throw = ts_ext
-
-        # NN-provided release instant: normalized eta -> time eta*T from the
-        # start of the throw. Fire suction_off on a timer at that moment
-        # instead of joint-proximity detection (which kept timing out and
-        # releasing late, at the end of the motion).
-        # NN-provided release fraction (eta) -> waypoint index. The interleave
-        # fix (firing suction_off mid-push) removed the late-release bug, so we
-        # can use the NN's learned release instant directly instead of a
-        # geometric heuristic. Shift earlier by RELEASE_LEAD steps for IO
-        # round-trip + pneumatic vent lag.
         eta_idx = int(round(params.eta * n_steps))
+        eta_idx = max(0, min(eta_idx, n_steps))
         lead_steps = int(round(self.cfg.RELEASE_LEAD * self.cfg.TRAJ_HZ))
         release_idx = max(0, min(eta_idx - lead_steps, n_steps))
 
+        # Splice at the release sample. Pre-release portion = throw motion up
+        # to and including the release joint config; that's identical to the
+        # original NN throw, so release velocity/direction are preserved.
+        traj_pre_5 = traj_ext[: eta_idx + 1].T    # (5, eta_idx+1)
+        vel_pre_5 = vel_ext[: eta_idx + 1].T
+        ts_pre = ts_ext[: eta_idx + 1]
+
+        release_q5 = traj_ext[eta_idx]            # (5,)
+        release_dq5 = vel_ext[eta_idx]
+
+        # Chain target: next pick's intercept if known, else the current
+        # pick's intercept (= grasp_joint) — keeps the arm low, ready over
+        # the belt instead of parked at the high aim_joint2 hover.
+        chain_target = (
+            np.asarray(next_intercept_joint, dtype=float)
+            if next_intercept_joint is not None
+            else np.asarray(grasp_joint, dtype=float)
+        )
+        chained_to_next = next_intercept_joint is not None
+
+        zero5 = np.zeros(5)
+        traj_chain_5, vel_chain_5, ts_chain = trajectory(
+            release_q5, release_dq5,
+            chain_target[:5], zero5,
+            self.M1[:5], self.M2[:5], hertz=self.cfg.TRAJ_HZ,
+        )
+        # Drop the chain's first column — it's the release sample, same as
+        # the last sample of the pre-release portion (would be a duplicate).
+        if traj_chain_5.shape[1] > 1:
+            traj_chain_5 = traj_chain_5[:, 1:]
+            vel_chain_5 = vel_chain_5[:, 1:]
+            ts_chain_shifted = ts_chain[1:] + ts_pre[-1]
+        else:
+            ts_chain_shifted = ts_chain[1:] + ts_pre[-1]  # empty
+
+        traj_full_5 = np.concatenate((traj_pre_5, traj_chain_5), axis=1)   # (5, total)
+        vel_full_5 = np.concatenate((vel_pre_5, vel_chain_5), axis=1)
+        ts_full = np.concatenate((ts_pre, ts_chain_shifted))
+
+        # Pad to 6-dof, reorient to (6, total) as the queue expects.
+        traj_throw = pad(traj_full_5.T).T
+        vel_throw = pad(vel_full_5.T).T
+        timestep_throw = ts_full
+        final_joint = chain_target
+
         self._node.get_logger().info(
             f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
-            f"{release_idx}/{n_steps} (eta step {eta_idx}, lead {self.cfg.RELEASE_LEAD:.2f}s)"
+            f"{release_idx}/{traj_throw.shape[1] - 1} (eta step {eta_idx}, "
+            f"lead {self.cfg.RELEASE_LEAD:.2f}s, "
+            f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'})"
         )
 
         self.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
-            final_joint=aim_joint2,
+            final_joint=final_joint,
             release_index=release_idx,
         )
         self._last_throw_meta = {
@@ -668,32 +715,35 @@ class GP8App:
 
         theta = THETA_MAP.get(target.class_name, 0.0)
 
-        # End the throw motion at the NEXT pick's intercept pose so the arm
-        # parks ready for the next object the moment the throw finishes —
-        # no separate "return to home then move to next" trajectory after
-        # release. If there's no feasible next intercept (queue empty after
-        # this pick, secondary unreachable), fall back to the legacy
-        # plan_throw_landing target.
-        T_aim2 = None
-        if secondary is not None:
-            T_next_grasp = secondary.T_grasp_base.copy()
-            T_next_grasp[1, 3] = self.cfg.GRASP_INTERCEPT_Y
-            T_next_grasp[2, 3] = self.cfg.GRASP_Z
-            if np.linalg.norm(T_next_grasp[:2, 3]) <= self.cfg.MAX_REACH:
-                T_aim2 = T_next_grasp
-        if T_aim2 is None:
-            T_aim2 = self._plan_throw_landing(
-                T_grasp, theta, T_aim, time.time(), secondary
-            )
-
+        # Original throw target — preserves the release motion exactly (same
+        # NN trajectory, same release velocity/direction).
+        T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
         aim_joint2 = self.robot.inverse_kinematics(T_aim2)
         if aim_joint2 is None:
             self._node.get_logger().warn("Throw IK failed after grab; lifting in place")
             aim_joint2, T_aim2 = aim_joint, T_aim
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
+        # Compute the next pick's intercept pose. If reachable, _execute_transfer
+        # splices the post-release portion of the throw with a smooth transition
+        # to it (pre-release motion stays identical so the throw release isn't
+        # affected). If not, the throw runs through to aim_joint2 as before.
+        next_intercept_joint = None
+        if secondary is not None:
+            T_next_grasp = secondary.T_grasp_base.copy()
+            T_next_grasp[1, 3] = self.cfg.GRASP_INTERCEPT_Y
+            T_next_grasp[2, 3] = self.cfg.GRASP_Z
+            if np.linalg.norm(T_next_grasp[:2, 3]) <= self.cfg.MAX_REACH:
+                ik = self.robot.inverse_kinematics(T_next_grasp)
+                if ik is not None:
+                    next_intercept_joint = np.asarray(ik, dtype=float)
+                    next_intercept_joint[-1] = 0.0
+
         params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
-        self._execute_transfer(grasp_joint, aim_joint2, params)
+        self._execute_transfer(
+            grasp_joint, aim_joint2, params,
+            next_intercept_joint=next_intercept_joint,
+        )
         # Safety: if the throw push failed for any reason and suction is still
         # on, release so we don't end up parked holding the object.
         self.traj_ctrl.suction_off()
