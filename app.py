@@ -141,10 +141,12 @@ class Config:
     # is ~13 s, so 12 s was firing ~1 s before arrival. 25 s covers slower belts.
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
 
-    # Trajectory sampling / joint limit scales
+    # Trajectory sampling / joint limit scales. Affects the post-throw chain
+    # and the pre-pick _move_through (anything via trajectory()/opt_time);
+    # NOT the NN-driven throw motion itself (that uses params.T / params.w).
     TRAJ_HZ: float = 20.0
-    JOINT_VEL_LIMIT_SCALE: float = 0.8
-    JOINT_ACCEL_LIMIT_SCALE: float = 2.5
+    JOINT_VEL_LIMIT_SCALE: float = 0.9    # 90% of nominal joint velocity (safety margin)
+    JOINT_ACCEL_LIMIT_SCALE: float = 6.0  # M2 = M1 × this (aggressive accel/decel)
 
     # Loop cooldown
     TIME_STEP: float = 1.0 / 25.0
