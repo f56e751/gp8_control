@@ -56,7 +56,7 @@ REFERENCE_Z_BASE: float = 0.630   # only used for display; ambush picks at GRASP
 
 # Per-axis sign: flip these if a test shows the arm goes to the opposite side.
 # cy is upstream-positive → same as base +Y (belt flows toward base −Y).
-SIGN_CX_TO_BASE_X: float = -1.0
+SIGN_CX_TO_BASE_X: float = +1.0
 SIGN_CY_TO_BASE_Y: float = +1.0
 
 # Per-axis scale: if the camera's belt-frame coords don't match the robot's
