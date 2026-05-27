@@ -11,10 +11,13 @@ from __future__ import annotations
 import sys
 import time
 import csv
+import json
 import os
 import datetime
 from dataclasses import dataclass, field
 from enum import Enum
+
+from std_msgs.msg import String
 
 import numpy as np
 import rclpy
@@ -224,6 +227,11 @@ class GP8App:
         self.cfg = cfg or Config()
         self.robot = GP8()
 
+        # Belt-state viz publishing (see _publish_belt_state).
+        self._status: str = "IDLE"
+        self._status_detail: str = ""
+        self._belt_state_pub = None
+
         self._node: Node | None = None
         self._executor: MultiThreadedExecutor | None = None
         self.traj_ctrl: TrajectoryController | None = None
@@ -249,6 +257,11 @@ class GP8App:
         self._node = Node("gp8_manager")
         self._executor = MultiThreadedExecutor()
         self._executor.add_node(self._node)
+
+        # Live belt-state stream for the belt_viz TUI (separate node).
+        self._belt_state_pub = self._node.create_publisher(
+            String, "/gp8_manager/tracked_state", 10
+        )
 
         self.traj_ctrl = TrajectoryController(self._node)
         self.moveit_ctrl = MoveItController(self._node)
@@ -575,13 +588,16 @@ class GP8App:
             return
 
         # WAIT_AT_GRASP: drive all the way to the grasp pose and park there.
+        self._set_status("POSITIONING", target.class_name)
         self._move_through(current_joint, aim_joint, grasp_joint)
 
         # Wait until the predicted object position reaches the intercept line,
         # then fire suction (slightly early to cover pneumatic lag).
+        self._set_status("WAITING", target.class_name)
         self._wait_for_arrival_and_suction(target, T_grasp[1, 3])
 
         # Lift + throw — same path as the moving strategy.
+        self._set_status("THROWING", target.class_name)
         theta = THETA_MAP.get(target.class_name, 0.0)
         T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
         aim_joint2 = self.robot.inverse_kinematics(T_aim2)
@@ -593,6 +609,7 @@ class GP8App:
         params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
         self._execute_transfer(grasp_joint, aim_joint2, params)
         self._log_throw_cycle(target)
+        self._set_status("IDLE", "")
 
     def _move_through(
         self, current_joint: np.ndarray, aim_joint: np.ndarray, grasp_joint: np.ndarray
@@ -606,8 +623,14 @@ class GP8App:
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
 
     def _sleep_until(self, deadline: float) -> None:
-        """Block until ``deadline`` (wall clock), staying responsive to shutdown."""
+        """Block until ``deadline`` (wall clock), staying responsive to shutdown.
+
+        Spins briefly each tick to keep belt-speed callbacks and viz publishing
+        live during long ambush waits.
+        """
         while rclpy.ok() and time.time() < deadline:
+            rclpy.spin_once(self._node, timeout_sec=0.0)
+            self._publish_belt_state()
             time.sleep(min(0.05, deadline - time.time()))
 
     def _wait_for_arrival_and_suction(
@@ -678,6 +701,45 @@ class GP8App:
                 w.writerow(row)
         except OSError as e:
             self._node.get_logger().warn(f"pick-log write failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Belt-state viz (publishes to /gp8_manager/tracked_state for belt_viz)
+    # ------------------------------------------------------------------
+    def _set_status(self, status: str, detail: str = "") -> None:
+        self._status = status
+        self._status_detail = detail
+        self._publish_belt_state()
+
+    def _publish_belt_state(self) -> None:
+        if self._belt_state_pub is None:
+            return
+        now = time.time()
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        objs = []
+        q = getattr(self, "queue", None)
+        if q is not None:
+            for obj in list(q._objects):
+                y_now = float(obj.T_grasp_base[1, 3] - v * (now - obj.detect_time))
+                objs.append({
+                    "class": obj.class_name,
+                    "y_now": y_now,
+                    "x": float(obj.T_grasp_base[0, 3]),
+                    "z": float(obj.T_grasp_base[2, 3]),
+                    "age_s": float(now - obj.detect_time),
+                })
+        state = {
+            "ts": now,
+            "belt_mps": float(v),
+            "intercept_y": float(self.cfg.GRASP_INTERCEPT_Y),
+            "max_reach": float(self.cfg.MAX_REACH),
+            "status": self._status,
+            "status_detail": self._status_detail,
+            "objects": objs,
+        }
+        try:
+            self._belt_state_pub.publish(String(data=json.dumps(state)))
+        except Exception:
+            pass  # never let viz publishing kill the control loop
 
     # ------------------------------------------------------------------
     # Epoch stages
@@ -826,6 +888,7 @@ class GP8App:
         now = time.time()
 
         self.conveyor.check_freshness()
+        self._publish_belt_state()                # live belt + queue snapshot
 
         self._intake_new_detections(now)
         self.queue.update(now, self.conveyor.current)

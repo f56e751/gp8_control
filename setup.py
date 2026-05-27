@@ -58,6 +58,7 @@ setup(
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",
             "terminal_debug = gp8_control.terminal_debug:main",
+            "belt_viz = gp8_control.belt_viz:main",
             "queue_test = gp8_control.tests.queue_test:main",
         ],
     },
