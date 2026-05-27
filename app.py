@@ -150,6 +150,12 @@ class Config:
     TIME_STEP: float = 1.0 / 25.0
     FRAME_COOLDOWN_DISTANCE: float = 0.8
 
+    # Spatial-dedup threshold for intake. A new detection within this
+    # radius of an existing tracked object is treated as the same physical
+    # object (so successive camera frames re-detecting it don't enqueue
+    # duplicates). 5 cm covers typical position noise.
+    OBJECT_MATCH_EPSILON: float = 0.05
+
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
     RELEASE_EARLY_SHIFT: float = 0.0
@@ -810,11 +816,6 @@ class GP8App:
              long-term fix; needs upstream cooperation since this client
              only consumes positions/class_names.
         """
-        v_now = self.conveyor.current
-        if not self.frame_gate.should_poll(now, v_now):
-            time.sleep(self.cfg.TIME_STEP)
-            return
-
         snap = self._cam_latest
         if snap is None:
             return  # waiting for the first /camera_debug/detections message
@@ -822,34 +823,58 @@ class GP8App:
         if not detections:
             return
 
-        # camera_debug already applied the camera→base transform, the Z
-        # offsets, and the v*delay back-projection. ``receipt_time`` is the
-        # moment for which the corrected positions are valid; the queue
-        # extrapolates forward from there.
+        # camera_debug already applied the camera→base transform, Z offsets,
+        # and v*delay back-projection. ``receipt_time`` is the moment for
+        # which the corrected positions are valid; the queue extrapolates
+        # forward from there.
         detect_time = float(snap.get("receipt_time", time.time()))
+        v = self.conveyor.current
 
-        self.frame_gate.mark(now)
-        self._node.get_logger().info(
-            f"New frame — {len(detections)} object(s) detected "
-            f"(belt {v_now:.3f} m/s)"
-        )
+        # Spatial dedup: each camera frame re-detects every visible object,
+        # so without this the queue fills with duplicates of the same physical
+        # object. Project every existing tracked object (the active pick
+        # target plus everything in the queue) forward to ``detect_time`` and
+        # skip any new detection that lands within OBJECT_MATCH_EPSILON of
+        # one. This is the "spatial association" replacement for the old
+        # FrameGate cooldown.
+        existing: list[TrackedObject] = []
+        if self._active_target is not None:
+            existing.append(self._active_target)
+        existing.extend(self.queue._objects)
+        eps = self.cfg.OBJECT_MATCH_EPSILON
+
+        def _matches(obj: TrackedObject, det_x: float, det_y: float) -> bool:
+            ox = float(obj.T_grasp_base[0, 3])
+            oy = float(obj.T_grasp_base[1, 3] - v * (detect_time - obj.detect_time))
+            return abs(ox - det_x) < eps and abs(oy - det_y) < eps
+
+        added = 0
         for d in detections:
             base_aim = d.get("base_aim", [0.0, 0.0, 0.0])
             base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
+            det_x = float(base_grasp[0])
+            det_y = float(base_grasp[1])
+            if any(_matches(o, det_x, det_y) for o in existing):
+                continue  # already tracking this physical object
             T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
             T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
-            self._node.get_logger().info(
-                f"  intake: {d.get('class','?')} base=["
-                f"{float(base_grasp[0]):+.3f}, {float(base_grasp[1]):+.3f}, "
-                f"{float(base_grasp[2]):+.3f}] m"
-            )
-            self.queue.add(TrackedObject(
+            new_obj = TrackedObject(
                 T_aim_base=T_aim_base,
                 T_grasp_base=T_grasp_base,
                 class_name=d.get("class", "?"),
                 detect_time=detect_time,
                 cam_pos=tuple(d.get("cam", [0.0, 0.0, 0.0])),
-            ))
+            )
+            self.queue.add(new_obj)
+            existing.append(new_obj)  # dedupe within the same intake too
+            added += 1
+
+        if added > 0:
+            self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
+            self._node.get_logger().info(
+                f"New frame — {added} new object(s) added (queue size: "
+                f"{len(self.queue._objects)}, belt {v:.3f} m/s)"
+            )
 
     def _on_camera_debug_detections(self, msg: String) -> None:
         try:
