@@ -651,12 +651,20 @@ class GP8App:
     def _sleep_until(self, deadline: float) -> None:
         """Block until ``deadline`` (wall clock), staying responsive to shutdown.
 
-        Spins briefly each tick to keep belt-speed callbacks and viz publishing
-        live during long ambush waits.
+        During the long ambush wait we still pump ROS callbacks (so belt
+        speed and detection snapshots stay fresh), publish viz state, and
+        — importantly — keep ingesting new detections into the queue and
+        updating its order. Otherwise objects that arrive on the belt
+        during the wait are invisible to app.py until the current cycle's
+        throw completes (~10 s later), often too late to catch.
         """
         while rclpy.ok() and time.time() < deadline:
             rclpy.spin_once(self._node, timeout_sec=0.0)
             self._publish_belt_state()
+            now = time.time()
+            self._intake_new_detections(now)
+            if self.queue is not None:
+                self.queue.update(now, self.conveyor.current if self.conveyor else 0.0)
             time.sleep(min(0.05, deadline - time.time()))
 
     def _wait_for_arrival_and_suction(
