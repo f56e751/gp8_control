@@ -217,7 +217,11 @@ THETA_MAP = {
 # "metal" cans drop 30 cm downstream (conveyor flow direction = −Y) from
 # the plastic bin.
 THROW_BIN_OFFSET_MAP: dict[str, tuple] = {
-    "metal": (0.0, -0.30, 0.0),
+    # Plastic bin: shift +10 cm in X so throws reach into the bin
+    # (without this they were landing short of it).
+    "transparent": (0.10, 0.0, 0.0),
+    # Can bin: same +X push + 30 cm downstream (−Y) from plastic.
+    "metal":       (0.10, -0.30, 0.0),
 }
 
 
