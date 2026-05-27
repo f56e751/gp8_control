@@ -104,8 +104,8 @@ class CameraDebugNode(Node):
         ref_x = extrinsics.REFERENCE_X_BASE
         ref_y = extrinsics.REFERENCE_Y_BASE
         ref_z = extrinsics.REFERENCE_Z_BASE
-        sx = extrinsics.SIGN_CX_TO_BASE_X
-        sy = extrinsics.SIGN_CY_TO_BASE_Y
+        sx = extrinsics.SIGN_CX_TO_BASE_X * extrinsics.SCALE_CX_TO_BASE_X
+        sy = extrinsics.SIGN_CY_TO_BASE_Y * extrinsics.SCALE_CY_TO_BASE_Y
 
         detections = []
         for pos, cls, conf in zip(positions, class_names, confidences):
