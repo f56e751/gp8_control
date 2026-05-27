@@ -36,3 +36,25 @@ DETECTION_OFFSET_GRASP: float = -0.01
 # |X|<0.2 rejects anything off the belt centerline.
 WORKSPACE_Z_MAX: float = 0.67
 WORKSPACE_X_ABS: float = 0.2
+
+
+# ---------------------------------------------------------------------------
+# Belt-frame camera format (current)
+# ---------------------------------------------------------------------------
+# The camera now publishes object positions in belt-frame metres relative to
+# the conveyor image-centre, instead of raw camera-frame coords. cx is the
+# across-belt offset; cy is the along-belt offset with **+ pointing upstream**
+# (toward the camera, before the object arrives at the robot). Depth is no
+# longer sent — pick height is anchored to GRASP_Z downstream.
+#
+# Mapping → robot base frame is a simple constant translation: the image
+# centre on the belt is at this fixed point in base coords (derived from the
+# old extrinsic transform: image centre cx=cy=0 mapped to base (0.425, 2.470)).
+REFERENCE_X_BASE: float = 0.425
+REFERENCE_Y_BASE: float = 2.470
+REFERENCE_Z_BASE: float = 0.630   # only used for display; ambush picks at GRASP_Z
+
+# Per-axis sign: flip these if a test shows the arm goes to the opposite side.
+# cy is upstream-positive → same as base +Y (belt flows toward base −Y).
+SIGN_CX_TO_BASE_X: float = +1.0
+SIGN_CY_TO_BASE_Y: float = +1.0

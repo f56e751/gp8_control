@@ -98,35 +98,39 @@ class CameraDebugNode(Node):
         v = float(self._belt_mps)
         receipt = time.time()
 
-        T_robot2base = extrinsics.T_ROBOT2BASE
-        T_base2cam = extrinsics.T_BASE2CAM
         offset_aim = extrinsics.DETECTION_OFFSET_AIM
         offset_grasp = extrinsics.DETECTION_OFFSET_GRASP
-        ws_z_max = extrinsics.WORKSPACE_Z_MAX
         ws_x_abs = extrinsics.WORKSPACE_X_ABS
+        ref_x = extrinsics.REFERENCE_X_BASE
+        ref_y = extrinsics.REFERENCE_Y_BASE
+        ref_z = extrinsics.REFERENCE_Z_BASE
+        sx = extrinsics.SIGN_CX_TO_BASE_X
+        sy = extrinsics.SIGN_CY_TO_BASE_Y
 
         detections = []
         for pos, cls, conf in zip(positions, class_names, confidences):
-            # Camera may now send 2D positions (no depth); default missing
-            # components to 0 so the pipeline doesn't crash. Pick height is
-            # overridden downstream (GRASP_Z) anyway.
+            # New format: cx = across-belt offset (m), cy = along-belt offset
+            # with + upstream (toward camera). Depth no longer sent — pick
+            # height comes from GRASP_Z downstream.
             cx = float(pos[0]) if len(pos) > 0 else 0.0
             cy = float(pos[1]) if len(pos) > 1 else 0.0
-            cz = float(pos[2]) if len(pos) > 2 else 0.0
-            in_ws = (cz < ws_z_max) and (-ws_x_abs < cx < ws_x_abs)
+            cz = float(pos[2]) if len(pos) > 2 else 0.0   # for display only
+            # Workspace = on the belt centerline laterally. Across-belt is now
+            # already in belt-frame meters so the same ±0.2 m filter applies.
+            in_ws = (-ws_x_abs < cx < ws_x_abs)
 
-            # Camera → base via T_robot2base @ T_base2cam @ T_cam.
-            T_cam = np.eye(4)
-            T_cam[:3, 3] = (cx, cy, cz)
-            base = (T_robot2base @ T_base2cam @ T_cam)[:3, 3]
+            # Camera (belt-frame, image-centre origin) → robot base: simple
+            # constant translation. No more 4×4 transform; the image-centre
+            # on the belt is at REFERENCE_(X|Y|Z)_BASE.
+            x_base = ref_x + sx * cx
+            y_base = ref_y + sy * cy
+            z_base = ref_z
 
             # Apply Z offsets for aim / grasp, back-project Y by v*delay so the
             # position is "where the object is at receipt time."
-            base_grasp = base.copy()
-            base_grasp[2] += offset_grasp
+            base_grasp = np.array([x_base, y_base, z_base + offset_grasp])
             base_grasp[1] -= v * delay_s
-            base_aim = base.copy()
-            base_aim[2] += offset_aim
+            base_aim = np.array([x_base, y_base, z_base + offset_aim])
             base_aim[1] -= v * delay_s
 
             detections.append({
