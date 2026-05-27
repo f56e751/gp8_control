@@ -241,15 +241,5 @@ def generate_launch_description():
         name_bridge,
         robot_state_publisher,
         moveit_launch,
-        # camera_debug owns the camera → base correction pipeline and
-        # publishes /camera_debug/detections; gp8_app subscribes to that
-        # topic. Start it here so the bringup is self-contained instead of
-        # making the user remember a second `ros2 run`.
-        Node(
-            package="gp8_control",
-            executable="camera_debug",
-            name="camera_debug",
-            output="screen",
-        ),
         gp8_app,
     ])
