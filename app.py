@@ -156,6 +156,14 @@ class Config:
     # duplicates). 5 cm covers typical position noise.
     OBJECT_MATCH_EPSILON: float = 0.05
 
+    # Pick-feasibility safety factor. _run_ambush_pick drops queue heads
+    # whose ETA < move_time * factor — i.e. objects that will reach the
+    # intercept before the arm can finish positioning. opt_time is known to
+    # over-estimate the real move (~2x), so 0.5 trusts that the real move
+    # is roughly half the planned one; bump higher (toward 1.0) to be more
+    # conservative (drop sooner) or lower to attempt more catches.
+    PICK_FEASIBILITY_FACTOR: float = 0.5
+
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
     RELEASE_EARLY_SHIFT: float = 0.0
@@ -504,77 +512,104 @@ class GP8App:
 
     def _run_ambush_pick(self, now: float, current_joint: np.ndarray) -> None:
         """Pre-position at GRASP_INTERCEPT_Y and fire suction when the object
-        arrives — no moving-intercept lead timing.
+        arrives.
 
-        The arm parks at a fixed intercept pose (the object's lateral X and
-        height, but a constant belt-Y); suction fires when the object, whose
-        position is predicted from ``detect_time`` + live belt speed, reaches
-        the cup.
+        Walks the queue from the head, dropping anything we can't actually
+        catch (already past the pick line, out of reach, IK fails, or — the
+        new one — the object will pass the intercept before the arm finishes
+        positioning). The first feasible head is committed as the pick.
         """
-        target = self.queue.head()
         v = self.conveyor.current
         intercept_y = self.cfg.GRASP_INTERCEPT_Y
-
-        obj_y = self._object_y_now(target, now, v)
-        if obj_y <= intercept_y:
-            self.queue.pop_head()
-            self._node.get_logger().info(
-                f"Object at/past intercept (y={obj_y:.3f} <= {intercept_y:.3f}); dropping"
-            )
-            return
-
-        # Freeze belt-Y to the intercept line; keep the detected lateral X.
-        # Anchor grasp height to GRASP_Z (detected Z is noisy) and preserve the
-        # approach pose's relative height above the grasp.
-        T_grasp = target.T_grasp_base.copy()
-        T_aim = target.T_aim_base.copy()
-        approach_dz = T_aim[2, 3] - T_grasp[2, 3]
-        T_grasp[1, 3] = intercept_y
-        T_aim[1, 3] = intercept_y
-        T_grasp[2, 3] = self.cfg.GRASP_Z
-        T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
-
-        if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
-            self.queue.pop_head()
-            self._node.get_logger().info("Intercept pose out of reach; dropping")
-            return
-
-        aim_joint = self.robot.inverse_kinematics(T_aim)
-        grasp_joint = self.robot.inverse_kinematics(T_grasp)
-        if aim_joint is None or grasp_joint is None:
-            self.queue.pop_head()
-            self._node.get_logger().warn("Ambush IK failed; dropping")
-            return
-        aim_joint = np.asarray(aim_joint, dtype=float); aim_joint[-1] = 0.0
-        grasp_joint = np.asarray(grasp_joint, dtype=float); grasp_joint[-1] = 0.0
-
-        # Positioning-vs-arrival check is advisory only: opt_time is known to
-        # over-estimate the real move time here, so a hard drop would reject
-        # catchable objects. We warn if it looks tight but still attempt — a
-        # genuine late arrival just yields a missed grab, not a hazard.
         zero = np.zeros_like(self.M1)
-        move_time = (
-            opt_time(current_joint, zero, aim_joint, zero, self.M1, self.M2)
-            + opt_time(aim_joint, zero, grasp_joint, zero, self.M1, self.M2)
-        )
-        eta = (obj_y - intercept_y) / (v + 1e-6)
-        if eta < move_time:
-            self._node.get_logger().warn(
-                f"Intercept may be tight: eta {eta:.2f}s < est. move {move_time:.2f}s "
-                "(opt_time over-estimates; attempting anyway)"
-            )
+        factor = self.cfg.PICK_FEASIBILITY_FACTOR
 
+        target = None
+        target_T_aim = target_T_grasp = None
+        target_aim_joint = target_grasp_joint = None
+        target_obj_y = target_move_time = target_eta = 0.0
+
+        while self.queue:
+            candidate = self.queue.head()
+            obj_y = self._object_y_now(candidate, now, v)
+
+            # already past the pick line → drop
+            if obj_y <= intercept_y:
+                self.queue.pop_head()
+                self._node.get_logger().info(
+                    f"Drop {candidate.class_name}: already past intercept "
+                    f"(y={obj_y:+.3f} <= {intercept_y:+.3f})"
+                )
+                continue
+
+            # build intercept pose: detected X, intercept Y, GRASP_Z height
+            T_grasp = candidate.T_grasp_base.copy()
+            T_aim = candidate.T_aim_base.copy()
+            approach_dz = T_aim[2, 3] - T_grasp[2, 3]
+            T_grasp[1, 3] = intercept_y
+            T_aim[1, 3] = intercept_y
+            T_grasp[2, 3] = self.cfg.GRASP_Z
+            T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
+
+            if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
+                self.queue.pop_head()
+                self._node.get_logger().info(
+                    f"Drop {candidate.class_name}: intercept pose out of reach"
+                )
+                continue
+
+            aim_joint = self.robot.inverse_kinematics(T_aim)
+            grasp_joint = self.robot.inverse_kinematics(T_grasp)
+            if aim_joint is None or grasp_joint is None:
+                self.queue.pop_head()
+                self._node.get_logger().warn(
+                    f"Drop {candidate.class_name}: IK failed"
+                )
+                continue
+            aim_joint = np.asarray(aim_joint, dtype=float); aim_joint[-1] = 0.0
+            grasp_joint = np.asarray(grasp_joint, dtype=float); grasp_joint[-1] = 0.0
+
+            move_time = (
+                opt_time(current_joint, zero, aim_joint, zero, self.M1, self.M2)
+                + opt_time(aim_joint, zero, grasp_joint, zero, self.M1, self.M2)
+            )
+            eta = (obj_y - intercept_y) / (v + 1e-6)
+
+            # Feasibility: drop the head if the object will pass the intercept
+            # before we can position. opt_time over-estimates, so scale by
+            # PICK_FEASIBILITY_FACTOR (default 0.5) to avoid over-rejection.
+            if eta < move_time * factor:
+                self.queue.pop_head()
+                self._node.get_logger().info(
+                    f"Drop {candidate.class_name}: too late to catch "
+                    f"(eta {eta:.2f}s < move {move_time:.2f}s × {factor:.2f})"
+                )
+                continue
+
+            # Feasible — keep this as the target and stop scanning.
+            target = candidate
+            target_T_aim, target_T_grasp = T_aim, T_grasp
+            target_aim_joint, target_grasp_joint = aim_joint, grasp_joint
+            target_obj_y, target_move_time, target_eta = obj_y, move_time, eta
+            break
+
+        if target is None:
+            return  # no feasible head in the queue this epoch
+
+        # Commit to the pick.
         secondary = self.queue.peek_next() if self.queue.has_next() else None
         self.queue.pop_head()
         # Keep the active target visible in belt_viz while we execute the cycle.
         self._active_target = target
         self._node.get_logger().info(
-            f"Ambush lock: {target.class_name} @ x={T_grasp[0, 3]:+.3f} "
-            f"y={intercept_y:.3f} z={T_grasp[2, 3]:+.3f} "
-            f"(detected y={obj_y:+.3f}; eta {eta:.2f}s, move {move_time:.2f}s)"
+            f"Ambush lock: {target.class_name} @ x={target_T_grasp[0, 3]:+.3f} "
+            f"y={intercept_y:.3f} z={target_T_grasp[2, 3]:+.3f} "
+            f"(detected y={target_obj_y:+.3f}; eta {target_eta:.2f}s, "
+            f"move {target_move_time:.2f}s)"
         )
         self._execute_ambush_pick(
-            target, current_joint, aim_joint, grasp_joint, T_aim, T_grasp, secondary
+            target, current_joint, target_aim_joint, target_grasp_joint,
+            target_T_aim, target_T_grasp, secondary,
         )
 
     def _execute_ambush_pick(
