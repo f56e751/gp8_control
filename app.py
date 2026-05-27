@@ -211,18 +211,11 @@ THETA_MAP = {
 }
 
 
-# Per-class offset (m) applied to the throw landing target (T_aim2). Send
-# different classes to different drop bins relative to the default landing
-# (= plan_throw_landing's result, currently roughly the plastic bin).
-# "metal" cans drop 30 cm downstream (conveyor flow direction = −Y) from
-# the plastic bin.
-THROW_BIN_OFFSET_MAP: dict[str, tuple] = {
-    # Plastic bin: shift +10 cm in X so throws reach into the bin
-    # (without this they were landing short of it).
-    "transparent": (0.10, 0.0, 0.0),
-    # Can bin: same +X push + 30 cm downstream (−Y) from plastic.
-    "metal":       (0.10, -0.30, 0.0),
-}
+# Per-class throw bin TARGET (absolute base-frame XYZ, m). When a target's
+# class is in this map, T_aim2 is OVERRIDDEN with these coordinates so the
+# NN throw aims at a fixed bin location instead of secondary/T_aim hover.
+# Empty default — fill in with measured bin coords (e.g., from terminal_debug).
+THROW_BIN_TARGET_MAP: dict[str, tuple] = {}
 
 
 class PickWaitMode(Enum):
@@ -735,20 +728,21 @@ class GP8App:
 
         theta = THETA_MAP.get(target.class_name, 0.0)
 
-        # Original throw target — preserves the release motion exactly (same
-        # NN trajectory, same release velocity/direction).
-        T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
-
-        # Class-specific bin offset: shift the throw target so e.g. metal
-        # cans land in a different bin than plastic.
-        bin_offset = THROW_BIN_OFFSET_MAP.get(target.class_name)
-        if bin_offset is not None:
-            T_aim2 = T_aim2.copy()
-            T_aim2[:3, 3] += np.asarray(bin_offset, dtype=float)
+        # Throw target. If the class has a fixed bin coord in THROW_BIN_TARGET_MAP,
+        # override T_aim2 with that absolute base-frame XYZ so the NN aims at the
+        # bin. Otherwise fall back to the legacy plan_throw_landing (secondary's
+        # predicted position, or T_aim hover when no secondary).
+        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+        if bin_xyz is not None:
+            T_aim2 = np.eye(4)
+            T_aim2[:3, :3] = T_aim[:3, :3]
+            T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
             self._node.get_logger().info(
-                f"Throw bin offset for {target.class_name}: "
-                f"({bin_offset[0]:+.2f}, {bin_offset[1]:+.2f}, {bin_offset[2]:+.2f}) m"
+                f"Throw target for {target.class_name}: fixed bin "
+                f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
             )
+        else:
+            T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
 
         aim_joint2 = self.robot.inverse_kinematics(T_aim2)
         if aim_joint2 is None:
