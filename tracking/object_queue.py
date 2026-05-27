@@ -28,8 +28,13 @@ class TrackedObject:
 
 
 class TrackedObjectQueue:
-    def __init__(self, max_reach: float) -> None:
+    def __init__(self, max_reach: float, drop_below_y: float = 0.0) -> None:
         self._max_reach = max_reach
+        # Objects whose current y has fallen below this line are considered
+        # past the pick point and dropped from the queue (so the head is
+        # always "next-front not yet past the robot"). Default 0.0 matches
+        # the ambush intercept_y.
+        self._drop_below_y = drop_below_y
         self._objects: list[TrackedObject] = []
 
     def __len__(self) -> int:
@@ -54,16 +59,17 @@ class TrackedObjectQueue:
         return self._objects.pop(0)
 
     def update(self, now: float, conveyor_speed: float) -> None:
-        """Drop anything past -max_reach, then sort by current Y.
+        """Drop anything past the pick line (drop_below_y), then sort by current Y.
 
-        Single decorate-sort-undecorate pass — the original two-step
-        version recomputed the conveyor offset for every object twice.
+        Belt travels in -Y; the head ends up as the smallest current-y still
+        in front of (above) the pick line — i.e. "the next-front object that
+        hasn't been passed by the robot yet."
         """
         v = conveyor_speed
         decorated = [
             (obj.T_aim_base[1, 3] - v * (now - obj.detect_time), obj)
             for obj in self._objects
         ]
-        decorated = [(y, obj) for y, obj in decorated if y > -self._max_reach]
+        decorated = [(y, obj) for y, obj in decorated if y > self._drop_below_y]
         decorated.sort(key=lambda pair: pair[0])
         self._objects = [obj for _, obj in decorated]

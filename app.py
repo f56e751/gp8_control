@@ -256,7 +256,12 @@ class GP8App:
         self.predictor: TrajectoryPredictor | None = None
         self.planner: PickThrowPlanner | None = None
 
-        self.queue = TrackedObjectQueue(self.cfg.MAX_REACH)
+        # Drop tracked objects whose extrapolated y has fallen past the
+        # ambush intercept line — those are already past the robot and
+        # uncatchable; the head stays "next-front still in front of the pick".
+        self.queue = TrackedObjectQueue(
+            self.cfg.MAX_REACH, drop_below_y=self.cfg.GRASP_INTERCEPT_Y,
+        )
         self.frame_gate = FrameGate(self.cfg.FRAME_COOLDOWN_DISTANCE)
         self.pick_delay = PickDelayTracker(self.cfg.DELAY_EMA_ALPHA)
 
