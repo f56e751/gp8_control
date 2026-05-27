@@ -109,7 +109,8 @@ class BeltVizNode(Node):
             extrapolated.append((o.get("class", "?"), y,
                                  float(o.get("x", 0.0)),
                                  float(o.get("age_s", 0.0)) + dt,
-                                 is_target))
+                                 is_target,
+                                 o.get("cam")))
 
         # Axis labels along the bottom.
         axis = list(" " * width)
@@ -137,12 +138,19 @@ class BeltVizNode(Node):
         out.append(f"  {''.join(axis)}\n\n")
         if extrapolated:
             out.append(" Tracked objects (live extrapolated positions):\n")
-            for cls, y, x, age, is_target in extrapolated:
+            for cls, y, x, age, is_target, cam in extrapolated:
                 tag = " ◉" if is_target else "  "
+                if cam is not None and len(cam) >= 3:
+                    cam_str = (
+                        f"  cam=[{float(cam[0]):+.3f},"
+                        f"{float(cam[1]):+.3f},{float(cam[2]):+.3f}]"
+                    )
+                else:
+                    cam_str = "  cam=?"
                 out.append(
                     f"  {tag}{str(cls):<12s}"
-                    f" y={y:+7.3f} m"
-                    f"  x={x:+6.3f}"
+                    f" y={y:+7.3f} m  x={x:+6.3f}"
+                    f"{cam_str}"
                     f"  age={age:5.2f}s\n"
                 )
         else:

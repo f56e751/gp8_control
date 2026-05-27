@@ -22,6 +22,9 @@ class TrackedObject:
     T_grasp_base: np.ndarray
     class_name: str
     detect_time: float       # time.time() when this object was observed
+    # Raw camera-frame position [cx, cy, cz] (m) reported by the perception
+    # stream, kept verbatim for belt_viz / diagnostics. None on legacy paths.
+    cam_pos: tuple | None = None
 
 
 class TrackedObjectQueue:

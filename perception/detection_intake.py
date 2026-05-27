@@ -40,6 +40,7 @@ class GraspCandidate:
     T_aim: np.ndarray
     T_grasp: np.ndarray
     class_name: str
+    cam_pos: tuple   # raw camera-frame position [cx, cy, cz] from the stream
 
 
 class DetectionIntake:
@@ -140,7 +141,10 @@ class DetectionIntake:
             if in_ws:
                 T_aim, T_grasp = self._camera_to_grasp(pos)
                 candidates.append(
-                    GraspCandidate(T_aim=T_aim, T_grasp=T_grasp, class_name=cls)
+                    GraspCandidate(
+                        T_aim=T_aim, T_grasp=T_grasp, class_name=cls,
+                        cam_pos=(float(pos[0]), float(pos[1]), float(pos[2])),
+                    )
                 )
 
             if self._log_raw and self._logger is not None:

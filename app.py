@@ -332,7 +332,7 @@ class GP8App:
             offset_grasp=self.cfg.DETECTION_OFFSET_GRASP,
             time_step=self.cfg.TIME_STEP,
             logger=self._node.get_logger(),
-            log_raw=True,
+            log_raw=False,   # raw cam positions go to belt_viz, not the bringup log
         )
 
     def _enable_robot(self) -> None:
@@ -728,6 +728,7 @@ class GP8App:
 
         def _serialize(obj: TrackedObject, is_target: bool) -> dict:
             y_now = float(obj.T_grasp_base[1, 3] - v * (now - obj.detect_time))
+            cam = obj.cam_pos
             return {
                 "class": obj.class_name,
                 "y_now": y_now,
@@ -735,6 +736,7 @@ class GP8App:
                 "z": float(obj.T_grasp_base[2, 3]),
                 "age_s": float(now - obj.detect_time),
                 "is_target": is_target,
+                "cam": list(cam) if cam is not None else None,
             }
 
         # Currently-executing target (popped from the queue but still on the belt).
@@ -815,6 +817,7 @@ class GP8App:
                 T_grasp_base=T_grasp_base,
                 class_name=cand.class_name,
                 detect_time=detect_time,
+                cam_pos=cand.cam_pos,
             ))
 
     def _plan_throw_landing(
