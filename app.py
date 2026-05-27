@@ -754,10 +754,20 @@ class GP8App:
     def _move_through(
         self, current_joint: np.ndarray, aim_joint: np.ndarray, grasp_joint: np.ndarray
     ) -> None:
-        """Queue-mode move current -> aim -> grasp, no suction (pre-position)."""
+        """Queue-mode move directly to the grasp pose, no aim hover.
+
+        The legacy 3-point motion went current -> aim (hover ~8 cm above
+        grasp) -> grasp. After the throw's chain leaves the arm at the
+        previous intercept's GRASP_Z, that hover meant every cycle bounced
+        UP to aim and back DOWN to grasp — which is what made the suction
+        fire at "a position much higher than the object." Go direct to
+        grasp so the arm stays at GRASP_Z when transitioning between
+        picks. ``aim_joint`` is kept in the signature for back-compat but
+        unused.
+        """
         zero = np.zeros_like(self.M1)
-        traj, vel, ts = trajectory_3points(
-            current_joint, zero, aim_joint, zero, grasp_joint, zero,
+        traj, vel, ts = trajectory(
+            current_joint, zero, grasp_joint, zero,
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
