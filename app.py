@@ -606,7 +606,20 @@ class GP8App:
         self._wait_for_arrival_and_suction(target, T_grasp[1, 3])
 
         # Lift + throw — same path as the moving strategy.
+        # MotoROS2 leaves point-queue mode once the pick trajectory's queue
+        # drains, and the ambush wait keeps the queue empty for seconds, so
+        # the throw push would be rejected with "Must call
+        # start_point_queue_mode" — re-enter queue mode here too.
         self._set_status("THROWING", target.class_name)
+        if not self.traj_ctrl.enter_queue_mode():
+            self._node.get_logger().error(
+                "Failed to (re)enter queue mode for throw; dropping object"
+            )
+            self.traj_ctrl.suction_off()
+            self._active_target = None
+            self._set_status("IDLE", "")
+            return
+
         theta = THETA_MAP.get(target.class_name, 0.0)
         T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
         aim_joint2 = self.robot.inverse_kinematics(T_aim2)
@@ -617,6 +630,9 @@ class GP8App:
 
         params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
         self._execute_transfer(grasp_joint, aim_joint2, params)
+        # Safety: if the throw push failed for any reason and suction is still
+        # on, release so we don't end up parked holding the object.
+        self.traj_ctrl.suction_off()
         self._log_throw_cycle(target)
         self._active_target = None
         self._set_status("IDLE", "")
