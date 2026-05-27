@@ -127,7 +127,7 @@ class Config:
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
     GRASP_Z: float = 0.062
-    SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
+    SUCTION_LEAD: float = 1.5           # fire suction this many seconds before arrival [s]
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
