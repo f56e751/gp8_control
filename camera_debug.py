@@ -107,7 +107,12 @@ class CameraDebugNode(Node):
 
         detections = []
         for pos, cls, conf in zip(positions, class_names, confidences):
-            cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
+            # Camera may now send 2D positions (no depth); default missing
+            # components to 0 so the pipeline doesn't crash. Pick height is
+            # overridden downstream (GRASP_Z) anyway.
+            cx = float(pos[0]) if len(pos) > 0 else 0.0
+            cy = float(pos[1]) if len(pos) > 1 else 0.0
+            cz = float(pos[2]) if len(pos) > 2 else 0.0
             in_ws = (cz < ws_z_max) and (-ws_x_abs < cx < ws_x_abs)
 
             # Camera → base via T_robot2base @ T_base2cam @ T_cam.
