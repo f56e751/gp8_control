@@ -59,6 +59,7 @@ setup(
             "name_bridge = gp8_control.bridge:main",
             "terminal_debug = gp8_control.terminal_debug:main",
             "belt_viz = gp8_control.belt_viz:main",
+            "camera_debug = gp8_control.camera_debug:main",
             "queue_test = gp8_control.tests.queue_test:main",
         ],
     },

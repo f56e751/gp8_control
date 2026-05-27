@@ -53,6 +53,22 @@ from gp8_control.planning import (
 from gp8_control.robots.gp8 import GP8
 
 
+# Tool orientation used to assemble grasp/aim 4x4 from the corrected base
+# position published by the camera_debug node (which owns the camera→base
+# transform, Z offsets, and v*delay back-projection). Must match the value
+# camera_debug uses (kept identical to the legacy DetectionIntake default).
+_R_GRASP_DEFAULT = np.array(
+    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
+)
+
+
+def _make_transform(R: np.ndarray, t) -> np.ndarray:
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = np.asarray(t, dtype=float).ravel()
+    return T
+
+
 # =========================================================================
 # Configuration
 # =========================================================================
@@ -235,6 +251,11 @@ class GP8App:
         # here so the viz can keep drawing it while the cycle runs.
         self._active_target: TrackedObject | None = None
 
+        # Latest corrected detection snapshot from the camera_debug node.
+        # See /camera_debug/detections — camera_debug owns the perception
+        # stream + cam→base transform + v*delay back-projection.
+        self._cam_latest: dict | None = None
+
         self._node: Node | None = None
         self._executor: MultiThreadedExecutor | None = None
         self.traj_ctrl: TrajectoryController | None = None
@@ -268,12 +289,12 @@ class GP8App:
 
         self.traj_ctrl = TrajectoryController(self._node)
         self.moveit_ctrl = MoveItController(self._node)
-        self.detection_source = StreamDetectionSource(
-            self.cfg.PERCEPTION_URL,
-            reconnect_delay=self.cfg.PERCEPTION_RECONNECT_DELAY,
-            logger=self._node.get_logger(),
+        # camera_debug node owns the perception stream + corrections; we just
+        # subscribe to its corrected detection list.
+        self._node.create_subscription(
+            String, "/camera_debug/detections",
+            self._on_camera_debug_detections, 10,
         )
-        self.detection_source.start()
         self.conveyor = ConveyorSpeedTracker(
             self._node,
             self.cfg.CONVEYOR_TOPIC,
@@ -285,7 +306,6 @@ class GP8App:
         self._load_predictor()
         self._setup_joint_limits()
         self._build_planner()
-        self._build_intake()
         self._enable_robot()
         # Always start from a known-off suction state.
         self._node.get_logger().info("Forcing suction OFF at startup.")
@@ -790,35 +810,47 @@ class GP8App:
             time.sleep(self.cfg.TIME_STEP)
             return
 
-        candidates, delay = self.intake.poll(time_to_check=0.3)
-        detect_time = time.time()
-        if not candidates:
+        snap = self._cam_latest
+        if snap is None:
+            return  # waiting for the first /camera_debug/detections message
+        detections = [d for d in snap.get("detections", []) if d.get("in_workspace")]
+        if not detections:
             return
+
+        # camera_debug already applied the camera→base transform, the Z
+        # offsets, and the v*delay back-projection. ``receipt_time`` is the
+        # moment for which the corrected positions are valid; the queue
+        # extrapolates forward from there.
+        detect_time = float(snap.get("receipt_time", time.time()))
 
         self.frame_gate.mark(now)
         self._node.get_logger().info(
-            f"New frame — {len(candidates)} object(s) detected (belt {v_now:.3f} m/s)"
+            f"New frame — {len(detections)} object(s) detected "
+            f"(belt {v_now:.3f} m/s)"
         )
-        for cand in candidates:
-            T_aim_base = cand.T_aim.copy()
-            T_grasp_base = cand.T_grasp.copy()
-            # Compensate for perception-pipeline delay using live speed
-            T_aim_base[1, 3] -= v_now * delay
-            T_grasp_base[1, 3] -= v_now * delay
-            # Per-candidate target (base frame) — for diagnosing lateral
-            # mis-grasp (compare with where the object actually is on the belt).
+        for d in detections:
+            base_aim = d.get("base_aim", [0.0, 0.0, 0.0])
+            base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
+            T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
+            T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
             self._node.get_logger().info(
-                f"  intake: {cand.class_name} base=["
-                f"{T_grasp_base[0, 3]:+.3f}, {T_grasp_base[1, 3]:+.3f}, "
-                f"{T_grasp_base[2, 3]:+.3f}] m"
+                f"  intake: {d.get('class','?')} base=["
+                f"{float(base_grasp[0]):+.3f}, {float(base_grasp[1]):+.3f}, "
+                f"{float(base_grasp[2]):+.3f}] m"
             )
             self.queue.add(TrackedObject(
                 T_aim_base=T_aim_base,
                 T_grasp_base=T_grasp_base,
-                class_name=cand.class_name,
+                class_name=d.get("class", "?"),
                 detect_time=detect_time,
-                cam_pos=cand.cam_pos,
+                cam_pos=tuple(d.get("cam", [0.0, 0.0, 0.0])),
             ))
+
+    def _on_camera_debug_detections(self, msg: String) -> None:
+        try:
+            self._cam_latest = json.loads(msg.data)
+        except (ValueError, TypeError):
+            pass
 
     def _plan_throw_landing(
         self,
