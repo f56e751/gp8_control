@@ -555,8 +555,9 @@ class GP8App:
         # Keep the active target visible in belt_viz while we execute the cycle.
         self._active_target = target
         self._node.get_logger().info(
-            f"Ambush lock: {target.class_name} @ y={intercept_y:.3f} "
-            f"(eta {eta:.2f}s, move {move_time:.2f}s)"
+            f"Ambush lock: {target.class_name} @ x={T_grasp[0, 3]:+.3f} "
+            f"y={intercept_y:.3f} z={T_grasp[2, 3]:+.3f} "
+            f"(detected y={obj_y:+.3f}; eta {eta:.2f}s, move {move_time:.2f}s)"
         )
         self._execute_ambush_pick(
             target, current_joint, aim_joint, grasp_joint, T_aim, T_grasp, secondary
@@ -800,6 +801,13 @@ class GP8App:
             # Compensate for perception-pipeline delay using live speed
             T_aim_base[1, 3] -= v_now * delay
             T_grasp_base[1, 3] -= v_now * delay
+            # Per-candidate target (base frame) — for diagnosing lateral
+            # mis-grasp (compare with where the object actually is on the belt).
+            self._node.get_logger().info(
+                f"  intake: {cand.class_name} base=["
+                f"{T_grasp_base[0, 3]:+.3f}, {T_grasp_base[1, 3]:+.3f}, "
+                f"{T_grasp_base[2, 3]:+.3f}] m"
+            )
             self.queue.add(TrackedObject(
                 T_aim_base=T_aim_base,
                 T_grasp_base=T_grasp_base,
