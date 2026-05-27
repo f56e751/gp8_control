@@ -56,6 +56,8 @@ class DetectionIntake:
         # rejects anything off the belt centerline.
         workspace_z_max: float = 0.67,
         workspace_x_abs: float = 0.2,
+        logger=None,
+        log_raw: bool = False,
     ) -> None:
         self._node = node
         self._sam = sam_client
@@ -67,6 +69,12 @@ class DetectionIntake:
         self._z_max = workspace_z_max
         self._x_abs = workspace_x_abs
         self._R_grasp = _R_GRASP_DEFAULT
+        # Optional raw-detection logging: when set, every detection seen on
+        # the stream is logged with its camera-frame position, transformed
+        # base-frame grasp position, and the filter decision. Used to debug
+        # cases like base-X stuck at the constant 0.425 (camera sent [0,0,0]).
+        self._logger = logger
+        self._log_raw = log_raw
 
     def _camera_to_grasp(self, position) -> tuple[np.ndarray, np.ndarray]:
         T_cam = np.eye(4)
@@ -127,8 +135,30 @@ class DetectionIntake:
 
         candidates: list[GraspCandidate] = []
         for pos, cls in zip(positions, class_names):
-            if not self._in_workspace(pos):
-                continue
-            T_aim, T_grasp = self._camera_to_grasp(pos)
-            candidates.append(GraspCandidate(T_aim=T_aim, T_grasp=T_grasp, class_name=cls))
+            in_ws = self._in_workspace(pos)
+            T_aim, T_grasp = (None, None)
+            if in_ws:
+                T_aim, T_grasp = self._camera_to_grasp(pos)
+                candidates.append(
+                    GraspCandidate(T_aim=T_aim, T_grasp=T_grasp, class_name=cls)
+                )
+
+            if self._log_raw and self._logger is not None:
+                cx, cy, cz = (float(pos[0]), float(pos[1]), float(pos[2]))
+                if in_ws and T_grasp is not None:
+                    bx, by, bz = (
+                        float(T_grasp[0, 3]),
+                        float(T_grasp[1, 3]),
+                        float(T_grasp[2, 3]),
+                    )
+                    self._logger.info(
+                        f"raw cam=[{cx:+.4f},{cy:+.4f},{cz:+.4f}] cls={cls}"
+                        f" -> base x={bx:+.3f} y={by:+.3f} z={bz:+.3f}"
+                        f" (delay {delay:.3f}s)"
+                    )
+                else:
+                    self._logger.info(
+                        f"raw cam=[{cx:+.4f},{cy:+.4f},{cz:+.4f}] cls={cls}"
+                        f" FILTERED (workspace) (delay {delay:.3f}s)"
+                    )
         return candidates, delay

@@ -331,6 +331,8 @@ class GP8App:
             offset_aim=self.cfg.DETECTION_OFFSET_AIM,
             offset_grasp=self.cfg.DETECTION_OFFSET_GRASP,
             time_step=self.cfg.TIME_STEP,
+            logger=self._node.get_logger(),
+            log_raw=True,
         )
 
     def _enable_robot(self) -> None:
