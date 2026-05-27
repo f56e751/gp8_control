@@ -667,7 +667,25 @@ class GP8App:
             return
 
         theta = THETA_MAP.get(target.class_name, 0.0)
-        T_aim2 = self._plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
+
+        # End the throw motion at the NEXT pick's intercept pose so the arm
+        # parks ready for the next object the moment the throw finishes —
+        # no separate "return to home then move to next" trajectory after
+        # release. If there's no feasible next intercept (queue empty after
+        # this pick, secondary unreachable), fall back to the legacy
+        # plan_throw_landing target.
+        T_aim2 = None
+        if secondary is not None:
+            T_next_grasp = secondary.T_grasp_base.copy()
+            T_next_grasp[1, 3] = self.cfg.GRASP_INTERCEPT_Y
+            T_next_grasp[2, 3] = self.cfg.GRASP_Z
+            if np.linalg.norm(T_next_grasp[:2, 3]) <= self.cfg.MAX_REACH:
+                T_aim2 = T_next_grasp
+        if T_aim2 is None:
+            T_aim2 = self._plan_throw_landing(
+                T_grasp, theta, T_aim, time.time(), secondary
+            )
+
         aim_joint2 = self.robot.inverse_kinematics(T_aim2)
         if aim_joint2 is None:
             self._node.get_logger().warn("Throw IK failed after grab; lifting in place")
