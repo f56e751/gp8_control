@@ -570,132 +570,90 @@ class GP8App:
         return target.T_grasp_base[1, 3] - v * (now - target.detect_time)
 
     def _run_ambush_pick(self, now: float, current_joint: np.ndarray) -> None:
-        """Pre-position at the intercept and fire suction when the object
+        """Pre-position at GRASP_INTERCEPT_Y and fire suction when the object
         arrives.
 
-        Walks the queue from the head. For each candidate, tries the default
-        intercept Y first; if positioning won't make it in time, shifts the
-        intercept downstream (more negative Y) just enough to give the arm
-        the needed time budget. Drops candidates that can't be caught even
-        with maximum downstream shift (out of reach).
+        Walks the queue from the head, dropping anything we can't actually
+        catch (already past the pick line, out of reach, IK fails, or — the
+        new one — the object will pass the intercept before the arm finishes
+        positioning). The first feasible head is committed as the pick.
         """
         v = self.conveyor.current
-        default_intercept_y = self.cfg.GRASP_INTERCEPT_Y
+        intercept_y = self.cfg.GRASP_INTERCEPT_Y
         zero = np.zeros_like(self.M1)
         factor = self.cfg.PICK_FEASIBILITY_FACTOR
-        lead = self.cfg.SUCTION_LEAD
-
-        def _build_poses(cand: TrackedObject, intercept_y: float):
-            T_grasp = cand.T_grasp_base.copy()
-            T_aim = cand.T_aim_base.copy()
-            approach_dz = T_aim[2, 3] - T_grasp[2, 3]
-            T_grasp[1, 3] = intercept_y
-            T_aim[1, 3] = intercept_y
-            T_grasp[2, 3] = self.cfg.GRASP_Z
-            T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
-            return T_grasp, T_aim
-
-        def _try(cand: TrackedObject, intercept_y: float):
-            """Returns (T_grasp, T_aim, grasp_joint, aim_joint, move_time, eta)
-            or None if not feasible at this intercept."""
-            T_grasp, T_aim = _build_poses(cand, intercept_y)
-            if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
-                return None
-            aj = self.robot.inverse_kinematics(T_aim)
-            gj = self.robot.inverse_kinematics(T_grasp)
-            if aj is None or gj is None:
-                return None
-            aj = np.asarray(aj, dtype=float); aj[-1] = 0.0
-            gj = np.asarray(gj, dtype=float); gj[-1] = 0.0
-            mt = (
-                opt_time(current_joint, zero, aj, zero, self.M1, self.M2)
-                + opt_time(aj, zero, gj, zero, self.M1, self.M2)
-            )
-            return T_grasp, T_aim, gj, aj, mt
 
         target = None
         target_T_aim = target_T_grasp = None
         target_aim_joint = target_grasp_joint = None
-        target_intercept_y = default_intercept_y
         target_obj_y = target_move_time = target_eta = 0.0
 
         while self.queue:
             candidate = self.queue.head()
             obj_y = self._object_y_now(candidate, now, v)
 
-            # already past max-downstream reach → drop
-            if obj_y <= -self.cfg.MAX_REACH:
+            # already past the pick line → drop
+            if obj_y <= intercept_y:
                 self.queue.pop_head()
                 self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: past max-reach "
-                    f"(y={obj_y:+.3f})"
+                    f"Drop {candidate.class_name}: already past intercept "
+                    f"(y={obj_y:+.3f} <= {intercept_y:+.3f})"
                 )
                 continue
 
-            # First pass: try the default intercept
-            attempt = _try(candidate, default_intercept_y)
-            if attempt is None:
+            # build intercept pose: detected X, intercept Y, GRASP_Z height
+            T_grasp = candidate.T_grasp_base.copy()
+            T_aim = candidate.T_aim_base.copy()
+            approach_dz = T_aim[2, 3] - T_grasp[2, 3]
+            T_grasp[1, 3] = intercept_y
+            T_aim[1, 3] = intercept_y
+            T_grasp[2, 3] = self.cfg.GRASP_Z
+            T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
+
+            if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
                 self.queue.pop_head()
                 self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: out of reach / IK fail at default intercept"
+                    f"Drop {candidate.class_name}: intercept pose out of reach"
                 )
                 continue
 
-            T_grasp, T_aim, gj, aj, mt = attempt
-            eta = (obj_y - default_intercept_y) / (v + 1e-6)
-            needed = mt * factor + lead
-
-            if eta >= needed:
-                # Default intercept is feasible.
-                target = candidate
-                target_T_aim, target_T_grasp = T_aim, T_grasp
-                target_aim_joint, target_grasp_joint = aj, gj
-                target_intercept_y = default_intercept_y
-                target_obj_y, target_move_time, target_eta = obj_y, mt, eta
-                break
-
-            # Default too tight: shift intercept downstream so the object's
-            # arrival is delayed enough to give the arm needed time.
-            shifted = obj_y - v * needed
-            if shifted < -self.cfg.MAX_REACH:
+            aim_joint = self.robot.inverse_kinematics(T_aim)
+            grasp_joint = self.robot.inverse_kinematics(T_grasp)
+            if aim_joint is None or grasp_joint is None:
                 self.queue.pop_head()
-                self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: even max downstream shift "
-                    f"(y={shifted:+.3f}) is out of reach (eta {eta:.2f}s < {needed:.2f}s)"
+                self._node.get_logger().warn(
+                    f"Drop {candidate.class_name}: IK failed"
                 )
                 continue
+            aim_joint = np.asarray(aim_joint, dtype=float); aim_joint[-1] = 0.0
+            grasp_joint = np.asarray(grasp_joint, dtype=float); grasp_joint[-1] = 0.0
 
-            # Retry at shifted intercept
-            attempt2 = _try(candidate, shifted)
-            if attempt2 is None:
-                self.queue.pop_head()
-                self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: shifted intercept y={shifted:+.3f} "
-                    "unreachable / IK fail"
-                )
-                continue
-
-            T_grasp2, T_aim2_, gj2, aj2, mt2 = attempt2
-            eta2 = (obj_y - shifted) / (v + 1e-6)
-            needed2 = mt2 * factor + lead
-            if eta2 < needed2:
-                # Shifting changed move_time enough that it's still tight; drop.
-                self.queue.pop_head()
-                self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: shifted still tight "
-                    f"(eta {eta2:.2f}s < {needed2:.2f}s)"
-                )
-                continue
-
-            target = candidate
-            target_T_aim, target_T_grasp = T_aim2_, T_grasp2
-            target_aim_joint, target_grasp_joint = aj2, gj2
-            target_intercept_y = shifted
-            target_obj_y, target_move_time, target_eta = obj_y, mt2, eta2
-            self._node.get_logger().info(
-                f"Shifted intercept for {candidate.class_name}: "
-                f"y={shifted:+.3f} (default 0.0 too tight, eta {eta:.2f}s < {needed:.2f}s)"
+            move_time = (
+                opt_time(current_joint, zero, aim_joint, zero, self.M1, self.M2)
+                + opt_time(aim_joint, zero, grasp_joint, zero, self.M1, self.M2)
             )
+            eta = (obj_y - intercept_y) / (v + 1e-6)
+
+            # Feasibility: the arm must be parked at the intercept by the time
+            # suction fires (= eta - SUCTION_LEAD), not just by the time the
+            # object actually arrives. Drop heads we can't position in time.
+            # opt_time over-estimates the real move (~2x), so scale by
+            # PICK_FEASIBILITY_FACTOR (default 0.5).
+            needed = move_time * factor + self.cfg.SUCTION_LEAD
+            if eta < needed:
+                self.queue.pop_head()
+                self._node.get_logger().info(
+                    f"Drop {candidate.class_name}: too late to catch "
+                    f"(eta {eta:.2f}s < move {move_time:.2f}s × {factor:.2f} "
+                    f"+ suction lead {self.cfg.SUCTION_LEAD:.2f}s = {needed:.2f}s)"
+                )
+                continue
+
+            # Feasible — keep this as the target and stop scanning.
+            target = candidate
+            target_T_aim, target_T_grasp = T_aim, T_grasp
+            target_aim_joint, target_grasp_joint = aim_joint, grasp_joint
+            target_obj_y, target_move_time, target_eta = obj_y, move_time, eta
             break
 
         if target is None:
@@ -708,7 +666,7 @@ class GP8App:
         self._active_target = target
         self._node.get_logger().info(
             f"Ambush lock: {target.class_name} @ x={target_T_grasp[0, 3]:+.3f} "
-            f"y={target_intercept_y:+.3f} z={target_T_grasp[2, 3]:+.3f} "
+            f"y={intercept_y:.3f} z={target_T_grasp[2, 3]:+.3f} "
             f"(detected y={target_obj_y:+.3f}; eta {target_eta:.2f}s, "
             f"move {target_move_time:.2f}s)"
         )
