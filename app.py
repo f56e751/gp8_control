@@ -724,20 +724,31 @@ class GP8App:
             aim_joint2, T_aim2 = aim_joint, T_aim
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
-        # Compute the next pick's intercept pose. If reachable, _execute_transfer
-        # splices the post-release portion of the throw with a smooth transition
-        # to it (pre-release motion stays identical so the throw release isn't
-        # affected). If not, the throw runs through to aim_joint2 as before.
+        # Re-poll the queue here (NOT the 'secondary' captured at lock time)
+        # because new objects may have entered the queue during the ~10 s
+        # ambush wait. Walk from head and pick the first reachable candidate
+        # as the chain target for the throw's post-release motion.
+        self.queue.update(
+            time.time(),
+            self.conveyor.current if self.conveyor is not None else 0.0,
+        )
         next_intercept_joint = None
-        if secondary is not None:
-            T_next_grasp = secondary.T_grasp_base.copy()
+        for cand in list(self.queue._objects):
+            T_next_grasp = cand.T_grasp_base.copy()
             T_next_grasp[1, 3] = self.cfg.GRASP_INTERCEPT_Y
             T_next_grasp[2, 3] = self.cfg.GRASP_Z
-            if np.linalg.norm(T_next_grasp[:2, 3]) <= self.cfg.MAX_REACH:
-                ik = self.robot.inverse_kinematics(T_next_grasp)
-                if ik is not None:
-                    next_intercept_joint = np.asarray(ik, dtype=float)
-                    next_intercept_joint[-1] = 0.0
+            if np.linalg.norm(T_next_grasp[:2, 3]) > self.cfg.MAX_REACH:
+                continue
+            ik = self.robot.inverse_kinematics(T_next_grasp)
+            if ik is None:
+                continue
+            next_intercept_joint = np.asarray(ik, dtype=float)
+            next_intercept_joint[-1] = 0.0
+            self._node.get_logger().info(
+                f"Throw chain target: {cand.class_name} at "
+                f"x={float(T_next_grasp[0, 3]):+.3f}"
+            )
+            break
 
         params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
         self._execute_transfer(
