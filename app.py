@@ -231,6 +231,9 @@ class GP8App:
         self._status: str = "IDLE"
         self._status_detail: str = ""
         self._belt_state_pub = None
+        # The target currently being executed (popped from the queue) — kept
+        # here so the viz can keep drawing it while the cycle runs.
+        self._active_target: TrackedObject | None = None
 
         self._node: Node | None = None
         self._executor: MultiThreadedExecutor | None = None
@@ -549,6 +552,8 @@ class GP8App:
 
         secondary = self.queue.peek_next() if self.queue.has_next() else None
         self.queue.pop_head()
+        # Keep the active target visible in belt_viz while we execute the cycle.
+        self._active_target = target
         self._node.get_logger().info(
             f"Ambush lock: {target.class_name} @ y={intercept_y:.3f} "
             f"(eta {eta:.2f}s, move {move_time:.2f}s)"
@@ -609,6 +614,7 @@ class GP8App:
         params = self.planner.compute_throw_params(T_grasp, T_aim2, theta)
         self._execute_transfer(grasp_joint, aim_joint2, params)
         self._log_throw_cycle(target)
+        self._active_target = None
         self._set_status("IDLE", "")
 
     def _move_through(
@@ -716,17 +722,26 @@ class GP8App:
         now = time.time()
         v = self.conveyor.current if self.conveyor is not None else 0.0
         objs = []
+
+        def _serialize(obj: TrackedObject, is_target: bool) -> dict:
+            y_now = float(obj.T_grasp_base[1, 3] - v * (now - obj.detect_time))
+            return {
+                "class": obj.class_name,
+                "y_now": y_now,
+                "x": float(obj.T_grasp_base[0, 3]),
+                "z": float(obj.T_grasp_base[2, 3]),
+                "age_s": float(now - obj.detect_time),
+                "is_target": is_target,
+            }
+
+        # Currently-executing target (popped from the queue but still on the belt).
+        if self._active_target is not None:
+            objs.append(_serialize(self._active_target, True))
+
         q = getattr(self, "queue", None)
         if q is not None:
             for obj in list(q._objects):
-                y_now = float(obj.T_grasp_base[1, 3] - v * (now - obj.detect_time))
-                objs.append({
-                    "class": obj.class_name,
-                    "y_now": y_now,
-                    "x": float(obj.T_grasp_base[0, 3]),
-                    "z": float(obj.T_grasp_base[2, 3]),
-                    "age_s": float(now - obj.detect_time),
-                })
+                objs.append(_serialize(obj, False))
         state = {
             "ts": now,
             "belt_mps": float(v),

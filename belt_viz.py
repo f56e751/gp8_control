@@ -28,6 +28,7 @@ Y_HIGH = 3.0       # upstream (m) — left edge of the strip
 Y_LOW = -0.5       # downstream past pick — right edge
 RENDER_HZ = 20.0   # animation update rate
 OBJECT_GLYPH = "●"
+TARGET_GLYPH = "◉"     # currently-executing pick target
 
 
 def _y_to_col(y: float, width: int) -> int:
@@ -100,9 +101,15 @@ class BeltVizNode(Node):
             y0 = float(o.get("y_now", 0.0))
             y = y0 - v * dt
             col = _y_to_col(y, width)
-            obj_row[col] = OBJECT_GLYPH
-            extrapolated.append((o.get("class", "?"), y, float(o.get("x", 0.0)),
-                                 float(o.get("age_s", 0.0)) + dt))
+            is_target = bool(o.get("is_target", False))
+            glyph = TARGET_GLYPH if is_target else OBJECT_GLYPH
+            # Don't let a queued ● overwrite an active ◉ at the same column.
+            if obj_row[col] != TARGET_GLYPH:
+                obj_row[col] = glyph
+            extrapolated.append((o.get("class", "?"), y,
+                                 float(o.get("x", 0.0)),
+                                 float(o.get("age_s", 0.0)) + dt,
+                                 is_target))
 
         # Axis labels along the bottom.
         axis = list(" " * width)
@@ -120,7 +127,7 @@ class BeltVizNode(Node):
         )
         out.append(
             f" objects: {len(objs)}   "
-            f"([=camera   R=pick   ●=object)\n\n"
+            f"([=camera   R=pick   ●=queued   ◉=active target)\n\n"
         )
         out.append(
             " upstream  ──────  belt direction  ──────→  downstream\n\n"
@@ -130,9 +137,10 @@ class BeltVizNode(Node):
         out.append(f"  {''.join(axis)}\n\n")
         if extrapolated:
             out.append(" Tracked objects (live extrapolated positions):\n")
-            for cls, y, x, age in extrapolated:
+            for cls, y, x, age, is_target in extrapolated:
+                tag = " ◉" if is_target else "  "
                 out.append(
-                    f"   {str(cls):<12s}"
+                    f"  {tag}{str(cls):<12s}"
                     f" y={y:+7.3f} m"
                     f"  x={x:+6.3f}"
                     f"  age={age:5.2f}s\n"
