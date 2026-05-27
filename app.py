@@ -30,6 +30,7 @@ from gp8_control.controllers.pick_delay_tracker import PickDelayTracker
 from gp8_control.perception.stream_detection_source import StreamDetectionSource
 from gp8_control.perception.conveyor_speed import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
+from gp8_control.perception import extrinsics as _extrinsics
 from gp8_control.trajectory.trajectory_primitive import (
     trajectory,
     trajectory_3points,
@@ -99,9 +100,9 @@ class Config:
     CONVEYOR_STALE_SECONDS: float = 2.0
     TARGET_DISTANCE: float = 1.2
 
-    # Detection
-    DETECTION_OFFSET_AIM: float = 0.07
-    DETECTION_OFFSET_GRASP: float = -0.01
+    # Detection (Z offsets shared with camera_debug via perception.extrinsics)
+    DETECTION_OFFSET_AIM: float = _extrinsics.DETECTION_OFFSET_AIM
+    DETECTION_OFFSET_GRASP: float = _extrinsics.DETECTION_OFFSET_GRASP
 
     # Pick-cycle delay starts at 0 (first pick uncompensated), then the
     # first observed overhead is adopted as-is, later picks EMA-smooth.
@@ -163,22 +164,13 @@ class Config:
     ]))
     INITIAL_T: np.ndarray = field(default_factory=lambda: np.array([[0.4], [0.0], [0.1]]))
 
-    # Fixed extrinsics (main_sam7 trusts these without an AprilTag handshake)
-    T_ROBOT2BASE: np.ndarray = field(default_factory=lambda: np.array([
-        [0.0, 1.0, 0.0, -0.025],
-        [-1.0, 0.0, 0.0, 0.235],
-        [0.0, 0.0, 1.0, -0.020],
-        [0.0, 0.0, 0.0, 1.0],
-    ]))
-    T_BASE2CAM: np.ndarray = field(default_factory=lambda: np.array([
-        # X = -2.235 so a centered detection maps to belt-Y = 2.47 m
-        # (measured camera->pick belt-direction length): 2.235 + 0.235 (the
-        # T_ROBOT2BASE Y offset) = 2.47.
-        [0.0, -1.0, 0.0, -2.235],
-        [-1.0, 0.0, 0.0,  0.450],
-        [0.0,  0.0, -1.0, 0.650],
-        [0.0,  0.0, 0.0,  1.0],
-    ]))
+    # Fixed extrinsics (shared with camera_debug via perception.extrinsics)
+    T_ROBOT2BASE: np.ndarray = field(
+        default_factory=lambda: _extrinsics.T_ROBOT2BASE.copy()
+    )
+    T_BASE2CAM: np.ndarray = field(
+        default_factory=lambda: _extrinsics.T_BASE2CAM.copy()
+    )
 
     def throw_decoding(self) -> ThrowDecodingConfig:
         return ThrowDecodingConfig(

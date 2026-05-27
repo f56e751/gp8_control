@@ -18,6 +18,7 @@ Run alongside the bringup in its own terminal:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -27,27 +28,26 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64, String
 
-from gp8_control.app import Config
+from gp8_control.perception import extrinsics
 from gp8_control.perception.perception_client import stream_detections
 
 
-# Workspace filter — kept in sync with the old DetectionIntake defaults
-# (camera-frame Z<0.67 keeps belt-surface detections; |X|<0.2 trims off-belt).
-WS_Z_MAX = 0.67
-WS_X_ABS = 0.2
+# Perception stream URL — same env-var override as gp8_control.app.Config.
+PERCEPTION_URL_DEFAULT = "http://147.46.175.15:8080/detections/stream"
+RECONNECT_DELAY = 2.0
+CONVEYOR_TOPIC = "/conveyor/speed"
+CONVEYOR_FALLBACK_MPS = 0.083
 
-RENDER_HZ = 10.0
 PUBLISH_HZ = 10.0
 
 
 class CameraDebugNode(Node):
     def __init__(self) -> None:
         super().__init__("camera_debug")
-        self._cfg = Config()
 
-        self._belt_mps = self._cfg.CONVEYOR_SPEED   # fallback until first /conveyor/speed
+        self._belt_mps = CONVEYOR_FALLBACK_MPS   # until first /conveyor/speed
         self.create_subscription(
-            Float64, self._cfg.CONVEYOR_TOPIC, self._on_belt, 1
+            Float64, CONVEYOR_TOPIC, self._on_belt, 1
         )
 
         self._snap_lock = threading.Lock()
@@ -58,7 +58,9 @@ class CameraDebugNode(Node):
         )
         self.create_timer(1.0 / PUBLISH_HZ, self._publish_and_render)
 
-        self._stream_url = self._cfg.PERCEPTION_URL
+        self._stream_url = os.environ.get(
+            "GP8_PERCEPTION_URL", PERCEPTION_URL_DEFAULT
+        )
         self._stream_thread = threading.Thread(
             target=self._run_stream, name="camera-stream", daemon=True
         )
@@ -80,7 +82,7 @@ class CameraDebugNode(Node):
         try:
             stream_detections(
                 self._stream_url, self._on_record,
-                reconnect_delay=self._cfg.PERCEPTION_RECONNECT_DELAY,
+                reconnect_delay=RECONNECT_DELAY,
             )
         except Exception as e:
             self.get_logger().error(f"perception stream thread crashed: {e}")
@@ -96,15 +98,17 @@ class CameraDebugNode(Node):
         v = float(self._belt_mps)
         receipt = time.time()
 
-        T_robot2base = self._cfg.T_ROBOT2BASE
-        T_base2cam = self._cfg.T_BASE2CAM
-        offset_aim = self._cfg.DETECTION_OFFSET_AIM
-        offset_grasp = self._cfg.DETECTION_OFFSET_GRASP
+        T_robot2base = extrinsics.T_ROBOT2BASE
+        T_base2cam = extrinsics.T_BASE2CAM
+        offset_aim = extrinsics.DETECTION_OFFSET_AIM
+        offset_grasp = extrinsics.DETECTION_OFFSET_GRASP
+        ws_z_max = extrinsics.WORKSPACE_Z_MAX
+        ws_x_abs = extrinsics.WORKSPACE_X_ABS
 
         detections = []
         for pos, cls, conf in zip(positions, class_names, confidences):
             cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
-            in_ws = (cz < WS_Z_MAX) and (-WS_X_ABS < cx < WS_X_ABS)
+            in_ws = (cz < ws_z_max) and (-ws_x_abs < cx < ws_x_abs)
 
             # Camera → base via T_robot2base @ T_base2cam @ T_cam.
             T_cam = np.eye(4)
