@@ -826,7 +826,12 @@ class GP8App:
             self._intake_new_detections(now)
             if self.queue is not None:
                 self.queue.update(now, self.conveyor.current if self.conveyor else 0.0)
-            time.sleep(min(0.05, deadline - time.time()))
+            # Clamp non-negative: the loop body (spin + intake + queue.update)
+            # can overrun the remaining time-to-deadline, making the delta
+            # negative -> time.sleep() would raise "sleep length must be
+            # non-negative" and kill the epoch mid-wait (arm parked, no
+            # suction/throw). max(0.0, ...) lets the while-guard exit instead.
+            time.sleep(max(0.0, min(0.05, deadline - time.time())))
 
     def _wait_for_arrival_and_suction(
         self, target: TrackedObject, intercept_y: float
