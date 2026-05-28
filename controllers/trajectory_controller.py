@@ -19,6 +19,7 @@ from rclpy.qos import qos_profile_sensor_data
 from control_msgs.action import FollowJointTrajectory
 from motoros2_interfaces.srv import (
     QueueTrajPoint,
+    ResetError,
     StartPointQueueMode,
     StartTrajMode,
     WriteSingleIO,
@@ -88,6 +89,13 @@ class TrajectoryController:
         # bridge가 URDF→raw 번역해서 MotoROS2 /queue_traj_point로 포워딩
         self._queue_point_client = self._node.create_client(
             QueueTrajPoint, "/motoman_gp8_controller/queue_traj_point",
+            callback_group=cb_group,
+        )
+        # MotoROS2 alarm/error reset — used to auto-recover from a controller
+        # alarm (e.g. 4414 excessive segment velocity) that otherwise blocks
+        # all subsequent start_point_queue_mode calls with "active Alarm".
+        self._reset_error_client = self._node.create_client(
+            ResetError, "/reset_error",
             callback_group=cb_group,
         )
 
@@ -190,22 +198,78 @@ class TrajectoryController:
     # ------------------------------------------------------------------
 
     def enter_queue_mode(self) -> bool:
-        """Trajectory mode 해제 후 Point Queue mode 진입."""
+        """Trajectory mode 해제 후 Point Queue mode 진입.
+
+        컨트롤러 알람/에러(예: 4414 excessive segment velocity)로 진입 실패 시
+        ``/reset_error``를 1회 호출하고 재시도한다 — 자동 복구가 없으면 한 번
+        알람이 뜬 뒤 이후 모든 진입이 "active Alarm"으로 연쇄 실패한다.
+        """
+        res = self._try_start_queue_mode()
+        if res is not None and res.result_code.value == 1:
+            self._node.get_logger().info(f"Queue mode entered: {res.message or 'READY'}")
+            return True
+
+        # MotionReadyEnum: 101=Alarm, 102=Error, 112=Inc-move error — all
+        # clearable remotely via reset_error. E-Stop/HOLD/TEACH/not-REMOTE need
+        # physical action, so don't auto-retry those (it would just loop).
+        recoverable = res is not None and res.result_code.value in (101, 102, 112)
+        if not recoverable:
+            self._node.get_logger().error(
+                f"start_point_queue_mode failed: {(res and res.message) or 'timeout'}"
+            )
+            return False
+
+        self._node.get_logger().warn(
+            f"Queue mode blocked ('{res.message}'); calling /reset_error and "
+            "retrying once."
+        )
+        self._reset_error()
+        res = self._try_start_queue_mode()
+        if res is not None and res.result_code.value == 1:
+            self._node.get_logger().info(
+                f"Queue mode entered after reset_error: {res.message or 'READY'}"
+            )
+            return True
+        self._node.get_logger().error(
+            "start_point_queue_mode still failing after reset_error: "
+            f"{(res and res.message) or 'timeout'} (major/hardware alarm? "
+            "clear it on the teach pendant)."
+        )
+        return False
+
+    def _try_start_queue_mode(self):
+        """One stop+start attempt; returns the service result (None on timeout)."""
         self._stop_current_mode()
         if not self._start_queue_client.wait_for_service(timeout_sec=5.0):
             self._node.get_logger().error("/start_point_queue_mode unavailable.")
-            return False
+            return None
         fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
         rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
-        res = fut.result()
-        if res is None or res.result_code.value != 1:
-            self._node.get_logger().error(
-                f"start_point_queue_mode failed: "
-                f"{res and res.message or 'timeout'}"
-            )
+        return fut.result()
+
+    def _reset_error(self) -> bool:
+        """Call MotoROS2 /reset_error to clear an active alarm/error.
+
+        Alarms numbered < 8000 (major / hardware / setting faults) cannot be
+        reset remotely; this returns False and the operator must clear them on
+        the teach pendant.
+        """
+        if not self._reset_error_client.wait_for_service(timeout_sec=2.0):
+            self._node.get_logger().error("/reset_error unavailable.")
             return False
-        self._node.get_logger().info(f"Queue mode entered: {res.message or 'READY'}")
-        return True
+        fut = self._reset_error_client.call_async(ResetError.Request())
+        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=5.0)
+        res = fut.result()
+        ok = bool(res and res.result_code.value == 1)
+        if ok:
+            self._node.get_logger().info("reset_error: controller alarm/error cleared.")
+        else:
+            self._node.get_logger().error(
+                f"reset_error failed: {(res and res.message) or 'timeout'} "
+                "(major/hardware alarm? clear it on the teach pendant)."
+            )
+        time.sleep(0.2)   # let the controller settle before the retry
+        return ok
 
     def exit_queue_mode(self) -> bool:
         """Queue mode → Trajectory mode 복귀 (종료 시 사용)."""
