@@ -484,13 +484,39 @@ class GP8App:
             fallback when there's no known next pick — keeps the arm low and
             over the belt instead of parked at the high aim_joint2 hover.
         """
-        n_steps = max(2, int(params.T * self.cfg.TRAJ_HZ))
+        throw_T = float(params.T)
+        n_steps = max(2, int(throw_T * self.cfg.TRAJ_HZ))
         s = np.linspace(0.0, 1.0, n_steps + 1)
 
         traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
-            s, grasp_joint[:5], aim_joint2[:5], params.w, params.T,
+            s, grasp_joint[:5], aim_joint2[:5], params.w, throw_T,
         )
         # traj_ext, vel_ext: (n_steps+1, 5); ts_ext: (n_steps+1,)
+
+        # Clamp the throw to the robot's joint velocity limits. The NN throw is
+        # time-parameterised (params.T) with NO joint-speed bound, so a large
+        # joint sweep in a short T can command a queued segment faster than the
+        # controller allows -> Yaskawa alarm 4414 "excessive segment velocity"
+        # (seen on S/L). new_trajectory's path depends only on s; velocity ∝
+        # 1/T, so stretching T by the over-limit ratio brings every segment
+        # under the limit in one rescale (2nd pass guards the n_steps re-sample).
+        m1_5 = np.asarray(self.M1[:5], dtype=float)
+        for _ in range(2):
+            dt_seg = np.maximum(np.diff(ts_ext), 1e-9)[:, None]
+            seg_vel = np.abs(np.diff(traj_ext, axis=0)) / dt_seg   # (n,5) rad/s
+            ratio = float(np.max(seg_vel / m1_5[None, :]))
+            if ratio <= 1.0:
+                break
+            throw_T = throw_T * ratio * 1.05    # +5% margin
+            n_steps = max(2, int(throw_T * self.cfg.TRAJ_HZ))
+            s = np.linspace(0.0, 1.0, n_steps + 1)
+            traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
+                s, grasp_joint[:5], aim_joint2[:5], params.w, throw_T,
+            )
+            self._node.get_logger().warn(
+                f"Throw clamped: seg vel ratio {ratio:.2f} > 1 "
+                f"-> T {params.T:.3f}->{throw_T:.3f}s (n_steps {n_steps})"
+            )
 
         eta_idx = int(round(params.eta * n_steps))
         eta_idx = max(0, min(eta_idx, n_steps))
