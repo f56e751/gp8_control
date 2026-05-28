@@ -238,8 +238,9 @@ class TrajectoryController:
     ) -> bool:
         """Queue Mode로 trajectory streaming. FJT의 send_trajectory 대체.
 
-        Queue Mode는 INIT_TRAJ_INVALID_STARTING_POS (204) 체크가 없어
-        positions[0] 치환 트릭 불필요.
+        주의: Queue Mode도 새 큐의 첫 점이 로봇 현재(피드백) 위치와 일치해야
+        받아준다(code 204 'first point must match current position').
+        _build_queue_waypoints가 positions[0]을 측정 현재 관절로 치환해 처리한다.
         """
         waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
         t_start = time.time()
@@ -393,8 +394,18 @@ class TrajectoryController:
         final_joint: np.ndarray | None,
         extra_time: float = 0.05,
     ) -> list[tuple[list, list, float]]:
-        """FJT _build_goal과 동일 로직, 단 positions[0] 치환 없음."""
+        """FJT _build_goal과 동일 로직 — positions[0]을 측정 현재 관절로 치환.
+
+        MotoROS2 point-queue는 새 큐의 첫 점이 로봇 현재(피드백) 위치와
+        일치해야 받아준다(code 204 'first point must match current position').
+        이전엔 큐 모드가 이 체크에서 면제된다고 가정해 치환을 생략했으나,
+        실제로는 적용되어, 첫 점이 '계획된 grasp_joint'(측정 위치 아님)인
+        던지기 trajectory가 재진입 시 거부됐다. _build_goal과 동일하게
+        positions[0]을 현재 관절로 치환해 회피한다.
+        """
         positions = traj.T.tolist()
+        if self.current_joints is not None:
+            positions[0] = list(self.current_joints)
         velocities = vel.T.tolist()
         times = timestep.tolist()
 
