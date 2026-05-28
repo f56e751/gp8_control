@@ -50,7 +50,7 @@ WORKSPACE_X_ABS: float = 0.2
 # Mapping → robot base frame is a simple constant translation: the image
 # centre on the belt is at this fixed point in base coords (derived from the
 # old extrinsic transform: image centre cx=cy=0 mapped to base (0.425, 2.470)).
-REFERENCE_X_BASE: float = 0.425
+REFERENCE_X_BASE: float = 0.45
 REFERENCE_Y_BASE: float = 2.470
 REFERENCE_Z_BASE: float = 0.630   # only used for display; ambush picks at GRASP_Z
 
