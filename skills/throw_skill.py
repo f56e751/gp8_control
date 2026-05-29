@@ -1,0 +1,423 @@
+"""Throw skill: grasp an object at the intercept, then fling it (NN throw)."""
+
+from __future__ import annotations
+
+import csv
+import datetime
+import os
+import time
+from enum import Enum
+from typing import TYPE_CHECKING, Optional
+
+import numpy as np
+
+from gp8_control.skills.base import ManipulationSkill, SkillResult
+from gp8_control.trajectory.trajectory_primitive import (
+    new_trajectory,
+    trajectory,
+    pad,
+)
+
+if TYPE_CHECKING:
+    from gp8_control.skills.context import PickRequest
+    from gp8_control.tracking import TrackedObject
+
+
+# =========================================================================
+# Throw policy (was app-level policy in app.py)
+# =========================================================================
+
+# Class-specific throw-plane angle (radians, rotation about +Z). Keys are
+# SAM class names; classes not listed here throw at theta=0. This connects
+# perception output to throw geometry — it lives with the throw skill so the
+# throw owner edits it without touching app.py.
+THETA_MAP = {
+    "transparent": -np.pi / 12.0,
+    "metal":       -np.pi * 25.0 / 180.0,
+}
+
+
+# Per-class throw bin TARGET (absolute base-frame XYZ, m). When a target's
+# class is in this map, T_aim2 is OVERRIDDEN with these coordinates so the
+# NN throw aims at a fixed bin location instead of secondary/T_aim hover.
+# Empty default — fill in with measured bin coords (e.g., from terminal_debug).
+THROW_BIN_TARGET_MAP: dict[str, tuple] = {}
+
+
+class PickWaitMode(Enum):
+    """How the arm waits at the ambush intercept before suction fires.
+
+    Extension point: map object classes to a wait mode in ``PICK_WAIT_MODE``
+    so e.g. fragile classes can hover-and-descend while flat ones park at
+    grasp height. Only WAIT_AT_GRASP is implemented today; HOVER_DESCEND
+    falls back to it with a warning until added.
+    """
+
+    WAIT_AT_GRASP = "wait_at_grasp"   # cup parked at grasp height; suction on arrival
+    HOVER_DESCEND = "hover_descend"   # park above, descend + suction on arrival (TODO)
+
+
+# Per-class wait mode (class_name -> PickWaitMode). Classes not listed use
+# DEFAULT_PICK_WAIT_MODE.
+PICK_WAIT_MODE: dict[str, PickWaitMode] = {}
+DEFAULT_PICK_WAIT_MODE = PickWaitMode.WAIT_AT_GRASP
+
+
+class ThrowSkill(ManipulationSkill):
+    """Pick (suction) at the intercept and throw the object via the NN trajectory.
+
+    ``execute`` runs the full ambush cycle (position → wait → suction → throw →
+    chain to next intercept). The individual stages —
+    :meth:`plan_throw_landing`, :meth:`solve_keyframe_joints`,
+    :meth:`build_throw_trajectory` — are also public so the legacy "moving"
+    pick strategy in ``app.py`` can reuse the same throw code.
+    """
+
+    name = "throw"
+
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        self._last_throw_meta: dict = {}
+
+    # ------------------------------------------------------------------
+    # Skill entry point (ambush strategy)
+    # ------------------------------------------------------------------
+    def execute(self, request: "PickRequest") -> SkillResult:
+        """Pre-position (mode-dependent), wait for arrival + suction, then throw."""
+        ctx = self.ctx
+        target = request.target
+        current_joint = request.current_joint
+        aim_joint = request.aim_joint
+        grasp_joint = request.grasp_joint
+        T_aim = request.T_aim
+        T_grasp = request.T_grasp
+        secondary = request.secondary
+
+        mode = PICK_WAIT_MODE.get(target.class_name, DEFAULT_PICK_WAIT_MODE)
+        if mode == PickWaitMode.HOVER_DESCEND:
+            ctx.log.warn(
+                "HOVER_DESCEND wait mode not implemented yet; using WAIT_AT_GRASP"
+            )
+            mode = PickWaitMode.WAIT_AT_GRASP
+
+        ctx.traj_ctrl.suction_off()
+
+        # Re-enter point queue mode each cycle. MotoROS2 leaves queue mode once
+        # the previous trajectory's queue drains, so the next pick's points are
+        # rejected ("Must call start_point_queue_mode") — which is why only the
+        # first object worked. Re-entering here makes every cycle self-contained.
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to (re)enter queue mode; skipping this pick")
+            return SkillResult(False, "enter_queue_mode (pick) failed")
+
+        # WAIT_AT_GRASP: drive all the way to the grasp pose and park there.
+        ctx.set_status("POSITIONING", target.class_name)
+        ctx.move_through(current_joint, aim_joint, grasp_joint)
+
+        # Wait until the predicted object position reaches the intercept line,
+        # then fire suction (slightly early to cover pneumatic lag).
+        ctx.set_status("WAITING", target.class_name)
+        ctx.wait_for_arrival_and_suction(target, T_grasp[1, 3])
+
+        # Lift + throw — same path as the moving strategy.
+        # MotoROS2 leaves point-queue mode once the pick trajectory's queue
+        # drains, and the ambush wait keeps the queue empty for seconds, so
+        # the throw push would be rejected with "Must call
+        # start_point_queue_mode" — re-enter queue mode here too.
+        ctx.set_status("THROWING", target.class_name)
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to (re)enter queue mode for throw; dropping object")
+            ctx.traj_ctrl.suction_off()
+            ctx.set_active_target(None)
+            ctx.set_status("IDLE", "")
+            return SkillResult(False, "enter_queue_mode (throw) failed")
+
+        theta = THETA_MAP.get(target.class_name, 0.0)
+
+        # Throw target. If the class has a fixed bin coord in THROW_BIN_TARGET_MAP,
+        # override T_aim2 with that absolute base-frame XYZ so the NN aims at the
+        # bin. Otherwise fall back to the legacy plan_throw_landing (secondary's
+        # predicted position, or T_aim hover when no secondary).
+        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+        if bin_xyz is not None:
+            T_aim2 = np.eye(4)
+            T_aim2[:3, :3] = T_aim[:3, :3]
+            T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+            ctx.log.info(
+                f"Throw target for {target.class_name}: fixed bin "
+                f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
+            )
+        else:
+            T_aim2 = self.plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
+
+        aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
+        if aim_joint2 is None:
+            ctx.log.warn("Throw IK failed after grab; lifting in place")
+            aim_joint2, T_aim2 = aim_joint, T_aim
+        aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
+
+        # Chain target for the throw's post-release motion: the next reachable
+        # object in the live queue (re-polled), so the arm flows to the next
+        # pick instead of parking after the throw.
+        next_intercept_joint = ctx.scan_next_intercept()
+
+        params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
+        self.build_throw_trajectory(
+            grasp_joint, aim_joint2, params,
+            next_intercept_joint=next_intercept_joint,
+        )
+        # Safety: if the throw push failed for any reason and suction is still
+        # on, release so we don't end up parked holding the object.
+        ctx.traj_ctrl.suction_off()
+        self._log_throw_cycle(target)
+        ctx.set_active_target(None)
+        ctx.set_status("IDLE", "")
+        return SkillResult(True, "throw complete")
+
+    # ------------------------------------------------------------------
+    # Throw planning (shared with the legacy "moving" pick strategy)
+    # ------------------------------------------------------------------
+    def plan_throw_landing(
+        self,
+        T_grasp1: np.ndarray,
+        theta: float,
+        T_aim1_fallback: np.ndarray,
+        now: float,
+        secondary: "Optional[TrackedObject]",
+    ) -> np.ndarray:
+        """Aim throw at ``secondary`` if feasible; else drop in place.
+
+        ``secondary`` is captured by the caller *before* the lock step so
+        this method does not depend on the queue's mutation order.
+        """
+        ctx = self.ctx
+        if secondary is None:
+            return T_aim1_fallback.copy()
+
+        T_aim2, _, _, neg_wait2 = ctx.planner.plan_throw_landing(
+            T_grasp1,
+            secondary.T_aim_base.copy(),
+            theta,
+            secondary.detect_time,
+            ctx.conveyor.current,
+            now,
+            fixed_delay=ctx.cfg.FIXED_DELAY_THROW,
+        )
+        infeasible = (
+            neg_wait2 is not None
+            or T_aim2[0, 3] < 0.1
+            or T_aim2[2, 3] < 0.0
+            or T_aim2[2, 3] > ctx.cfg.MAX_REACH
+        )
+        if infeasible:
+            return T_aim1_fallback.copy()
+        return T_aim2
+
+    def solve_keyframe_joints(
+        self,
+        T_aim1: np.ndarray,
+        T_grasp1: np.ndarray,
+        T_aim2: np.ndarray,
+    ):
+        """IK for all three keyframes; zero last joint. Returns None on IK fail."""
+        ctx = self.ctx
+        aim_joint1 = ctx.robot.inverse_kinematics(T_aim1)
+        grasp_joint1 = ctx.robot.inverse_kinematics(T_grasp1)
+        aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
+        if aim_joint1 is None or grasp_joint1 is None or aim_joint2 is None:
+            ctx.log.warn("IK failed after target lock; aborting")
+            return None
+        aim_joint1 = np.asarray(aim_joint1, dtype=float)
+        grasp_joint1 = np.asarray(grasp_joint1, dtype=float)
+        aim_joint2 = np.asarray(aim_joint2, dtype=float)
+        aim_joint1[-1] = 0.0
+        grasp_joint1[-1] = 0.0
+        aim_joint2[-1] = 0.0
+        return aim_joint1, grasp_joint1, aim_joint2
+
+    # ------------------------------------------------------------------
+    # Throw trajectory build + dispatch
+    # ------------------------------------------------------------------
+    def build_throw_trajectory(
+        self,
+        grasp_joint: np.ndarray,
+        aim_joint2: np.ndarray,
+        params,
+        next_intercept_joint: "Optional[np.ndarray]" = None,
+    ) -> None:
+        """Build and dispatch throw trajectory using already-decoded ThrowParams.
+
+        The **full** NN throw arc (grasp → release → aim_joint2) is kept intact,
+        so the arm performs the entire trained swing including the wide
+        follow-through past the release sample up to aim_joint2. Because
+        new_trajectory decelerates to rest at aim_joint2 (dq(T)=0), we then
+        **append** a smooth transition from that rest pose to a ready pose so
+        the arm does not park at the high aim_joint2 hover (the NN boundary
+        condition leaves it at dq=0 there for an instant, then it immediately
+        continues into the chain) — this is what keeps multi-object operation
+        flowing:
+          - ``next_intercept_joint`` when supplied (next pick's intercept), or
+          - ``grasp_joint`` (the current pick's intercept) as a sensible
+            fallback when there's no known next pick — keeps the arm low and
+            over the belt, ready for the next cycle.
+
+        The timed suction release still fires at ``release_idx``
+        (= eta_idx - lead_steps), which indexes the same pre-release waypoint
+        as before, so release timing/position/velocity are unchanged.
+        """
+        ctx = self.ctx
+        throw_T = float(params.T)
+        n_steps = max(2, int(throw_T * ctx.cfg.TRAJ_HZ))
+        s = np.linspace(0.0, 1.0, n_steps + 1)
+
+        traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
+            s, grasp_joint[:5], aim_joint2[:5], params.w, throw_T,
+        )
+        # traj_ext, vel_ext: (n_steps+1, 5); ts_ext: (n_steps+1,)
+
+        # Clamp the throw to the robot's joint velocity limits. The NN throw is
+        # time-parameterised (params.T) with NO joint-speed bound, so a large
+        # joint sweep in a short T can command a queued segment faster than the
+        # controller allows -> Yaskawa alarm 4414 "excessive segment velocity"
+        # (seen on S/L). new_trajectory's path depends only on s; velocity ∝
+        # 1/T, so stretching T by the over-limit ratio brings every segment
+        # under the limit in one rescale (2nd pass guards the n_steps re-sample).
+        m1_5 = np.asarray(ctx.M1[:5], dtype=float)
+        for _ in range(2):
+            dt_seg = np.maximum(np.diff(ts_ext), 1e-9)[:, None]
+            seg_vel = np.abs(np.diff(traj_ext, axis=0)) / dt_seg   # (n,5) rad/s
+            ratio = float(np.max(seg_vel / m1_5[None, :]))
+            if ratio <= 1.0:
+                break
+            throw_T = throw_T * ratio * 1.05    # +5% margin
+            n_steps = max(2, int(throw_T * ctx.cfg.TRAJ_HZ))
+            s = np.linspace(0.0, 1.0, n_steps + 1)
+            traj_ext, vel_ext, _, _, ts_ext = new_trajectory(
+                s, grasp_joint[:5], aim_joint2[:5], params.w, throw_T,
+            )
+            ctx.log.warn(
+                f"Throw clamped: seg vel ratio {ratio:.2f} > 1 "
+                f"-> T {params.T:.3f}->{throw_T:.3f}s (n_steps {n_steps})"
+            )
+
+        eta_idx = int(round(params.eta * n_steps))
+        eta_idx = max(0, min(eta_idx, n_steps))
+        lead_steps = int(round(ctx.cfg.RELEASE_LEAD * ctx.cfg.TRAJ_HZ))
+        release_idx = max(0, min(eta_idx - lead_steps, n_steps))
+
+        # Keep the FULL NN throw arc (grasp → release → aim_joint2). The arm
+        # sweeps the entire trained throw, including the follow-through past
+        # the release sample up to aim_joint2 — the wide swing. eta_idx (the
+        # release sample) stays only as the timed-release index; it no longer
+        # truncates the motion.
+        traj_pre_5 = traj_ext.T                   # (5, n_steps+1) full arc
+        vel_pre_5 = vel_ext.T
+        ts_pre = ts_ext
+
+        # End of the throw = aim_joint2 at rest (new_trajectory's dq(T)=0), the
+        # start state for the chain transition below.
+        end_q5 = traj_ext[-1]                     # (5,) == aim_joint2
+        end_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
+
+        # Chain target: next pick's intercept if known, else the current
+        # pick's intercept (= grasp_joint) — keeps the arm low, ready over
+        # the belt instead of parked at the high aim_joint2 hover.
+        chain_target = (
+            np.asarray(next_intercept_joint, dtype=float)
+            if next_intercept_joint is not None
+            else np.asarray(grasp_joint, dtype=float)
+        )
+        chained_to_next = next_intercept_joint is not None
+
+        zero5 = np.zeros(5)
+        traj_chain_5, vel_chain_5, ts_chain = trajectory(
+            end_q5, end_dq5,
+            chain_target[:5], zero5,
+            ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
+        )
+        # Drop the chain's first column — it's aim_joint2, same as the last
+        # sample of the full arc (would be a duplicate). Slice traj/vel/ts the
+        # SAME way so the three stay equal length: if the chain degenerates to
+        # a single sample (chain_target ≈ aim_joint2 -> opt_time ≈ 0) all three
+        # become empty and only the full arc remains. (Slicing ts alone would
+        # leave traj/vel one column longer, and zip() in _build_queue_waypoints
+        # would then silently drop a waypoint and bind final_joint to the wrong
+        # timestamp.)
+        traj_chain_5 = traj_chain_5[:, 1:]
+        vel_chain_5 = vel_chain_5[:, 1:]
+        ts_chain_shifted = ts_chain[1:] + ts_pre[-1]
+
+        traj_full_5 = np.concatenate((traj_pre_5, traj_chain_5), axis=1)   # (5, total)
+        vel_full_5 = np.concatenate((vel_pre_5, vel_chain_5), axis=1)
+        ts_full = np.concatenate((ts_pre, ts_chain_shifted))
+        assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
+            f"throw traj/vel/timestep length mismatch: "
+            f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
+        )
+
+        # Pad to 6-dof, reorient to (6, total) as the queue expects.
+        traj_throw = pad(traj_full_5.T).T
+        vel_throw = pad(vel_full_5.T).T
+        timestep_throw = ts_full
+        final_joint = chain_target
+
+        ctx.log.info(
+            f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
+            f"{release_idx}/{traj_throw.shape[1] - 1} (eta step {eta_idx}, "
+            f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, "
+            f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'})"
+        )
+
+        ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
+            traj_throw, vel_throw, timestep_throw,
+            final_joint=final_joint,
+            release_index=release_idx,
+        )
+        self._last_throw_meta = {
+            "T": params.T, "eta": params.eta,
+            "release_idx": release_idx, "n_steps": n_steps,
+        }
+
+    # ------------------------------------------------------------------
+    # Per-cycle timing log
+    # ------------------------------------------------------------------
+    def _log_throw_cycle(self, target: "TrackedObject") -> None:
+        """Append one pick-cycle timing row to PICK_LOG_CSV: suction-on ->
+        throw-start -> release, for offline analysis of the release timing."""
+        ctx = self.ctx
+        path = ctx.cfg.PICK_LOG_CSV
+        if not path:
+            return
+        lt = getattr(ctx.traj_ctrl, "last_throw", {}) or {}
+        meta = self._last_throw_meta or {}
+        son = getattr(ctx.traj_ctrl, "last_suction_on_t", None)
+        t0 = lt.get("throw_start")
+        trel = lt.get("release_wall")
+
+        def _d(a, b):
+            return round(a - b, 4) if (a is not None and b is not None) else ""
+
+        row = {
+            "iso_time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "class": target.class_name,
+            "belt_mps": round(ctx.conveyor.current, 4),
+            "suction_on_t": round(son, 4) if son else "",
+            "throw_start_t": round(t0, 4) if t0 else "",
+            "release_t": round(trel, 4) if trel else "",
+            "on_to_throwstart_s": _d(t0, son),
+            "throwstart_to_release_s": _d(trel, t0),
+            "throw_T_s": round(meta.get("T", 0.0), 3),
+            "eta": round(meta.get("eta", 0.0), 3),
+            "release_idx": meta.get("release_idx", ""),
+            "n_steps": meta.get("n_steps", ""),
+            "io_ms": round(lt["io_ms"], 1) if lt.get("io_ms") is not None else "",
+        }
+        try:
+            new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new_file:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as e:
+            ctx.log.warn(f"pick-log write failed: {e}")
