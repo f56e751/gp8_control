@@ -247,23 +247,25 @@ class ThrowSkill(ManipulationSkill):
     ) -> None:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
-        The **full** NN throw arc (grasp → release → aim_joint2) is kept intact,
-        so the arm performs the entire trained swing including the wide
-        follow-through past the release sample up to aim_joint2. Because
-        new_trajectory decelerates to rest at aim_joint2 (dq(T)=0), we then
-        **append** a smooth transition from that rest pose to a ready pose so
-        the arm does not park at the high aim_joint2 hover (the NN boundary
-        condition leaves it at dq=0 there for an instant, then it immediately
-        continues into the chain) — this is what keeps multi-object operation
-        flowing:
-          - ``next_intercept_joint`` when supplied (next pick's intercept), or
-          - ``grasp_joint`` (the current pick's intercept) as a sensible
-            fallback when there's no known next pick — keeps the arm low and
-            over the belt, ready for the next cycle.
+        The NN throw arc (grasp → release → aim_joint2) is generated and
+        velocity-clamped exactly as the trained swing, so the motion UP TO the
+        release sample is identical to the original throw — same path, same
+        velocity, same release timing. Only the post-release tail differs,
+        depending on whether a next pick is known:
+
+          - ``next_intercept_joint`` supplied -> CUT the arc at the release
+            sample and fly straight to that intercept via a time-optimal move
+            that STARTS FROM THE ACTUAL RELEASE STATE (position + the large
+            throw velocity). The follow-through release→aim_joint2 is dropped
+            (wasted motion once the object is gone), so the arm heads to the
+            next pick immediately instead of parking at the 8 cm hover first.
+          - no next pick -> ORIGINAL behaviour: keep the full arc up to
+            aim_joint2 (8 cm hover, dq(T)=0) and chain back to the current
+            intercept (``grasp_joint``) from rest.
 
         The timed suction release still fires at ``release_idx``
-        (= eta_idx - lead_steps), which indexes the same pre-release waypoint
-        as before, so release timing/position/velocity are unchanged.
+        (= eta_idx - lead_steps); in the cut case that is the last arc
+        waypoint, so release timing/position/velocity are unchanged.
         """
         ctx = self.ctx
         throw_T = float(params.T)
@@ -305,41 +307,50 @@ class ThrowSkill(ManipulationSkill):
         lead_steps = int(round(ctx.cfg.RELEASE_LEAD * ctx.cfg.TRAJ_HZ))
         release_idx = max(0, min(eta_idx - lead_steps, n_steps))
 
-        # Keep the FULL NN throw arc (grasp → release → aim_joint2). The arm
-        # sweeps the entire trained throw, including the follow-through past
-        # the release sample up to aim_joint2 — the wide swing. eta_idx (the
-        # release sample) stays only as the timed-release index; it no longer
-        # truncates the motion.
-        traj_pre_5 = traj_ext.T                   # (5, n_steps+1) full arc
-        vel_pre_5 = vel_ext.T
-        ts_pre = ts_ext
-
-        # End of the throw = aim_joint2 at rest (new_trajectory's dq(T)=0), the
-        # start state for the chain transition below.
-        end_q5 = traj_ext[-1]                     # (5,) == aim_joint2
-        end_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
-
-        # Chain target: next pick's intercept if known, else the current
-        # pick's intercept (= grasp_joint) — keeps the arm low, ready over
-        # the belt instead of parked at the high aim_joint2 hover.
-        chain_target = (
-            np.asarray(next_intercept_joint, dtype=float)
-            if next_intercept_joint is not None
-            else np.asarray(grasp_joint, dtype=float)
-        )
-        chained_to_next = next_intercept_joint is not None
+        # The arc + velocity clamp above are UNCHANGED, so the swing up to the
+        # release sample is byte-identical to the original throw. Only the
+        # post-release tail differs (see docstring):
+        #   * next pick known -> CUT at the release sample and fly straight to
+        #     it from the actual release state (large velocity); drop the
+        #     wasted release→aim_joint2 follow-through.
+        #   * no next pick    -> ORIGINAL: keep the full arc to aim_joint2
+        #     (8 cm hover, at rest) and chain back to grasp_joint.
+        # Either branch then appends one fresh time-optimal trajectory() from
+        # (start_q5, start_dq5) to chain_target — only the start state / target
+        # differ, so the concat/dispatch code below stays shared.
+        if next_intercept_joint is not None:
+            cut = release_idx
+            traj_pre_5 = traj_ext[:cut + 1].T         # arc up to (incl.) release
+            vel_pre_5 = vel_ext[:cut + 1].T
+            ts_pre = ts_ext[:cut + 1]
+            start_q5 = traj_ext[cut]                   # release-sample pose
+            # Release-sample velocity is large (mid-swing). Clip to the joint
+            # speed limit so opt_time/_trajectory_1d stay in their feasible
+            # region; affects only the appended move's start, never the throw.
+            start_dq5 = np.clip(vel_ext[cut], -ctx.M1[:5], ctx.M1[:5])
+            chain_target = np.asarray(next_intercept_joint, dtype=float)
+            chained_to_next = True
+        else:
+            traj_pre_5 = traj_ext.T                    # (5, n_steps+1) full arc
+            vel_pre_5 = vel_ext.T
+            ts_pre = ts_ext
+            start_q5 = traj_ext[-1]                     # aim_joint2 at rest
+            start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
+            chain_target = np.asarray(grasp_joint, dtype=float)
+            chained_to_next = False
 
         zero5 = np.zeros(5)
         traj_chain_5, vel_chain_5, ts_chain = trajectory(
-            end_q5, end_dq5,
+            start_q5, start_dq5,
             chain_target[:5], zero5,
             ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
         )
-        # Drop the chain's first column — it's aim_joint2, same as the last
-        # sample of the full arc (would be a duplicate). Slice traj/vel/ts the
-        # SAME way so the three stay equal length: if the chain degenerates to
-        # a single sample (chain_target ≈ aim_joint2 -> opt_time ≈ 0) all three
-        # become empty and only the full arc remains. (Slicing ts alone would
+        # Drop the chain's first column — it's start_q5 (the last sample of the
+        # kept arc: release pose when cut, else aim_joint2), so it would be a
+        # duplicate. Slice traj/vel/ts the SAME way so the three stay equal
+        # length: if the chain degenerates to a single sample (chain_target ≈
+        # start_q5 -> opt_time ≈ 0) all three become empty and only the arc
+        # remains. (Slicing ts alone would
         # leave traj/vel one column longer, and zip() in _build_queue_waypoints
         # would then silently drop a waypoint and bind final_joint to the wrong
         # timestamp.)
@@ -365,7 +376,7 @@ class ThrowSkill(ManipulationSkill):
             f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
             f"{release_idx}/{traj_throw.shape[1] - 1} (eta step {eta_idx}, "
             f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, "
-            f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'})"
+            f"{'cut@release->next intercept' if chained_to_next else 'full arc->current grasp'})"
         )
 
         ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
