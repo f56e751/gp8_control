@@ -153,7 +153,16 @@ class NameBridge(Node):
     # ------------------------------------------------------------------
 
     def _on_joint_states(self, msg: JointState) -> None:
-        self._js_pub.publish(_rename_joint_state(msg))
+        out = _rename_joint_state(msg)
+        # MotoROS2 can emit a header stamp with sec < 0 before the controller
+        # clock is synced (notably right after launch). rclcpp::Time refuses to
+        # construct from a negative-seconds stamp and throws an uncaught
+        # std::runtime_error, which *aborts* every C++ consumer inside its
+        # joint_state callback — move_group and robot_state_publisher both die
+        # with SIGABRT. Re-stamp with our own (already-synced) node clock so a
+        # bad controller time can never crash a downstream node.
+        out.header.stamp = self.get_clock().now().to_msg()
+        self._js_pub.publish(out)
 
     # ------------------------------------------------------------------
     # FJT proxy
