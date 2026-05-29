@@ -129,8 +129,9 @@ class Config:
     # (every object -> throw today). Set to a skill name ("throw" or "push")
     # to pin EVERY object to that one skill, bypassing per-class routing and
     # the skill's can_handle() — handy for driving one skill in isolation
-    # (e.g. testing the push path before it's fully wired). Override at launch
-    # without editing code: GP8_FORCE_SKILL=push ros2 launch ...
+    # (e.g. testing the push path before it's fully wired). Prefer the CLI flag
+    # `--skill push|throw` (see main()); GP8_FORCE_SKILL is the env equivalent
+    # for launch files. Precedence: CLI flag > env var > "" (normal routing).
     FORCE_SKILL: str = field(
         default_factory=lambda: _env_default("GP8_FORCE_SKILL", "")
     )
@@ -881,8 +882,32 @@ class GP8App:
             rclpy.shutdown()
 
 
-def main() -> None:
-    app = GP8App()
+def main(argv=None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="gp8_app",
+        description="GP8 conveyor pick-and-place orchestrator.",
+    )
+    parser.add_argument(
+        "--skill",
+        choices=["throw", "push"],
+        default=None,
+        help=(
+            "Force every object to this manipulation skill (testing aid). "
+            "Overrides the GP8_FORCE_SKILL env var. Omit for normal "
+            "push/throw routing."
+        ),
+    )
+    # parse_known_args so ROS 2 / ros2 launch-injected args (e.g. --ros-args)
+    # pass through harmlessly instead of erroring out.
+    args, _ = parser.parse_known_args(argv)
+
+    cfg = Config()
+    if args.skill is not None:
+        cfg.FORCE_SKILL = args.skill   # CLI flag wins over the env default
+
+    app = GP8App(cfg)
     app.run()
 
 
