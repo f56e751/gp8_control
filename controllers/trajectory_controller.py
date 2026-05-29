@@ -404,6 +404,7 @@ class TrajectoryController:
         timestep: np.ndarray,
         final_joint: np.ndarray,
         release_index: int,
+        suction_on_at: float | None = None,
     ) -> bool:
         """Queue Mode + suction_off interleaved into the point-push.
 
@@ -413,11 +414,17 @@ class TrajectoryController:
         full swing duration, so suction_off landed at the end. The point-queue
         and IO are independent services, so inserting the IO command mid-push
         is safe (no collision/drop).
+
+        ``suction_on_at`` (wall-clock, optional): once the release has fired and
+        this instant passes, fire suction_ON ONCE — to PRIME THE NEXT pick's
+        vacuum during this throw's return (chain) move, so a back-to-back object
+        keeps its full lead. Only fires after the release (never while still
+        holding the thrown object). Returns True iff that next-suction fired.
         """
         waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
         total_duration = waypoints[-1][2]
 
-        state = {"fired": False}
+        state = {"fired": False, "primed_next": False}
         t_start = time.time()
         self.last_throw = {
             "throw_start": t_start,
@@ -439,16 +446,33 @@ class TrajectoryController:
                 f"(IO round-trip {io_ms:.0f} ms)"
             )
 
+        def _prime_next() -> None:
+            # Prime the NEXT pick's vacuum, but only AFTER this object's release
+            # (don't suck while still holding/releasing the thrown object).
+            if (suction_on_at is not None and state["fired"]
+                    and not state["primed_next"] and time.time() >= suction_on_at):
+                self.suction_on()
+                state["primed_next"] = True
+                self._node.get_logger().info(
+                    "Return-prime: suction_on for next pick during chain move."
+                )
+
         if not self._push_waypoints(
-            waypoints, release_index=release_index, release_fn=_release
+            waypoints, release_index=release_index, release_fn=_release,
+            between_fn=_prime_next,
         ):
-            return False
+            return state["primed_next"]
         if not state["fired"]:
             # release_index beyond the pushed points — fire now as a fallback.
             _release()
 
-        self._wait_trajectory_end(total_duration, t_start=t_start)
-        return True
+        # Finish the move, still watching the next-pick suction deadline.
+        t_end = t_start + total_duration + 0.1
+        while time.time() < t_end:
+            rclpy.spin_once(self._node, timeout_sec=0.05)
+            _prime_next()
+        _prime_next()
+        return state["primed_next"]
 
     def send_trajectory_queue_timed_suction(
         self,

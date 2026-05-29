@@ -100,7 +100,11 @@ class ThrowSkill(ManipulationSkill):
             )
             mode = PickWaitMode.WAIT_AT_GRASP
 
-        ctx.traj_ctrl.suction_off()
+        # Start clean — but NOT if the prior throw's return already primed this
+        # pick's suction (vacuum intentionally ON); clearing it would re-open the
+        # back-to-back blind gap we just closed.
+        if not ctx.suction_primed_for_pick:
+            ctx.traj_ctrl.suction_off()
 
         # Re-enter point queue mode each cycle. MotoROS2 leaves queue mode once
         # the previous trajectory's queue drains, so the next pick's points are
@@ -155,19 +159,31 @@ class ThrowSkill(ManipulationSkill):
             aim_joint2, T_aim2 = aim_joint, T_aim
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
-        # Chain target for the throw's post-release motion: the next reachable
-        # object in the live queue (re-polled), so the arm flows to the next
-        # pick instead of parking after the throw.
-        next_intercept_joint = ctx.scan_next_intercept()
-
+        # Decode the throw first so the chain selection below knows how long the
+        # swing takes (the arm can't start chaining to the next object until the
+        # throw finishes).
         params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
-        self.build_throw_trajectory(
+
+        # Chain target for the throw's post-release motion: the next object the
+        # pick will ACTUALLY complete — same feasibility gate as the main pick,
+        # plus the throw_time the arm must finish first. So the arm only flies to
+        # an intercept it will then pick (no "went there but never picked"), and
+        # ``next_suction_at`` primes THAT object's vacuum during the return chain.
+        next_intercept_joint, next_suction_at = ctx.scan_next_intercept(
+            grasp_joint, float(params.T),
+        )
+        primed_next = self.build_throw_trajectory(
             grasp_joint, aim_joint2, params,
             next_intercept_joint=next_intercept_joint,
+            next_suction_at=next_suction_at,
         )
-        # Safety: if the throw push failed for any reason and suction is still
-        # on, release so we don't end up parked holding the object.
-        ctx.traj_ctrl.suction_off()
+        # If the return chain primed the next pick's suction (vacuum ON), hand
+        # that off to the next cycle instead of clearing it. Otherwise it's a
+        # safety release in case the throw push failed with suction still on.
+        if primed_next:
+            ctx.suction_primed_for_pick = True
+        else:
+            ctx.traj_ctrl.suction_off()
         self._log_throw_cycle(target)
         ctx.set_active_target(None)
         ctx.set_status("IDLE", "")
@@ -243,7 +259,8 @@ class ThrowSkill(ManipulationSkill):
         aim_joint2: np.ndarray,
         params,
         next_intercept_joint: "Optional[np.ndarray]" = None,
-    ) -> None:
+        next_suction_at: "Optional[float]" = None,
+    ) -> bool:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
         The NN throw arc (grasp → release → aim_joint2) is generated and
@@ -378,15 +395,17 @@ class ThrowSkill(ManipulationSkill):
             f"{'cut@release->next intercept' if chained_to_next else 'full arc->current grasp'})"
         )
 
-        ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
+        primed_next = ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=final_joint,
             release_index=release_idx,
+            suction_on_at=next_suction_at,
         )
         self._last_throw_meta = {
             "T": params.T, "eta": params.eta,
             "release_idx": release_idx, "n_steps": n_steps,
         }
+        return primed_next
 
     # ------------------------------------------------------------------
     # Per-cycle timing log

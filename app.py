@@ -183,7 +183,7 @@ class Config:
     # over-estimate the real move (~2x), so this trusts the real move is only
     # a fraction of the planned one; bump higher (toward 1.0) to be more
     # conservative (drop sooner) or lower to attempt more borderline catches.
-    PICK_FEASIBILITY_FACTOR: float = 1.4
+    PICK_FEASIBILITY_FACTOR: float = 1.05
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
@@ -788,6 +788,21 @@ class GP8App:
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    def _release_orphan_suction(self) -> None:
+        """Release a return-primed suction that no pick will consume this epoch.
+
+        The throw's return (chain) primes the NEXT pick's vacuum speculatively;
+        only that pick's throw release turns it off. If the pick does not happen
+        (object passed during the throw, queue drained, none feasible), the
+        vacuum would otherwise run indefinitely — turn it off here.
+        """
+        if self.ctx is not None and self.ctx.suction_primed_for_pick:
+            self._node.get_logger().info(
+                "No pick this epoch — releasing orphaned primed suction."
+            )
+            self.traj_ctrl.suction_off()
+            self.ctx.suction_primed_for_pick = False
+
     def run_epoch(self, epoch: int) -> None:
         # Pump ROS callbacks so joint_states and conveyor speed stay fresh.
         # Previously DetectionIntake.poll() spun every epoch; with the HTTP
@@ -810,6 +825,7 @@ class GP8App:
         self.queue.update(now, self.conveyor.current)
         if not self.queue:
             self.frame_gate.reset()
+            self._release_orphan_suction()
             time.sleep(self.cfg.TIME_STEP)
             return
 
@@ -819,6 +835,10 @@ class GP8App:
                 # Decide push vs throw (rule-based today; RL later) and run it.
                 skill = self.selector.select(request)
                 skill.execute(request)
+            else:
+                # No feasible pick this epoch — don't leave a return-primed
+                # vacuum running with nothing to turn it off.
+                self._release_orphan_suction()
             return
 
         # Capture the secondary throw target *before* lock_or_drop_head
