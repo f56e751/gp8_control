@@ -23,6 +23,13 @@ class ActionSelector:
     (:meth:`ManipulationSkill.can_handle`), the selector falls back to the
     default. ``select`` returns a skill whose ``execute`` the app then calls —
     swapping in an RL policy means replacing only this class.
+
+    Testing override: ``force`` (skill name) pins every object to one skill,
+    bypassing ``by_class``, ``default``, AND ``can_handle``. Use it to drive a
+    single skill in isolation — e.g. ``force="throw"`` to test throwing only,
+    or ``force="push"`` to test the push path even while PushSkill is still a
+    stub (its ``can_handle`` would otherwise refuse and fall back to throw).
+    Leave it ``None`` for normal routing.
     """
 
     def __init__(
@@ -30,17 +37,26 @@ class ActionSelector:
         skills: "Iterable[ManipulationSkill]",
         default: str = "throw",
         by_class: "Optional[dict[str, str]]" = None,
+        force: "Optional[str]" = None,
     ) -> None:
         self.skills = {s.name: s for s in skills}
         if default not in self.skills:
             raise ValueError(
                 f"default skill {default!r} not among {list(self.skills)}"
             )
+        if force is not None and force not in self.skills:
+            raise ValueError(
+                f"force skill {force!r} not among {list(self.skills)}"
+            )
         self.default = default
         self.by_class = dict(by_class or {})
+        self.force = force
 
     def select(self, request: "PickRequest") -> "ManipulationSkill":
         """Return the skill that should handle ``request.target``."""
+        # Testing override: pin to one skill, ignoring routing and can_handle.
+        if self.force is not None:
+            return self.skills[self.force]
         name = self.by_class.get(request.target.class_name, self.default)
         skill = self.skills.get(name)
         if skill is None or not skill.can_handle(request.target):

@@ -124,6 +124,17 @@ class Config:
     #              Avoids moving-intercept lead timing entirely.
     #   "moving" — legacy predictive-intercept pick (plan_pick + lock).
     PICK_STRATEGY: str = "ambush"
+
+    # Test override for the push/throw ActionSelector. Empty = normal routing
+    # (every object -> throw today). Set to a skill name ("throw" or "push")
+    # to pin EVERY object to that one skill, bypassing per-class routing and
+    # the skill's can_handle() — handy for driving one skill in isolation
+    # (e.g. testing the push path before it's fully wired). Override at launch
+    # without editing code: GP8_FORCE_SKILL=push ros2 launch ...
+    FORCE_SKILL: str = field(
+        default_factory=lambda: _env_default("GP8_FORCE_SKILL", "")
+    )
+
     GRASP_INTERCEPT_Y: float = 0.0      # belt-frame Y where the arm waits [m]
     # Grasp height [m]: belt-surface contact Z. Manually verified pose was
     # z=0.067 (terminal_debug: EE x=0.508 y=0.000, suction ON); lowered ~5 mm
@@ -355,8 +366,16 @@ class GP8App:
         self.push_skill = PushSkill(self.ctx)
         # Rule-based for now (always throw); swap this for an RL policy later
         # to choose push vs throw per object. by_class can override per class.
+        # FORCE_SKILL (env GP8_FORCE_SKILL) pins every object to one skill for
+        # testing; empty -> normal routing.
+        force = self.cfg.FORCE_SKILL or None
+        if force is not None:
+            self._node.get_logger().warn(
+                f"ActionSelector FORCED to '{force}' skill for ALL objects "
+                f"(GP8_FORCE_SKILL). Disable for normal push/throw routing."
+            )
         self.selector = ActionSelector(
-            [self.throw_skill, self.push_skill], default="throw",
+            [self.throw_skill, self.push_skill], default="throw", force=force,
         )
 
     def _build_intake(self) -> None:
