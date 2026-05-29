@@ -180,10 +180,10 @@ class Config:
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
     # whose ETA < move_time * factor — i.e. objects that will reach the
     # intercept before the arm can finish positioning. opt_time is known to
-    # over-estimate the real move (~2x), so 0.5 trusts that the real move
-    # is roughly half the planned one; bump higher (toward 1.0) to be more
-    # conservative (drop sooner) or lower to attempt more catches.
-    PICK_FEASIBILITY_FACTOR: float = 0.5
+    # over-estimate the real move (~2x), so this trusts the real move is only
+    # a fraction of the planned one; bump higher (toward 1.0) to be more
+    # conservative (drop sooner) or lower to attempt more borderline catches.
+    PICK_FEASIBILITY_FACTOR: float = 0.4
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
