@@ -102,6 +102,32 @@ package's `.venv/bin/python` (found by walking up from the launch file) so
 that torch is available. Override the venv location with
 `GP8_VENV_PYTHON=/path/to/python` if needed.
 
+### Skill 선택 — throw만 / push만 실행 (디버그)
+
+`gp8_manager` 는 매 객체를 `ActionSelector` 가 push/throw 스킬로 라우팅합니다
+(기본: 전부 throw). 디버그·테스트용으로 **모든 객체를 한 스킬로 고정**할 수 있습니다.
+
+| 모드 | 실행 |
+|---|---|
+| 정상 라우팅 (기본) | `ros2 launch gp8_control gp8_bringup.launch.py` |
+| throw 만 | `GP8_FORCE_SKILL=throw ros2 launch gp8_control gp8_bringup.launch.py` |
+| push 만 | `GP8_FORCE_SKILL=push ros2 launch gp8_control gp8_bringup.launch.py` |
+
+- 우선순위: CLI `--skill {throw,push}` > 환경변수 `GP8_FORCE_SKILL` > 기본(정상 라우팅).
+- 기동 로그에 `ActionSelector FORCED to '<skill>' skill for ALL objects` 가 뜨면 적용된 것.
+- ⚠️ **`push` 는 아직 실제 스윕이 아니라 디버그 모션**입니다 — 객체가 잡힐 때마다
+  EE 를 위로 5cm 올렸다 다시 5cm 내리는 한 사이클만 수행합니다
+  (`skills/push_skill.py`). 정상 라우팅에서는 `can_handle()` 이 `False` 라
+  선택되지 않고, **강제(force)할 때만** 동작합니다.
+
+bringup 없이 앱만 단독으로 띄울 땐 venv python 으로 플래그를 직접 줄 수 있습니다
+(torch 때문에 venv 필요; move_group/bridge 가 없어 실제 picking 은 안 됨):
+
+```bash
+PYTHONPATH=$HOME/ros2_ws/src:$PYTHONPATH \
+  ~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.app --skill push
+```
+
 ### Terminal 2 — conveyor encoder (publishes `/conveyor/speed`)
 
 Lives in a sibling package:
