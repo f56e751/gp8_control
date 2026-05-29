@@ -183,7 +183,7 @@ class Config:
     # over-estimate the real move (~2x), so this trusts the real move is only
     # a fraction of the planned one; bump higher (toward 1.0) to be more
     # conservative (drop sooner) or lower to attempt more borderline catches.
-    PICK_FEASIBILITY_FACTOR: float = 0.4
+    PICK_FEASIBILITY_FACTOR: float = 1.4
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
@@ -570,18 +570,18 @@ class GP8App:
             )
             eta = (obj_y - intercept_y) / (v + 1e-6)
 
-            # Feasibility: the arm must be parked at the intercept by the time
-            # suction fires (= eta - SUCTION_LEAD), not just by the time the
-            # object actually arrives. Drop heads we can't position in time.
-            # opt_time over-estimates the real move (~2x), so scale by
-            # PICK_FEASIBILITY_FACTOR (default 0.5).
-            needed = move_time * factor + self.cfg.SUCTION_LEAD
+            # Feasibility: the arm only needs to REACH the intercept by the
+            # object's arrival. Suction now primes DURING the positioning move
+            # (position_and_prime), not after the arm parks, so no SUCTION_LEAD
+            # is reserved here anymore. opt_time over-estimates the real move
+            # (~2x), so scale it by PICK_FEASIBILITY_FACTOR.
+            needed = move_time * factor
             if eta < needed:
                 self.queue.pop_head()
                 self._node.get_logger().info(
                     f"Drop {candidate.class_name}: too late to catch "
                     f"(eta {eta:.2f}s < move {move_time:.2f}s × {factor:.2f} "
-                    f"+ suction lead {self.cfg.SUCTION_LEAD:.2f}s = {needed:.2f}s)"
+                    f"= {needed:.2f}s)"
                 )
                 continue
 

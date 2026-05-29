@@ -154,6 +154,56 @@ class SkillContext:
         #    so the lift/throw motion begins at eta.
         self.sleep_until(now + eta)
 
+    def position_and_prime(
+        self,
+        current_joint: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+        target: "TrackedObject",
+        intercept_y: float,
+    ) -> None:
+        """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
+
+        Unlike the old "position (blocking) THEN wait+suction" split (which fired
+        suction only after positioning finished, so a slow positioning ate into
+        the lead), the suction-on here is keyed to an ABSOLUTE wall-clock instant
+        ``t_suction = arrival - SUCTION_LEAD``. If that instant falls while the
+        arm is still positioning, suction fires mid-move (priming the vacuum
+        early is harmless). This guarantees the full SUCTION_LEAD regardless of
+        how long positioning takes, so a borderline pick keeps its lead. Returns
+        once the object has reached the intercept (caller then lifts/throws).
+        """
+        now = time.time()
+        v = self.conveyor.current
+        obj_y = self.object_y_now(target, now, v)
+        eta = max(0.0, min((obj_y - intercept_y) / (v + 1e-6), self.cfg.AMBUSH_MAX_WAIT))
+        t_arrival = now + eta
+        t_suction = t_arrival - self.cfg.SUCTION_LEAD     # absolute; may be <= now
+        self.log.info(
+            f"Ambush: prime suction {self.cfg.SUCTION_LEAD:.2f}s before arrival, "
+            f"arrival/lift in {eta:.2f}s (dist {obj_y - intercept_y:.3f} m / "
+            f"belt {v:.3f} m/s)"
+        )
+
+        zero = np.zeros_like(self.M1)
+        traj, vel, ts = trajectory(
+            current_joint, zero, grasp_joint, zero,
+            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+        )
+        # Positioning fires suction the instant t_suction passes — mid-move when
+        # the object is already within SUCTION_LEAD by the time we get there.
+        fired = self.traj_ctrl.send_trajectory_queue_timed_suction(
+            traj, vel, ts, final_joint=grasp_joint, suction_on_at=t_suction,
+        )
+        self.set_status("WAITING", getattr(target, "class_name", ""))
+        # Comfortable pick: t_suction still ahead -> park until it, then prime.
+        if not fired:
+            self.sleep_until(t_suction)
+            self.traj_ctrl.suction_on()
+        # Finally wait out the rest until arrival, then return so the throw
+        # begins right as the object reaches the intercept.
+        self.sleep_until(t_arrival)
+
     def scan_next_intercept(self) -> "Optional[np.ndarray]":
         """Re-poll the live queue for the next reachable object's intercept joint.
 

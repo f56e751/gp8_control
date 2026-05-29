@@ -450,6 +450,42 @@ class TrajectoryController:
         self._wait_trajectory_end(total_duration, t_start=t_start)
         return True
 
+    def send_trajectory_queue_timed_suction(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray,
+        suction_on_at: float,
+    ) -> bool:
+        """Queue-mode move that fires suction_on ONCE at wall-clock ``suction_on_at``.
+
+        The deadline is checked during BOTH the point-push and the end-wait, so
+        the vacuum is primed on time even while the arm is still positioning
+        (priming early is harmless for a suction gripper). Used for the ambush
+        pre-position: guarantees the full SUCTION_LEAD before object arrival
+        regardless of how long positioning takes. Returns True iff suction was
+        fired before returning (i.e. ``suction_on_at`` had already passed)."""
+        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        total_duration = waypoints[-1][2]
+        state = {"fired": False}
+
+        def _fire() -> None:
+            if not state["fired"] and time.time() >= suction_on_at:
+                self.suction_on()
+                state["fired"] = True
+
+        t_start = time.time()
+        if not self._push_waypoints(waypoints, between_fn=_fire):
+            return state["fired"]
+        # Finish the move, still watching the suction deadline.
+        t_end = t_start + total_duration + 0.1
+        while time.time() < t_end:
+            rclpy.spin_once(self._node, timeout_sec=0.02)
+            _fire()
+        _fire()
+        return state["fired"]
+
     def _build_queue_waypoints(
         self,
         traj: np.ndarray,
@@ -491,6 +527,7 @@ class TrajectoryController:
         busy_max_retry: int = 5,
         release_index: int | None = None,
         release_fn=None,
+        between_fn=None,
     ) -> bool:
         """waypoint를 /motoman_gp8_controller/queue_traj_point로 순차 push.
 
@@ -541,6 +578,11 @@ class TrajectoryController:
             if release_fn is not None and release_index is not None and i >= release_index:
                 release_fn()
                 release_fn = None  # fire once
+
+            # Generic per-point hook: e.g. fire an early suction_on the instant
+            # its wall-clock deadline passes, mid-push if needed.
+            if between_fn is not None:
+                between_fn()
 
         if busy_total > 0:
             # BUSY는 push가 MotoROS2 수신 속도보다 빠를 때 발생하는 정상 신호.

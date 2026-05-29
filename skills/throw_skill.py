@@ -110,14 +110,13 @@ class ThrowSkill(ManipulationSkill):
             ctx.log.error("Failed to (re)enter queue mode; skipping this pick")
             return SkillResult(False, "enter_queue_mode (pick) failed")
 
-        # WAIT_AT_GRASP: drive all the way to the grasp pose and park there.
+        # WAIT_AT_GRASP: drive to the grasp pose and prime suction SUCTION_LEAD
+        # before the object's predicted arrival — even when that instant falls
+        # DURING the positioning move (a borderline pick still gets the full
+        # vacuum lead; priming early is harmless). Returns once the object has
+        # reached the intercept.
         ctx.set_status("POSITIONING", target.class_name)
-        ctx.move_through(current_joint, aim_joint, grasp_joint)
-
-        # Wait until the predicted object position reaches the intercept line,
-        # then fire suction (slightly early to cover pneumatic lag).
-        ctx.set_status("WAITING", target.class_name)
-        ctx.wait_for_arrival_and_suction(target, T_grasp[1, 3])
+        ctx.position_and_prime(current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3])
 
         # Lift + throw — same path as the moving strategy.
         # MotoROS2 leaves point-queue mode once the pick trajectory's queue
