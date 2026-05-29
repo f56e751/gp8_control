@@ -147,7 +147,10 @@ class Config:
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
-    RELEASE_LEAD: float = 0.0           # [s]
+    # Positive = release earlier; NEGATIVE = release LATER. lead_steps =
+    # round(RELEASE_LEAD * TRAJ_HZ), release_idx = eta_idx - lead_steps, so
+    # -0.1 @ 20 Hz shifts release +2 waypoints (~0.1 s of trajectory time later).
+    RELEASE_LEAD: float = -0.1          # [s]  (negative -> release ~0.1 s later)
 
     # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
     PICK_LOG_CSV: str = field(
