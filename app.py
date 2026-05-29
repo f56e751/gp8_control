@@ -475,14 +475,23 @@ class GP8App:
     ) -> None:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
-        The release motion (grasp → release sample at eta) is unchanged from
-        the NN trajectory; what used to be the follow-through to aim_joint2
-        is **replaced** with a smooth transition from the release joint state
-        (carrying the throw's release velocity) to a ready pose:
+        The **full** NN throw arc (grasp → release → aim_joint2) is kept intact,
+        so the arm performs the entire trained swing including the wide
+        follow-through past the release sample up to aim_joint2. Because
+        new_trajectory decelerates to rest at aim_joint2 (dq(T)=0), we then
+        **append** a smooth transition from that rest pose to a ready pose so
+        the arm does not park at the high aim_joint2 hover (the NN boundary
+        condition leaves it at dq=0 there for an instant, then it immediately
+        continues into the chain) — this is what keeps multi-object operation
+        flowing:
           - ``next_intercept_joint`` when supplied (next pick's intercept), or
           - ``grasp_joint`` (the current pick's intercept) as a sensible
             fallback when there's no known next pick — keeps the arm low and
-            over the belt instead of parked at the high aim_joint2 hover.
+            over the belt, ready for the next cycle.
+
+        The timed suction release still fires at ``release_idx``
+        (= eta_idx - lead_steps), which indexes the same pre-release waypoint
+        as before, so release timing/position/velocity are unchanged.
         """
         throw_T = float(params.T)
         n_steps = max(2, int(throw_T * self.cfg.TRAJ_HZ))
@@ -523,15 +532,19 @@ class GP8App:
         lead_steps = int(round(self.cfg.RELEASE_LEAD * self.cfg.TRAJ_HZ))
         release_idx = max(0, min(eta_idx - lead_steps, n_steps))
 
-        # Splice at the release sample. Pre-release portion = throw motion up
-        # to and including the release joint config; that's identical to the
-        # original NN throw, so release velocity/direction are preserved.
-        traj_pre_5 = traj_ext[: eta_idx + 1].T    # (5, eta_idx+1)
-        vel_pre_5 = vel_ext[: eta_idx + 1].T
-        ts_pre = ts_ext[: eta_idx + 1]
+        # Keep the FULL NN throw arc (grasp → release → aim_joint2). The arm
+        # sweeps the entire trained throw, including the follow-through past
+        # the release sample up to aim_joint2 — the wide swing. eta_idx (the
+        # release sample) stays only as the timed-release index; it no longer
+        # truncates the motion.
+        traj_pre_5 = traj_ext.T                   # (5, n_steps+1) full arc
+        vel_pre_5 = vel_ext.T
+        ts_pre = ts_ext
 
-        release_q5 = traj_ext[eta_idx]            # (5,)
-        release_dq5 = vel_ext[eta_idx]
+        # End of the throw = aim_joint2 at rest (new_trajectory's dq(T)=0), the
+        # start state for the chain transition below.
+        end_q5 = traj_ext[-1]                     # (5,) == aim_joint2
+        end_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
 
         # Chain target: next pick's intercept if known, else the current
         # pick's intercept (= grasp_joint) — keeps the arm low, ready over
@@ -545,22 +558,29 @@ class GP8App:
 
         zero5 = np.zeros(5)
         traj_chain_5, vel_chain_5, ts_chain = trajectory(
-            release_q5, release_dq5,
+            end_q5, end_dq5,
             chain_target[:5], zero5,
             self.M1[:5], self.M2[:5], hertz=self.cfg.TRAJ_HZ,
         )
-        # Drop the chain's first column — it's the release sample, same as
-        # the last sample of the pre-release portion (would be a duplicate).
-        if traj_chain_5.shape[1] > 1:
-            traj_chain_5 = traj_chain_5[:, 1:]
-            vel_chain_5 = vel_chain_5[:, 1:]
-            ts_chain_shifted = ts_chain[1:] + ts_pre[-1]
-        else:
-            ts_chain_shifted = ts_chain[1:] + ts_pre[-1]  # empty
+        # Drop the chain's first column — it's aim_joint2, same as the last
+        # sample of the full arc (would be a duplicate). Slice traj/vel/ts the
+        # SAME way so the three stay equal length: if the chain degenerates to
+        # a single sample (chain_target ≈ aim_joint2 -> opt_time ≈ 0) all three
+        # become empty and only the full arc remains. (Slicing ts alone would
+        # leave traj/vel one column longer, and zip() in _build_queue_waypoints
+        # would then silently drop a waypoint and bind final_joint to the wrong
+        # timestamp.)
+        traj_chain_5 = traj_chain_5[:, 1:]
+        vel_chain_5 = vel_chain_5[:, 1:]
+        ts_chain_shifted = ts_chain[1:] + ts_pre[-1]
 
         traj_full_5 = np.concatenate((traj_pre_5, traj_chain_5), axis=1)   # (5, total)
         vel_full_5 = np.concatenate((vel_pre_5, vel_chain_5), axis=1)
         ts_full = np.concatenate((ts_pre, ts_chain_shifted))
+        assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
+            f"throw traj/vel/timestep length mismatch: "
+            f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
+        )
 
         # Pad to 6-dof, reorient to (6, total) as the queue expects.
         traj_throw = pad(traj_full_5.T).T
