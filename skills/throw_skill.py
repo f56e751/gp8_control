@@ -106,21 +106,30 @@ class ThrowSkill(ManipulationSkill):
         if not ctx.suction_primed_for_pick:
             ctx.traj_ctrl.suction_off()
 
-        # Re-enter point queue mode each cycle. MotoROS2 leaves queue mode once
-        # the previous trajectory's queue drains, so the next pick's points are
-        # rejected ("Must call start_point_queue_mode") — which is why only the
-        # first object worked. Re-entering here makes every cycle self-contained.
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to (re)enter queue mode; skipping this pick")
-            return SkillResult(False, "enter_queue_mode (pick) failed")
+        # Did the previous throw's return swing already park the arm AT this
+        # pick's grasp pose? If so we must NOT re-enter queue mode + re-drive:
+        # the mode stop would chop the just-finished swing and the re-drive is to
+        # the same spot — that is the observed bobble. The throw re-enters queue
+        # mode later, on a stopped arm. Only drive (and switch modes) when the arm
+        # actually needs to move there (first pick, a different object, etc.).
+        at_grasp = float(np.linalg.norm(
+            np.asarray(current_joint, dtype=float) - np.asarray(grasp_joint, dtype=float)
+        )) < 0.05      # rad
+        if not at_grasp:
+            # MotoROS2 leaves queue mode once the previous trajectory's queue
+            # drains; re-enter so the positioning push isn't rejected.
+            if not ctx.traj_ctrl.enter_queue_mode():
+                ctx.log.error("Failed to (re)enter queue mode; skipping this pick")
+                return SkillResult(False, "enter_queue_mode (pick) failed")
 
-        # WAIT_AT_GRASP: drive to the grasp pose and prime suction SUCTION_LEAD
-        # before the object's predicted arrival — even when that instant falls
-        # DURING the positioning move (a borderline pick still gets the full
-        # vacuum lead; priming early is harmless). Returns once the object has
-        # reached the intercept.
+        # WAIT_AT_GRASP: drive to the grasp pose (unless already there) and prime
+        # suction SUCTION_LEAD before the object's arrival. Returns once the
+        # object has reached the intercept.
         ctx.set_status("POSITIONING", target.class_name)
-        ctx.position_and_prime(current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3])
+        ctx.position_and_prime(
+            current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
+            skip_move=at_grasp,
+        )
 
         # Lift + throw — same path as the moving strategy.
         # MotoROS2 leaves point-queue mode once the pick trajectory's queue

@@ -49,6 +49,7 @@ class TrajectoryController:
         self._node = node
         self.current_joints: list | None = None
         self.current_jointvels: list | None = None
+        self._jmon = None   # [QMODE-DBG] (min,max) joint tracker during a mode switch
 
         cb_group = ReentrantCallbackGroup()
 
@@ -119,6 +120,17 @@ class TrajectoryController:
     def _joint_state_cb(self, msg: JointState) -> None:
         self.current_joints = list(msg.position)
         self.current_jointvels = list(msg.velocity)
+        # [QMODE-DBG] track joint excursion during a mode switch (catches a
+        # transient up-down bobble even when the net move is ~0).
+        jmon = self._jmon
+        if jmon is not None:
+            lo, hi = jmon
+            for i, p in enumerate(self.current_joints):
+                if i < len(lo):
+                    if p < lo[i]:
+                        lo[i] = p
+                    if p > hi[i]:
+                        hi[i] = p
 
     # ------------------------------------------------------------------
     # Trajectory execution
@@ -239,12 +251,25 @@ class TrajectoryController:
 
     def _try_start_queue_mode(self):
         """One stop+start attempt; returns the service result (None on timeout)."""
+        # [QMODE-DBG] watch whether the stop+start physically moves the arm.
+        j0 = list(self.current_joints) if self.current_joints else None
+        self._jmon = ([float(x) for x in j0], [float(x) for x in j0]) if j0 else None
+        t0 = time.time()
         self._stop_current_mode()
         if not self._start_queue_client.wait_for_service(timeout_sec=5.0):
             self._node.get_logger().error("/start_point_queue_mode unavailable.")
+            self._jmon = None
             return None
         fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
         rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        if self._jmon is not None and j0 is not None:
+            lo, hi = self._jmon
+            exc = [round(hi[i] - lo[i], 4) for i in range(len(lo))]
+            self._node.get_logger().info(
+                f"[QMODE-DBG] mode switch {(time.time() - t0) * 1000:.0f}ms; "
+                f"joint excursion (max-min) = {exc} rad"
+            )
+        self._jmon = None
         return fut.result()
 
     def _reset_error(self) -> bool:
@@ -472,6 +497,13 @@ class TrajectoryController:
             rclpy.spin_once(self._node, timeout_sec=0.05)
             _prime_next()
         _prime_next()
+        # Settle: wait for the arm to ACTUALLY reach the final pose, not just the
+        # time estimate. The BUSY-throttled push delays execution, so the loop
+        # above can return while the arm is still finishing the return (chain)
+        # move; the NEXT cycle's mode stop would then chop that still-moving arm
+        # (the observed bobble). Waiting here means the next cycle starts from a
+        # stopped arm.
+        self._wait_for_position(final_joint, tolerance=0.03, timeout_sec=1.5)
         return state["primed_next"]
 
     def send_trajectory_queue_timed_suction(

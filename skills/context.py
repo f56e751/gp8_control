@@ -165,6 +165,7 @@ class SkillContext:
         grasp_joint: np.ndarray,
         target: "TrackedObject",
         intercept_y: float,
+        skip_move: bool = False,
     ) -> None:
         """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
 
@@ -195,23 +196,31 @@ class SkillContext:
         )
 
         zero = np.zeros_like(self.M1)
-        traj, vel, ts = trajectory(
-            current_joint, zero, grasp_joint, zero,
-            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
-        )
-        if already_primed:
-            # Vacuum already on (primed during the return chain) — just drive in.
-            self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
-        else:
-            # Fire suction the instant t_suction passes — mid-move when the object
-            # is already within SUCTION_LEAD by the time we get there.
-            fired = self.traj_ctrl.send_trajectory_queue_timed_suction(
-                traj, vel, ts, final_joint=grasp_joint, suction_on_at=t_suction,
-            )
-            if not fired:
-                # t_suction still ahead -> park until it, then prime.
+        if skip_move:
+            # Arm already AT the grasp pose (the return swing parked it here) — no
+            # drive, no mode switch. Just prime (if not already on) and wait, so
+            # the return swing flows straight into the grab without a bobble.
+            if not already_primed:
                 self.sleep_until(t_suction)
                 self.traj_ctrl.suction_on()
+        else:
+            traj, vel, ts = trajectory(
+                current_joint, zero, grasp_joint, zero,
+                self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+            )
+            if already_primed:
+                # Vacuum already on (primed during the return chain) — just drive in.
+                self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+            else:
+                # Fire suction the instant t_suction passes — mid-move when the
+                # object is already within SUCTION_LEAD by the time we get there.
+                fired = self.traj_ctrl.send_trajectory_queue_timed_suction(
+                    traj, vel, ts, final_joint=grasp_joint, suction_on_at=t_suction,
+                )
+                if not fired:
+                    # t_suction still ahead -> park until it, then prime.
+                    self.sleep_until(t_suction)
+                    self.traj_ctrl.suction_on()
         self.set_status("WAITING", getattr(target, "class_name", ""))
         # Wait out the rest until arrival, then return so the throw begins right
         # as the object reaches the intercept.
