@@ -103,7 +103,7 @@ PUSH_RETREAT_MIN_X: float = 0.3
 
 # 6th joint angle (rad) for all push keyframes.  π/2 ≈ 90° clockwise
 # (viewed from above) so the TCP faces the push direction.
-PUSH_JOINT6_ANGLE: float = np.pi / 2.0
+PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 
 
 class PushSkill(ManipulationSkill):
@@ -143,7 +143,8 @@ class PushSkill(ManipulationSkill):
         """Full push cycle: position high → wait → descend + push → chain."""
         ctx = self.ctx
         target = request.target
-        current_joint = request.current_joint
+        current_joint = request.current_joint.copy()
+        current_joint[-1] = PUSH_JOINT6_ANGLE  # match 6th joint for push
         aim_joint = request.aim_joint        # T_aim1: high wait pose (original)
         grasp_joint = request.grasp_joint    # T_grasp1: low, near-object pose
         T_aim = request.T_aim               # 4×4 SE3 of aim pose
@@ -523,6 +524,7 @@ class PushSkill(ManipulationSkill):
             if next_intercept_joint is not None
             else np.asarray(grasp_joint, dtype=float)
         )
+        chain_target[-1] = PUSH_JOINT6_ANGLE  # override; scan_next_intercept sets 0
         chained_to_next = next_intercept_joint is not None
 
         traj_chain_5, vel_chain_5, ts_chain = trajectory(
@@ -555,9 +557,12 @@ class PushSkill(ManipulationSkill):
             f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
         )
 
-        # Pad to 6-DOF (zero 6th joint), reorient to (6, total).
+        # Pad to 6-DOF, then set the 6th joint to PUSH_JOINT6_ANGLE.
+        # pad() fills the 6th row with zeros; we overwrite with the
+        # correct angle.  Velocity stays 0 (no 6th-joint motion).
         traj_push = pad(traj_full_5.T).T
-        vel_push = pad(vel_full_5.T).T
+        traj_push[5, :] = PUSH_JOINT6_ANGLE
+        vel_push = pad(vel_full_5.T).T       # 6th vel = 0 is correct
         final_joint = chain_target
 
         n_desc = traj_desc_5.shape[1]
@@ -648,7 +653,8 @@ class PushSkill(ManipulationSkill):
                 )
                 break
             q = np.asarray(ik, dtype=float)
-            q[-1] = PUSH_JOINT6_ANGLE        # 6th joint for push
+            # Only q[:5] is used below; 6th joint is handled by
+            # build_push_trajectory after pad().
             waypoints.append(q[:5])
 
         # Fallback: if fewer than 2 waypoints, return a zero-motion segment
