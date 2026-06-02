@@ -221,17 +221,17 @@ class PushSkill(ManipulationSkill):
         self._wait_for_approach(target, T_grasp_retreat, wait_joint, grasp_retreat_joint)
 
         # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
-        # The positioning queue has long since drained, so we must re-enter
-        # queue mode (same as ThrowSkill line 128).
+        # Perform heavy computation (scan_next_intercept does queue update +
+        # IK per candidate) BEFORE entering queue mode so that the gap
+        # between enter_queue_mode() and the first queued point is minimal.
         ctx.set_status("PUSHING", target.class_name)
+        next_intercept_joint = ctx.scan_next_intercept()
+
         if not ctx.traj_ctrl.enter_queue_mode():
             ctx.log.error("Failed to enter queue mode for push sweep")
             ctx.set_active_target(None)
             ctx.set_status("IDLE", "")
             return SkillResult(False, "enter_queue_mode (push sweep) failed")
-
-        # Chain target for post-push transition (next pick's intercept).
-        next_intercept_joint = ctx.scan_next_intercept()
 
         # Build & dispatch: descent + push stroke + chain only (compact).
         self.build_push_trajectory(
@@ -564,6 +564,24 @@ class PushSkill(ManipulationSkill):
             (vel_desc_5, vel_stroke_5, vel_chain_5), axis=1,
         )
         ts_full = np.concatenate((ts_desc, ts_stroke_shifted, ts_chain_shifted))
+
+        # ================================================================
+        # Decimate: ensure _push_waypoints outruns the robot
+        # ================================================================
+        # trajectory() at TRAJ_HZ=20 produces points every 50 ms, but
+        # each queue_traj_point service call through the bridge takes
+        # ~60-100 ms.  If dt < latency the robot consumes points faster
+        # than we can push them → queue drains → code 2.  Decimate to
+        # _MIN_QUEUE_GAP (150 ms) so every gap comfortably exceeds the
+        # worst-case service latency.  ThrowSkill avoids this because its
+        # NN trajectory is long enough to absorb the latency; the push
+        # descent segment is much shorter and drains immediately.
+        n_before = traj_full_5.shape[1]
+        traj_full_5, vel_full_5, ts_full = self._decimate_for_queue(
+            traj_full_5, vel_full_5, ts_full,
+        )
+        n_after = traj_full_5.shape[1]
+
         assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
             f"push traj/vel/ts length mismatch: "
             f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
@@ -578,7 +596,8 @@ class PushSkill(ManipulationSkill):
         n_desc = traj_desc_5.shape[1]
         n_stroke = traj_stroke_5.shape[1]
         ctx.log.info(
-            f"Push traj: descent {n_desc} + stroke {n_stroke} steps "
+            f"Push traj: {n_after} pts (decimated from {n_before}), "
+            f"descent {n_desc} + stroke {n_stroke} raw steps "
             f"(d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
             f"θ={np.degrees(theta):.1f}°), "
             f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'}"
