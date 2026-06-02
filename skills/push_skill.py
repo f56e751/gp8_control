@@ -201,14 +201,14 @@ class PushSkill(ManipulationSkill):
             )
         )
 
-        # ---- 1. Queue mode entry (single session for the whole cycle) ----
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to enter queue mode for push")
-            return SkillResult(False, "enter_queue_mode failed")
-
-        # ---- 2. Compute approach timing BEFORE positioning ----
-        # We need the hold (wait) duration upfront so we can build positioning
-        # + hold + push as one contiguous queue dispatch.
+        # ---- 1. Compute approach timing BEFORE entering queue mode ----
+        # Heavy computation (trajectory generation for timing estimate, queue
+        # scan with IK) is done FIRST so that enter_queue_mode() is called
+        # immediately before the first point is pushed.  Otherwise the gap
+        # between entering queue mode and the first queued point lets MotoROS2
+        # time out and auto-exit queue mode → code 2 "Must call
+        # start_point_queue_mode".  This matches the ThrowSkill pattern where
+        # queue mode is entered right before send_trajectory_queue.
         ctx.set_status("POSITIONING", target.class_name)
         wait_sec, descent_time = self._compute_approach_timing(
             target, T_grasp_retreat, wait_joint, grasp_retreat_joint,
@@ -216,6 +216,11 @@ class PushSkill(ManipulationSkill):
 
         # Chain target for post-push transition (next pick's intercept).
         next_intercept_joint = ctx.scan_next_intercept()
+
+        # ---- 2. Queue mode entry (immediately before dispatch) ----
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to enter queue mode for push")
+            return SkillResult(False, "enter_queue_mode failed")
 
         # ---- 3. Build & dispatch the FULL trajectory in one queue push ----
         # positioning (current→wait) + hold (dummy) + descent + stroke + chain
