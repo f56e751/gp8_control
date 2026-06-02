@@ -105,6 +105,12 @@ PUSH_RETREAT_MIN_X: float = 0.27
 # (viewed from above) so the TCP faces the push direction.
 PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 
+# Minimum time gap (seconds) between consecutive queued trajectory
+# points.  ``queue_traj_point`` round-trip through the URDF→raw
+# bridge takes ~60-100 ms; 150 ms gives a comfortable margin so
+# ``_push_waypoints`` never falls behind the robot's execution clock.
+_MIN_QUEUE_GAP: float = 0.15
+
 
 class PushSkill(ManipulationSkill):
     """Position above the intercept, descend, and push the object off the belt.
@@ -480,19 +486,18 @@ class PushSkill(ManipulationSkill):
         # ================================================================
         # Segment 0: Startup buffer  (hold at current, queue pump-prime)
         # ================================================================
-        # _push_waypoints sends one ROS service call per point (~20-30 ms
-        # each), but the robot begins executing as soon as the first point
-        # arrives.  A short positioning segment (current ≈ wait → 2-3
-        # points spanning <60 ms) can be consumed before the push loop
-        # feeds the next segment → queue drains → MotoROS2 auto-exits
-        # queue mode → code 2 "Must call start_point_queue_mode".
-        #
-        # The startup buffer holds the robot at the current position for
-        # ~0.36 s with wide inter-point gaps, giving the push loop enough
-        # wall-clock time to fill the queue with all subsequent segments
-        # before the robot's execution clock catches up.
+        # _push_waypoints sends one ROS service call per point, and each
+        # round-trip through the URDF→raw bridge takes ~60-100 ms.  The
+        # robot starts executing as soon as the first point arrives, so a
+        # short positioning segment can drain the queue before more points
+        # are pushed.  The startup buffer holds the robot stationary for
+        # ~0.6 s with wide inter-point gaps (200 ms), giving the push
+        # loop enough wall-clock time to fill the queue with upcoming
+        # segments.  After concatenation, a global decimation pass thins
+        # ALL remaining 50 Hz segments to ≥ 150 ms gaps so the push loop
+        # can never fall behind the robot's execution clock.
         _STARTUP_N = 4
-        _STARTUP_DT = 0.12          # 120 ms between startup points
+        _STARTUP_DT = 0.20          # 200 ms between startup points
         startup_q5 = np.tile(current_joint[:5, None], (1, _STARTUP_N))
         startup_v5 = np.zeros((5, _STARTUP_N))
         # First point at t=0 so positions[0] matches current_joints
@@ -610,6 +615,21 @@ class PushSkill(ManipulationSkill):
             (ts_startup, ts_pos_shifted, ts_hold,
              ts_desc_shifted, ts_stroke_shifted, ts_chain_shifted),
         )
+
+        # ================================================================
+        # Decimate: guarantee push loop outruns robot execution
+        # ================================================================
+        # queue_traj_point service calls through the URDF→raw bridge take
+        # ~60-100 ms each.  Any consecutive points closer than that cause
+        # the robot to consume them faster than they are pushed → queue
+        # drains → code 2.  Decimate to MIN_QUEUE_GAP so every inter-
+        # point gap comfortably exceeds the worst-case service latency.
+        n_before = traj_full_5.shape[1]
+        traj_full_5, vel_full_5, ts_full = self._decimate_for_queue(
+            traj_full_5, vel_full_5, ts_full,
+        )
+        n_after = traj_full_5.shape[1]
+
         assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
             f"push traj/vel/ts length mismatch: "
             f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
@@ -621,15 +641,11 @@ class PushSkill(ManipulationSkill):
         vel_push = pad(vel_full_5.T).T       # 6th vel = 0 is correct
         final_joint = chain_target
 
-        n_pos = traj_pos_5.shape[1]
-        n_desc = traj_desc_5.shape[1]
-        n_stroke = traj_stroke_5.shape[1]
         ctx.log.info(
-            f"Push traj: startup {_STARTUP_N} + pos {n_pos} "
-            f"+ hold {n_hold} ({hold_sec:.2f}s) "
-            f"+ descent {n_desc} + stroke {n_stroke} steps "
-            f"(d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
-            f"θ={np.degrees(theta):.1f}°), "
+            f"Push traj: {n_after} pts (decimated from {n_before}), "
+            f"hold {hold_sec:.2f}s, "
+            f"d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
+            f"θ={np.degrees(theta):.1f}°, "
             f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'}"
         )
 
@@ -675,6 +691,72 @@ class PushSkill(ManipulationSkill):
             hold_sec=0.0,           # no hold — caller already waited
             next_intercept_joint=next_intercept_joint,
         )
+
+    # ------------------------------------------------------------------
+    # Queue-safe decimation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decimate_for_queue(
+        traj_5: np.ndarray,
+        vel_5: np.ndarray,
+        ts: np.ndarray,
+        min_gap: float = _MIN_QUEUE_GAP,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Thin a trajectory so consecutive points are ≥ *min_gap* apart.
+
+        MotoROS2 ``queue_traj_point`` is a synchronous service call whose
+        round-trip through the URDF→raw bridge takes ~60-100 ms.  If
+        consecutive trajectory points are closer in time than that latency,
+        the robot consumes queued points faster than ``_push_waypoints``
+        can supply them → the internal buffer drains → MotoROS2 auto-exits
+        point-queue mode → code 2 "Must call start_point_queue_mode".
+
+        Decimation keeps the **first** and **last** point unconditionally
+        and retains interior points only when they are ≥ *min_gap* from
+        the most-recently-kept point.  Joint velocities are recomputed
+        via central finite differences at the new (wider) spacing so that
+        MotoROS2's interpolation stays consistent.
+
+        This is applied as a post-processing step after the full
+        trajectory (startup + positioning + hold + descent + stroke +
+        chain) is concatenated, so it is guaranteed to cover **all**
+        segments regardless of their original sample rate.
+        """
+        n = traj_5.shape[1]
+        if n <= 2:
+            return traj_5, vel_5, ts
+
+        # Greedy decimation: walk interior points, keep those ≥ min_gap
+        # from the last kept point.  First and last are always kept.
+        keep = [0]
+        for i in range(1, n - 1):
+            if ts[i] - ts[keep[-1]] >= min_gap:
+                keep.append(i)
+        keep.append(n - 1)
+
+        # If the last interior point is too close to the final point,
+        # drop it so the invariant (ALL gaps ≥ min_gap) holds at the end.
+        while len(keep) > 2 and ts[keep[-1]] - ts[keep[-2]] < min_gap:
+            keep.pop(-2)
+
+        idx = np.array(keep)
+        traj_dec = traj_5[:, idx]
+        ts_dec = ts[idx]
+
+        # Recompute velocities via central finite differences.
+        m = len(idx)
+        vel_dec = np.zeros_like(traj_dec)
+        if m > 2:
+            for j in range(1, m - 1):
+                dt2 = ts_dec[j + 1] - ts_dec[j - 1]
+                if dt2 > 1e-9:
+                    vel_dec[:, j] = (
+                        traj_dec[:, j + 1] - traj_dec[:, j - 1]
+                    ) / dt2
+        # Boundary velocities stay zero (start/end at rest).
+
+        return traj_dec, vel_dec, ts_dec
 
     # ------------------------------------------------------------------
     # Push stroke helpers
