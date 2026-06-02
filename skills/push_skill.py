@@ -82,11 +82,11 @@ PUSH_SPEED: float = 1.0
 # Push stroke distance (m). How far the TCP travels from T_grasp1 in the
 # push direction. Must be long enough to clear the object off the belt but
 # short enough to stay within the workspace.
-PUSH_DISTANCE: float = 0.3
+PUSH_DISTANCE: float = 0.2
 
 # Small lead time (s) subtracted from the computed descent-start time to
 # compensate for trajectory dispatch latency (queue setup, ROS transport).
-PUSH_DESCENT_LEAD: float = 0.1
+PUSH_DESCENT_LEAD: float = 0.15
 
 
 class PushSkill(ManipulationSkill):
