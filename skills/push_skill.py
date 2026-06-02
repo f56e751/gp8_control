@@ -86,14 +86,24 @@ PUSH_DISTANCE: float = 0.2
 
 # Small lead time (s) subtracted from the computed descent-start time to
 # compensate for trajectory dispatch latency (queue setup, ROS transport).
-PUSH_DESCENT_LEAD: float = 0.15
+PUSH_DESCENT_LEAD: float = 0.18
 
 # Retreat distance (m) for the high wait pose.  The TCP waits on the line
 # from the push target through the intercept point (T_grasp), but offset
 # PUSH_RETREAT_DISTANCE behind T_grasp — i.e. in the direction *opposite*
 # to the push.  This keeps TCP, object, and target collinear while giving
 # the arm room to accelerate into the push stroke.
-PUSH_RETREAT_DISTANCE: float = 0.05
+PUSH_RETREAT_DISTANCE: float = 0.10
+
+# Minimum TCP X position (m) after retreat.  If the full retreat would
+# place the TCP at X < PUSH_RETREAT_MIN_X, the retreat distance is scaled
+# down proportionally so X stays at exactly this limit.  Prevents the arm
+# from over-reaching toward the base.
+PUSH_RETREAT_MIN_X: float = 0.3
+
+# 6th joint angle (rad) for all push keyframes.  π/2 ≈ 90° clockwise
+# (viewed from above) so the TCP faces the push direction.
+PUSH_JOINT6_ANGLE: float = np.pi / 2.0
 
 
 class PushSkill(ManipulationSkill):
@@ -257,6 +267,27 @@ class PushSkill(ManipulationSkill):
         retreat_dx = PUSH_RETREAT_DISTANCE * push_dir[0]
         retreat_dy = PUSH_RETREAT_DISTANCE * push_dir[1]
 
+        # Safety clamp: if the retreat would push X below PUSH_RETREAT_MIN_X,
+        # scale the whole retreat (dx & dy) proportionally so X = min limit.
+        retreated_x = T_grasp[0, 3] - retreat_dx
+        if retreated_x < PUSH_RETREAT_MIN_X and retreat_dx > 0:
+            available = T_grasp[0, 3] - PUSH_RETREAT_MIN_X
+            if available <= 0:
+                # Already at or past the limit — no retreat possible.
+                ctx.log.warn(
+                    f"Push retreat: grasp X={T_grasp[0, 3]:.4f} already "
+                    f"<= min {PUSH_RETREAT_MIN_X:.3f}; skipping retreat"
+                )
+                return aim_joint.copy(), T_aim.copy(), grasp_joint.copy(), T_grasp.copy()
+            scale = available / retreat_dx
+            retreat_dx *= scale
+            retreat_dy *= scale
+            ctx.log.info(
+                f"Push retreat clamped: X would be {retreated_x:.4f} < "
+                f"{PUSH_RETREAT_MIN_X:.3f}; scaled ×{scale:.2f} → "
+                f"dx={retreat_dx:+.4f}, dy={retreat_dy:+.4f}"
+            )
+
         # ---- Retreat wait pose (high, aim height) ----
         T_wait = T_grasp.copy()
         T_wait[0, 3] -= retreat_dx
@@ -280,15 +311,17 @@ class PushSkill(ManipulationSkill):
             return aim_joint.copy(), T_aim.copy(), grasp_joint.copy(), T_grasp.copy()
 
         wait_joint = np.asarray(ik_wait, dtype=float)
-        wait_joint[-1] = 0.0
+        wait_joint[-1] = PUSH_JOINT6_ANGLE
         grasp_retreat_joint = np.asarray(ik_grasp, dtype=float)
-        grasp_retreat_joint[-1] = 0.0
+        grasp_retreat_joint[-1] = PUSH_JOINT6_ANGLE
 
         ctx.log.info(
-            f"Push retreat: {PUSH_RETREAT_DISTANCE:.3f}m behind T_grasp "
-            f"(dir [{push_dir[0]:+.3f}, {push_dir[1]:+.3f}]) — "
-            f"wait ({T_wait[0, 3]:+.4f}, {T_wait[1, 3]:+.4f}, {T_wait[2, 3]:+.4f}), "
-            f"grasp ({T_grasp_retreat[0, 3]:+.4f}, {T_grasp_retreat[1, 3]:+.4f}, "
+            f"Push retreat: {PUSH_RETREAT_DISTANCE:.3f}m, "
+            f"dir [{push_dir[0]:+.3f}, {push_dir[1]:+.3f}], "
+            f"dx={retreat_dx:+.4f}, dy={retreat_dy:+.4f} — "
+            f"orig grasp ({T_grasp[0, 3]:+.4f}, {T_grasp[1, 3]:+.4f}, {T_grasp[2, 3]:+.4f}), "
+            f"retreat wait ({T_wait[0, 3]:+.4f}, {T_wait[1, 3]:+.4f}, {T_wait[2, 3]:+.4f}), "
+            f"retreat grasp ({T_grasp_retreat[0, 3]:+.4f}, {T_grasp_retreat[1, 3]:+.4f}, "
             f"{T_grasp_retreat[2, 3]:+.4f}) m"
         )
         return wait_joint, T_wait, grasp_retreat_joint, T_grasp_retreat
@@ -406,9 +439,9 @@ class PushSkill(ManipulationSkill):
         aim_joint1 = np.asarray(aim_joint1, dtype=float)
         grasp_joint1 = np.asarray(grasp_joint1, dtype=float)
         aim_joint2 = np.asarray(aim_joint2, dtype=float)
-        aim_joint1[-1] = 0.0
-        grasp_joint1[-1] = 0.0
-        aim_joint2[-1] = 0.0
+        aim_joint1[-1] = PUSH_JOINT6_ANGLE
+        grasp_joint1[-1] = PUSH_JOINT6_ANGLE
+        aim_joint2[-1] = PUSH_JOINT6_ANGLE
         return aim_joint1, grasp_joint1, aim_joint2
 
     # ------------------------------------------------------------------
@@ -615,7 +648,7 @@ class PushSkill(ManipulationSkill):
                 )
                 break
             q = np.asarray(ik, dtype=float)
-            q[-1] = 0.0                       # zero 6th joint
+            q[-1] = PUSH_JOINT6_ANGLE        # 6th joint for push
             waypoints.append(q[:5])
 
         # Fallback: if fewer than 2 waypoints, return a zero-motion segment
