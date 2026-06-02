@@ -77,16 +77,16 @@ PUSH_BIN_TARGET_MAP: dict[str, tuple] = {}
 # TCP speed during the push stroke (m/s). The arm sweeps at this speed
 # parallel to the belt surface. Tune to balance impact force vs. control
 # stability; too fast may exceed joint velocity limits.
-PUSH_SPEED: float = 0.3
+PUSH_SPEED: float = 1.0
 
 # Push stroke distance (m). How far the TCP travels from T_grasp1 in the
 # push direction. Must be long enough to clear the object off the belt but
 # short enough to stay within the workspace.
-PUSH_DISTANCE: float = 0.15
+PUSH_DISTANCE: float = 0.3
 
 # Small lead time (s) subtracted from the computed descent-start time to
 # compensate for trajectory dispatch latency (queue setup, ROS transport).
-PUSH_DESCENT_LEAD: float = 0.05
+PUSH_DESCENT_LEAD: float = 0.1
 
 
 class PushSkill(ManipulationSkill):
