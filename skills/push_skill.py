@@ -88,6 +88,13 @@ PUSH_DISTANCE: float = 0.2
 # compensate for trajectory dispatch latency (queue setup, ROS transport).
 PUSH_DESCENT_LEAD: float = 0.15
 
+# Retreat distance (m) for the high wait pose.  The TCP waits on the line
+# from the push target through the intercept point (T_grasp), but offset
+# PUSH_RETREAT_DISTANCE behind T_grasp — i.e. in the direction *opposite*
+# to the push.  This keeps TCP, object, and target collinear while giving
+# the arm room to accelerate into the push stroke.
+PUSH_RETREAT_DISTANCE: float = 0.05
+
 
 class PushSkill(ManipulationSkill):
     """Position above the intercept, descend, and push the object off the belt.
@@ -127,7 +134,7 @@ class PushSkill(ManipulationSkill):
         ctx = self.ctx
         target = request.target
         current_joint = request.current_joint
-        aim_joint = request.aim_joint        # T_aim1: high wait pose
+        aim_joint = request.aim_joint        # T_aim1: high wait pose (original)
         grasp_joint = request.grasp_joint    # T_grasp1: low, near-object pose
         T_aim = request.T_aim               # 4×4 SE3 of aim pose
         T_grasp = request.T_grasp           # 4×4 SE3 of grasp pose
@@ -136,40 +143,11 @@ class PushSkill(ManipulationSkill):
         # Push does NOT use suction — ensure it's off from any prior cycle.
         ctx.traj_ctrl.suction_off()
 
-        # ---- 1. Queue mode entry (positioning) ----
-        # Re-enter queue mode each cycle (same MotoROS2 workaround as throw).
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to enter queue mode for push positioning")
-            return SkillResult(False, "enter_queue_mode (positioning) failed")
-
-        # ---- 2. POSITIONING: drive to T_aim1 (high hover) and park ----
-        # Unlike throw (which parks at grasp height), push parks HIGH so the
-        # gripper clears the belt while waiting. move_through's 3rd arg is the
-        # destination, so pass aim_joint to park at the high hover.
-        ctx.set_status("POSITIONING", target.class_name)
-        ctx.move_through(current_joint, aim_joint, aim_joint)
-
-        # ---- 3. WAITING: hold at T_aim1 until time to descend ----
-        # No suction — we compute ETA, subtract the descent duration, and
-        # sleep so the subsequent trajectory dispatch starts the descent at
-        # exactly the right moment for the push stroke to coincide with
-        # object arrival at the intercept.
-        ctx.set_status("WAITING", target.class_name)
-        self._wait_for_approach(target, T_grasp, aim_joint, grasp_joint)
-
-        # ---- 4. PUSHING ----
-        ctx.set_status("PUSHING", target.class_name)
-        # Re-enter queue mode (MotoROS2 left it after positioning drained).
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to enter queue mode for push sweep")
-            ctx.set_active_target(None)
-            ctx.set_status("IDLE", "")
-            return SkillResult(False, "enter_queue_mode (push sweep) failed")
-
         theta = PUSH_THETA_MAP.get(target.class_name, 0.0)
 
-        # Push target (T_aim2). Fixed-bin override or dynamic planning, same
-        # pattern as throw_skill's T_aim2 selection.
+        # ---- Compute push target (T_aim2) early ----
+        # We need the push direction *before* positioning so we can place the
+        # wait pose on the line behind T_grasp, opposite to the push target.
         bin_xyz = PUSH_BIN_TARGET_MAP.get(target.class_name)
         if bin_xyz is not None:
             T_aim2 = np.eye(4)
@@ -184,12 +162,57 @@ class PushSkill(ManipulationSkill):
                 T_grasp, theta, T_aim, time.time(), secondary,
             )
 
+        # ---- Compute retreat wait & grasp poses ----
+        # The TCP should wait on the line:  target ← object(T_grasp) ← TCP,
+        # retreated PUSH_RETREAT_DISTANCE behind T_grasp in the direction
+        # opposite to the push (i.e. away from T_aim2).
+        #   T_wait:          retreated XY, aim height (high hover)
+        #   grasp_retreat:   same retreated XY, grasp height (belt level)
+        # This ensures T_wait is directly above grasp_retreat — the descent
+        # is a clean vertical drop.
+        wait_joint, T_wait, grasp_retreat_joint, T_grasp_retreat = (
+            self._compute_retreat_wait_pose(
+                T_grasp, T_aim2, T_aim, aim_joint, grasp_joint,
+            )
+        )
+
+        # ---- 1. Queue mode entry (positioning) ----
+        # Re-enter queue mode each cycle (same MotoROS2 workaround as throw).
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to enter queue mode for push positioning")
+            return SkillResult(False, "enter_queue_mode (positioning) failed")
+
+        # ---- 2. POSITIONING: drive to retreat wait pose and park ----
+        # The wait pose is behind T_grasp along the push line so the TCP,
+        # object, and target are collinear. The arm hovers at aim height.
+        ctx.set_status("POSITIONING", target.class_name)
+        ctx.move_through(current_joint, wait_joint, wait_joint)
+
+        # ---- 3. WAITING: hold at retreat pose until time to descend ----
+        # No suction — we compute ETA, subtract the descent duration, and
+        # sleep so the subsequent trajectory dispatch starts the descent at
+        # exactly the right moment for the push stroke to coincide with
+        # object arrival at the intercept.
+        ctx.set_status("WAITING", target.class_name)
+        self._wait_for_approach(target, T_grasp_retreat, wait_joint, grasp_retreat_joint)
+
+        # ---- 4. PUSHING ----
+        ctx.set_status("PUSHING", target.class_name)
+        # Re-enter queue mode (MotoROS2 left it after positioning drained).
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to enter queue mode for push sweep")
+            ctx.set_active_target(None)
+            ctx.set_status("IDLE", "")
+            return SkillResult(False, "enter_queue_mode (push sweep) failed")
+
         # Chain target for post-push transition (next pick's intercept).
         next_intercept_joint = ctx.scan_next_intercept()
 
         # Build & dispatch the full trajectory: descent + push stroke + chain.
+        # Uses the retreated grasp pose so the descent from T_wait is vertical,
+        # then the push stroke sweeps forward through the intercept toward T_aim2.
         self.build_push_trajectory(
-            aim_joint, grasp_joint, T_grasp, T_aim2, theta,
+            wait_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
             next_intercept_joint=next_intercept_joint,
         )
 
@@ -198,6 +221,81 @@ class PushSkill(ManipulationSkill):
         ctx.set_active_target(None)
         ctx.set_status("IDLE", "")
         return SkillResult(True, "push complete")
+
+    # ------------------------------------------------------------------
+    # Retreat wait pose computation
+    # ------------------------------------------------------------------
+    def _compute_retreat_wait_pose(
+        self,
+        T_grasp: np.ndarray,
+        T_aim2: np.ndarray,
+        T_aim: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute retreat poses (wait + grasp) behind T_grasp opposite the push.
+
+        Both poses share the same retreated XY (offset by
+        ``PUSH_RETREAT_DISTANCE`` away from T_aim2), but differ in Z:
+
+        * **T_wait** — aim height (``T_aim[2, 3]``), for the high hover.
+        * **T_grasp_retreat** — grasp height (``T_grasp[2, 3]``), directly
+          below T_wait so the descent is a clean vertical drop.
+
+        After descent the push stroke sweeps forward from T_grasp_retreat
+        through the original intercept toward T_aim2.
+
+        Returns ``(wait_joint, T_wait, grasp_retreat_joint, T_grasp_retreat)``.
+        Falls back to original ``aim_joint`` / ``grasp_joint`` if IK fails.
+        """
+        ctx = self.ctx
+
+        # Push direction (XY only, belt-parallel)
+        push_dir_xy = T_aim2[:2, 3] - T_grasp[:2, 3]
+        norm = np.linalg.norm(push_dir_xy)
+        if norm < 1e-6:
+            # Degenerate: push target coincides with grasp in XY → keep originals.
+            ctx.log.warn("Push retreat: T_aim2 ≈ T_grasp in XY; using original poses")
+            return aim_joint.copy(), T_aim.copy(), grasp_joint.copy(), T_grasp.copy()
+
+        push_dir_unit = push_dir_xy / norm  # unit vector from grasp → target in XY
+        retreat_dx = PUSH_RETREAT_DISTANCE * push_dir_unit[0]
+        retreat_dy = PUSH_RETREAT_DISTANCE * push_dir_unit[1]
+
+        # ---- Retreat wait pose (high, aim height) ----
+        T_wait = T_grasp.copy()
+        T_wait[0, 3] -= retreat_dx
+        T_wait[1, 3] -= retreat_dy
+        T_wait[2, 3] = T_aim[2, 3]  # aim height for belt clearance
+
+        ik_wait = ctx.robot.inverse_kinematics(T_wait)
+        if ik_wait is None:
+            ctx.log.warn("Push retreat wait IK failed; falling back to original poses")
+            return aim_joint.copy(), T_aim.copy(), grasp_joint.copy(), T_grasp.copy()
+
+        # ---- Retreat grasp pose (low, grasp height) ----
+        T_grasp_retreat = T_grasp.copy()
+        T_grasp_retreat[0, 3] -= retreat_dx
+        T_grasp_retreat[1, 3] -= retreat_dy
+        # Z stays at T_grasp[2, 3] (belt level)
+
+        ik_grasp = ctx.robot.inverse_kinematics(T_grasp_retreat)
+        if ik_grasp is None:
+            ctx.log.warn("Push retreat grasp IK failed; falling back to original poses")
+            return aim_joint.copy(), T_aim.copy(), grasp_joint.copy(), T_grasp.copy()
+
+        wait_joint = np.asarray(ik_wait, dtype=float)
+        wait_joint[-1] = 0.0
+        grasp_retreat_joint = np.asarray(ik_grasp, dtype=float)
+        grasp_retreat_joint[-1] = 0.0
+
+        ctx.log.info(
+            f"Push retreat: {PUSH_RETREAT_DISTANCE:.3f}m behind T_grasp — "
+            f"wait ({T_wait[0, 3]:+.4f}, {T_wait[1, 3]:+.4f}, {T_wait[2, 3]:+.4f}), "
+            f"grasp ({T_grasp_retreat[0, 3]:+.4f}, {T_grasp_retreat[1, 3]:+.4f}, "
+            f"{T_grasp_retreat[2, 3]:+.4f}) m"
+        )
+        return wait_joint, T_wait, grasp_retreat_joint, T_grasp_retreat
 
     # ------------------------------------------------------------------
     # Wait for object approach (no suction — push-specific)
