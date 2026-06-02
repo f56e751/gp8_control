@@ -154,6 +154,29 @@ class SkillContext:
         #    so the lift/throw motion begins at eta.
         self.sleep_until(now + eta)
 
+    def wait_for_arrival(
+        self, target: "TrackedObject", intercept_y: float, offset = 0.18
+    ) -> None:
+        """One-shot wait, parked at the grasp pose. Suction fires SUCTION_LEAD
+        seconds before the object arrives so the vacuum is already pulling, but
+        this method only returns at the predicted arrival — so the caller's
+        lift/throw motion starts on time (at eta), not early.
+
+        eta is computed once here from remaining distance / belt speed sampled
+        now (no per-tick recompute). Assumes a roughly steady belt.
+        """
+        now = time.time()
+        v = self.conveyor.current
+        obj_y = self.object_y_now(target, now, v)
+        eta = (obj_y - intercept_y) / (v + 1e-6)
+        eta = max(0.0, min(eta, self.cfg.AMBUSH_MAX_WAIT))
+        lead = min(self.cfg.SUCTION_LEAD, eta)   # can't fire before now
+        self.log.info(
+            f"Ambush: suction in {eta - lead:.2f}s, arrival/lift in {eta:.2f}s "
+            f"(dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s, lead {lead:.2f}s)"
+        )
+        self.sleep_until(now + eta - offset)
+
     def scan_next_intercept(self) -> "Optional[np.ndarray]":
         """Re-poll the live queue for the next reachable object's intercept joint.
 

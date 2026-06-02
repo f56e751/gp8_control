@@ -105,6 +105,8 @@ PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 # ``_push_waypoints`` never falls behind the robot's execution clock.
 _MIN_QUEUE_GAP: float = 0.15
 
+FIXED_DELAY_PUSH = 0.18
+
 
 class PushSkill(ManipulationSkill):
     """Position at the intercept, wait for the object, and push it off the belt.
@@ -200,7 +202,7 @@ class PushSkill(ManipulationSkill):
 
         # ---- 2. WAITING: block until the object arrives ----
         ctx.set_status("WAITING", target.class_name)
-        ctx.wait_for_arrival_and_suction(target, T_grasp[1, 3])
+        ctx.wait_for_arrival(target, T_grasp[1, 3], offset = FIXED_DELAY_PUSH)
 
         # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
         ctx.set_status("PUSHING", target.class_name)
