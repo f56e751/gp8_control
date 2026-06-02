@@ -625,6 +625,8 @@ class PushSkill(ManipulationSkill):
         # drains → code 2.  Decimate to MIN_QUEUE_GAP so every inter-
         # point gap comfortably exceeds the worst-case service latency.
         n_before = traj_full_5.shape[1]
+        n_desc = traj_desc_5.shape[1]
+        n_stroke = traj_stroke_5.shape[1]
         traj_full_5, vel_full_5, ts_full = self._decimate_for_queue(
             traj_full_5, vel_full_5, ts_full,
         )
