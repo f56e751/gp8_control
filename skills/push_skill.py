@@ -478,28 +478,59 @@ class PushSkill(ManipulationSkill):
         zero5 = np.zeros(5)
 
         # ================================================================
-        # Segment 0: Positioning  (current → wait, time-optimal)
+        # Segment 0: Startup buffer  (hold at current, queue pump-prime)
+        # ================================================================
+        # _push_waypoints sends one ROS service call per point (~20-30 ms
+        # each), but the robot begins executing as soon as the first point
+        # arrives.  A short positioning segment (current ≈ wait → 2-3
+        # points spanning <60 ms) can be consumed before the push loop
+        # feeds the next segment → queue drains → MotoROS2 auto-exits
+        # queue mode → code 2 "Must call start_point_queue_mode".
+        #
+        # The startup buffer holds the robot at the current position for
+        # ~0.36 s with wide inter-point gaps, giving the push loop enough
+        # wall-clock time to fill the queue with all subsequent segments
+        # before the robot's execution clock catches up.
+        _STARTUP_N = 4
+        _STARTUP_DT = 0.12          # 120 ms between startup points
+        startup_q5 = np.tile(current_joint[:5, None], (1, _STARTUP_N))
+        startup_v5 = np.zeros((5, _STARTUP_N))
+        # First point at t=0 so positions[0] matches current_joints
+        # (overwritten by _build_queue_waypoints anyway).
+        ts_startup = np.arange(0, _STARTUP_N) * _STARTUP_DT
+
+        # ================================================================
+        # Segment 1: Positioning  (current → wait, time-optimal)
         # ================================================================
         traj_pos_5, vel_pos_5, ts_pos = trajectory(
             current_joint[:5], zero5,
             wait_joint[:5], zero5,
             ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
         )
-        # traj_pos_5: (5, n_pos), ts_pos: (n_pos,)
+        # Drop first sample (duplicate of startup's last = current_joint)
+        # and shift timestamps to follow the startup buffer.
+        traj_pos_5 = traj_pos_5[:, 1:]
+        vel_pos_5 = vel_pos_5[:, 1:]
+        ts_pos_shifted = ts_pos[1:] + ts_startup[-1]
 
         # ================================================================
-        # Segment 1: Hold / dummy  (wait_joint repeated, keeps queue alive)
+        # Segment 2: Hold / dummy  (wait_joint repeated, keeps queue alive)
         # ================================================================
-        # Minimum 1 hold point even when hold_sec ≈ 0 to guarantee a clean
-        # velocity boundary (dq=0) between positioning and descent.
-        dt_hold = 1.0 / ctx.cfg.TRAJ_HZ
-        n_hold = max(1, int(hold_sec * ctx.cfg.TRAJ_HZ))
-        hold_q5 = np.tile(wait_joint[:5, None], (1, n_hold))   # (5, n_hold)
-        hold_v5 = np.zeros((5, n_hold))                        # all zero vel
-        ts_hold = ts_pos[-1] + np.arange(1, n_hold + 1) * dt_hold
+        # Sparse rate (~2 Hz) — the robot is stationary during the hold so
+        # high-frequency updates are unnecessary and would bloat the
+        # waypoint count, causing _push_waypoints to fall behind execution.
+        _HOLD_HZ = 2.0
+        dt_hold = 1.0 / _HOLD_HZ
+        n_hold = max(1, int(hold_sec * _HOLD_HZ))
+        hold_q5 = np.tile(wait_joint[:5, None], (1, n_hold))
+        hold_v5 = np.zeros((5, n_hold))
+        pos_end_t = (
+            ts_pos_shifted[-1] if len(ts_pos_shifted) > 0 else ts_startup[-1]
+        )
+        ts_hold = pos_end_t + np.arange(1, n_hold + 1) * dt_hold
 
         # ================================================================
-        # Segment 2: Descent  (wait → grasp, time-optimal trapezoidal)
+        # Segment 3: Descent  (wait → grasp, time-optimal trapezoidal)
         # ================================================================
         traj_desc_5, vel_desc_5, ts_desc = trajectory(
             wait_joint[:5], zero5,
@@ -512,7 +543,7 @@ class PushSkill(ManipulationSkill):
         ts_desc_shifted = ts_desc[1:] + ts_hold[-1]
 
         # ================================================================
-        # Segment 3: Push stroke  (Cartesian, belt-parallel, constant speed)
+        # Segment 4: Push stroke  (Cartesian, belt-parallel, constant speed)
         # ================================================================
         push_dir = self._compute_push_direction(T_grasp, T_aim2)
         traj_stroke_5, vel_stroke_5, ts_stroke = self._build_push_stroke(
@@ -535,7 +566,7 @@ class PushSkill(ManipulationSkill):
         vel_stroke_5 = vel_stroke_5[:, 1:]
 
         # ================================================================
-        # Segment 4: Chain  (push_end → next intercept or grasp)
+        # Segment 5: Chain  (push_end → next intercept or grasp)
         # ================================================================
         push_end_q5 = traj_stroke_5[:, -1]
         push_end_dq5 = vel_stroke_5[:, -1]      # ~0 (boundary condition)
@@ -566,15 +597,18 @@ class PushSkill(ManipulationSkill):
         # Concatenate ALL segments into one dispatch
         # ================================================================
         traj_full_5 = np.concatenate(
-            (traj_pos_5, hold_q5, traj_desc_5, traj_stroke_5, traj_chain_5),
+            (startup_q5, traj_pos_5, hold_q5,
+             traj_desc_5, traj_stroke_5, traj_chain_5),
             axis=1,
         )
         vel_full_5 = np.concatenate(
-            (vel_pos_5, hold_v5, vel_desc_5, vel_stroke_5, vel_chain_5),
+            (startup_v5, vel_pos_5, hold_v5,
+             vel_desc_5, vel_stroke_5, vel_chain_5),
             axis=1,
         )
         ts_full = np.concatenate(
-            (ts_pos, ts_hold, ts_desc_shifted, ts_stroke_shifted, ts_chain_shifted),
+            (ts_startup, ts_pos_shifted, ts_hold,
+             ts_desc_shifted, ts_stroke_shifted, ts_chain_shifted),
         )
         assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
             f"push traj/vel/ts length mismatch: "
@@ -591,7 +625,8 @@ class PushSkill(ManipulationSkill):
         n_desc = traj_desc_5.shape[1]
         n_stroke = traj_stroke_5.shape[1]
         ctx.log.info(
-            f"Push traj: pos {n_pos} + hold {n_hold} ({hold_sec:.2f}s) "
+            f"Push traj: startup {_STARTUP_N} + pos {n_pos} "
+            f"+ hold {n_hold} ({hold_sec:.2f}s) "
             f"+ descent {n_desc} + stroke {n_stroke} steps "
             f"(d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
             f"θ={np.degrees(theta):.1f}°), "
