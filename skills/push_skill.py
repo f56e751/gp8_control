@@ -105,7 +105,7 @@ PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 # ``_push_waypoints`` never falls behind the robot's execution clock.
 _MIN_QUEUE_GAP: float = 0.15
 
-FIXED_DELAY_PUSH = 0.35
+FIXED_DELAY_PUSH = 0.45
 HEIGHT_OFFSET = 0.02
 
 
@@ -188,7 +188,7 @@ class PushSkill(ManipulationSkill):
             )
 
         # ---- Compute retreat poses (wait at aim height + grasp at grasp height) ----
-        wait_joint, grasp_retreat_joint = self._compute_retreat_poses(
+        wait_joint, grasp_retreat_joint, T_grasp_retreat = self._compute_retreat_poses(
             T_grasp, T_aim2, T_aim, aim_joint, grasp_joint,
         )
 
@@ -219,7 +219,7 @@ class PushSkill(ManipulationSkill):
 
         # Build & dispatch: descent (wait→grasp_retreat) + push stroke + chain.
         self.build_push_trajectory(
-            wait_joint, grasp_retreat_joint, T_grasp, T_aim2, theta,
+            wait_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
             next_intercept_joint=next_intercept_joint,
         )
 
@@ -242,16 +242,17 @@ class PushSkill(ManipulationSkill):
         T_aim: np.ndarray,
         aim_joint: np.ndarray,
         grasp_joint: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute retreat poses behind T_grasp opposite the push direction.
 
         Both poses share the same retreated XY but differ in Z:
 
         * **wait_joint** — aim height, for high hover during WAITING.
-        * **grasp_retreat_joint** — grasp height, descent target & push start.
+        * **grasp_retreat_joint** — grasp height minus HEIGHT_OFFSET,
+          descent target & push stroke start.
 
-        Returns ``(wait_joint, grasp_retreat_joint)``.
-        Falls back to ``(aim_joint, grasp_joint)`` on IK failure.
+        Returns ``(wait_joint, grasp_retreat_joint, T_grasp_retreat)``.
+        Falls back to ``(aim_joint, grasp_joint, T_grasp)`` on IK failure.
         """
         ctx = self.ctx
         push_dir = self._compute_push_direction(T_grasp, T_aim2)
@@ -262,7 +263,7 @@ class PushSkill(ManipulationSkill):
         if T_grasp[0, 3] - dx < PUSH_RETREAT_MIN_X and dx > 0:
             available = max(0.0, T_grasp[0, 3] - PUSH_RETREAT_MIN_X)
             if available <= 0:
-                return aim_joint.copy(), grasp_joint.copy()
+                return aim_joint.copy(), grasp_joint.copy(), T_grasp.copy()
             scale = available / dx
             dx *= scale
             dy *= scale
@@ -273,22 +274,23 @@ class PushSkill(ManipulationSkill):
         T_wait[1, 3] -= dy
         T_wait[2, 3] = T_aim[2, 3]
 
-        # Grasp retreat pose: retreated XY, grasp height (Z unchanged)
-        T_grasp_retreat = T_grasp.copy() - HEIGHT_OFFSET
+        # Grasp retreat pose: retreated XY, grasp height - HEIGHT_OFFSET
+        T_grasp_retreat = T_grasp.copy()
         T_grasp_retreat[0, 3] -= dx
         T_grasp_retreat[1, 3] -= dy
+        T_grasp_retreat[2, 3] -= HEIGHT_OFFSET
 
         ik_wait = ctx.robot.inverse_kinematics(T_wait)
         ik_grasp = ctx.robot.inverse_kinematics(T_grasp_retreat)
         if ik_wait is None or ik_grasp is None:
             ctx.log.warn("Retreat IK failed; falling back to original poses")
-            return aim_joint.copy(), grasp_joint.copy()
+            return aim_joint.copy(), grasp_joint.copy(), T_grasp.copy()
 
         wait_joint = np.asarray(ik_wait, dtype=float)
         wait_joint[-1] = PUSH_JOINT6_ANGLE
         grasp_retreat_joint = np.asarray(ik_grasp, dtype=float)
         grasp_retreat_joint[-1] = PUSH_JOINT6_ANGLE
-        return wait_joint, grasp_retreat_joint
+        return wait_joint, grasp_retreat_joint, T_grasp_retreat
 
     # ------------------------------------------------------------------
     # Push target planning (mirrors throw_skill.plan_throw_landing)
