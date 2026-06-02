@@ -250,17 +250,12 @@ class PushSkill(ManipulationSkill):
         """
         ctx = self.ctx
 
-        # Push direction (XY only, belt-parallel)
-        push_dir_xy = T_aim2[:2, 3] - T_grasp[:2, 3]
-        norm = np.linalg.norm(push_dir_xy)
-        if norm < 1e-6:
-            # Degenerate: push target coincides with grasp in XY → keep originals.
-            ctx.log.warn("Push retreat: T_aim2 ≈ T_grasp in XY; using original poses")
-            return aim_joint.copy(), T_aim.copy(), grasp_joint.copy(), T_grasp.copy()
-
-        push_dir_unit = push_dir_xy / norm  # unit vector from grasp → target in XY
-        retreat_dx = PUSH_RETREAT_DISTANCE * push_dir_unit[0]
-        retreat_dy = PUSH_RETREAT_DISTANCE * push_dir_unit[1]
+        # Reuse _compute_push_direction so the degenerate case (T_aim2 ≈
+        # T_grasp in XY, e.g. no secondary target) falls back to +X instead
+        # of skipping the retreat entirely.
+        push_dir = self._compute_push_direction(T_grasp, T_aim2)  # 3D, Z=0
+        retreat_dx = PUSH_RETREAT_DISTANCE * push_dir[0]
+        retreat_dy = PUSH_RETREAT_DISTANCE * push_dir[1]
 
         # ---- Retreat wait pose (high, aim height) ----
         T_wait = T_grasp.copy()
@@ -290,7 +285,8 @@ class PushSkill(ManipulationSkill):
         grasp_retreat_joint[-1] = 0.0
 
         ctx.log.info(
-            f"Push retreat: {PUSH_RETREAT_DISTANCE:.3f}m behind T_grasp — "
+            f"Push retreat: {PUSH_RETREAT_DISTANCE:.3f}m behind T_grasp "
+            f"(dir [{push_dir[0]:+.3f}, {push_dir[1]:+.3f}]) — "
             f"wait ({T_wait[0, 3]:+.4f}, {T_wait[1, 3]:+.4f}, {T_wait[2, 3]:+.4f}), "
             f"grasp ({T_grasp_retreat[0, 3]:+.4f}, {T_grasp_retreat[1, 3]:+.4f}, "
             f"{T_grasp_retreat[2, 3]:+.4f}) m"
