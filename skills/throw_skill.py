@@ -106,16 +106,15 @@ class ThrowSkill(ManipulationSkill):
         if not ctx.suction_primed_for_pick:
             ctx.traj_ctrl.suction_off()
 
-        # Did the previous throw's return swing already park the arm AT this
-        # pick's grasp pose? If so we must NOT re-enter queue mode + re-drive:
-        # the mode stop would chop the just-finished swing and the re-drive is to
-        # the same spot — that is the observed bobble. The throw re-enters queue
-        # mode later, on a stopped arm. Only drive (and switch modes) when the arm
-        # actually needs to move there (first pick, a different object, etc.).
-        at_grasp = float(np.linalg.norm(
-            np.asarray(current_joint, dtype=float) - np.asarray(grasp_joint, dtype=float)
-        )) < 0.05      # rad
-        if not at_grasp:
+        # Is this object the previous throw's committed return target? If so the
+        # return swing already parked the arm at its grasp pose, so we must NOT
+        # re-enter queue mode (the stop would chop the swing) or re-drive (same
+        # spot) — just wait + grab. The throw re-enters queue mode later, on a
+        # stopped arm. Only drive (and switch modes) when the arm actually needs
+        # to move there (first pick, a different object, etc.). Decided by object
+        # identity upstream (PickRequest.prepositioned), not a distance guess.
+        prepositioned = request.prepositioned
+        if not prepositioned:
             # MotoROS2 leaves queue mode once the previous trajectory's queue
             # drains; re-enter so the positioning push isn't rejected.
             if not ctx.traj_ctrl.enter_queue_mode():
@@ -128,7 +127,7 @@ class ThrowSkill(ManipulationSkill):
         ctx.set_status("POSITIONING", target.class_name)
         ctx.position_and_prime(
             current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
-            skip_move=at_grasp,
+            skip_move=prepositioned,
         )
 
         # Lift + throw — same path as the moving strategy.

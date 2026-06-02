@@ -37,6 +37,10 @@ class PickRequest:
     aim_joint: np.ndarray
     grasp_joint: np.ndarray
     secondary: "Optional[TrackedObject]" = None
+    # True when this object IS the previous throw's committed return target — the
+    # swing already parked the arm at its grasp pose, so the pick must not re-enter
+    # queue mode (stop would chop the swing) or re-drive; just wait + grab.
+    prepositioned: bool = False
 
 
 @dataclass
@@ -69,6 +73,11 @@ class SkillContext:
     # NEXT pick's suction (vacuum ON). The upcoming pick then must NOT re-prime
     # or clear it; it is reset to False once that pick consumes it.
     suction_primed_for_pick: bool = False
+    # The object the throw's return swing was committed to (sent to its intercept).
+    # The next selection marks its request ``prepositioned`` iff it picks THIS same
+    # object — so "already at the grasp" is decided by object identity, not a
+    # distance guess. Consumed (cleared) by the next selection.
+    committed_next: "Optional[TrackedObject]" = None
 
     @property
     def log(self):
@@ -284,6 +293,10 @@ class SkillContext:
                 )
                 continue
             suction_on_at = now + eta - self.cfg.SUCTION_LEAD
+            # Commit this object as the next pick: the swing is heading to its
+            # intercept, so the next selection should grab THIS one (and skip the
+            # re-drive/mode-stop) instead of re-deciding from scratch.
+            self.committed_next = cand
             self.log.info(
                 f"Chain target: {cand.class_name} at "
                 f"x={float(T_next_grasp[0, 3]):+.3f} (prime in "

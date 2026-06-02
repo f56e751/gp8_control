@@ -518,6 +518,13 @@ class GP8App:
         intercept_y = self.cfg.GRASP_INTERCEPT_Y
         zero = np.zeros_like(self.M1)
         factor = self.cfg.PICK_FEASIBILITY_FACTOR
+        # The object the prior throw's return swing was committed to. Consume it
+        # here: if we choose this same object below, its request is marked
+        # ``prepositioned`` (the swing already parked the arm at its grasp — no
+        # re-drive / mode-stop). Decided by object identity, not a distance guess.
+        committed = self.ctx.committed_next if self.ctx is not None else None
+        if self.ctx is not None:
+            self.ctx.committed_next = None
 
         target = None
         target_T_aim = target_T_grasp = None
@@ -614,6 +621,7 @@ class GP8App:
             aim_joint=target_aim_joint,
             grasp_joint=target_grasp_joint,
             secondary=secondary,
+            prepositioned=(target is committed),
         )
 
     # ------------------------------------------------------------------
