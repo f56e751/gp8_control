@@ -146,14 +146,22 @@ class PushSkill(ManipulationSkill):
     # Skill entry point (ambush strategy)
     # ------------------------------------------------------------------
     def execute(self, request: "PickRequest") -> SkillResult:
-        """Full push cycle: position high → wait → descend + push → chain.
+        """Full push cycle: position → wait → descend + push → chain.
 
-        Everything runs inside a **single** queue-mode session.  After the
-        positioning waypoints are pushed, dummy *hold points* that repeat
-        ``wait_joint`` at the ``TRAJ_HZ`` rate are appended so the MotoROS2
-        queue never drains to IDLE during the approach-wait window.  The
-        descent + push-stroke + chain trajectory is then concatenated onto
-        the same queue — no second ``enter_queue_mode`` call is needed.
+        Follows the same **two-phase queue** pattern as ThrowSkill:
+
+        1. ``enter_queue_mode`` → ``move_through`` (positioning to the
+           retreat wait pose).  MotoROS2 drains the queue and auto-exits
+           queue mode when the short positioning trajectory finishes.
+        2. ``sleep_until`` blocks (no queue) while the object approaches.
+        3. ``enter_queue_mode`` → dispatch descent + push-stroke + chain
+           as a single compact trajectory.
+
+        This avoids the "single giant queue" approach whose hundreds of
+        hold+positioning points overwhelmed ``_push_waypoints`` (each
+        ``queue_traj_point`` service call takes ~60-100 ms, so the robot
+        consumed points faster than they could be pushed → queue drain →
+        code 2 "Must call start_point_queue_mode").
         """
         ctx = self.ctx
         target = request.target
@@ -188,50 +196,46 @@ class PushSkill(ManipulationSkill):
             )
 
         # ---- Compute retreat wait & grasp poses ----
-        # The TCP should wait on the line:  target ← object(T_grasp) ← TCP,
-        # retreated PUSH_RETREAT_DISTANCE behind T_grasp in the direction
-        # opposite to the push (i.e. away from T_aim2).
-        #   T_wait:          retreated XY, aim height (high hover)
-        #   grasp_retreat:   same retreated XY, grasp height (belt level)
-        # This ensures T_wait is directly above grasp_retreat — the descent
-        # is a clean vertical drop.
         wait_joint, T_wait, grasp_retreat_joint, T_grasp_retreat = (
             self._compute_retreat_wait_pose(
                 T_grasp, T_aim2, T_aim, aim_joint, grasp_joint,
             )
         )
 
-        # ---- 1. Compute approach timing BEFORE entering queue mode ----
-        # Heavy computation (trajectory generation for timing estimate, queue
-        # scan with IK) is done FIRST so that enter_queue_mode() is called
-        # immediately before the first point is pushed.  Otherwise the gap
-        # between entering queue mode and the first queued point lets MotoROS2
-        # time out and auto-exit queue mode → code 2 "Must call
-        # start_point_queue_mode".  This matches the ThrowSkill pattern where
-        # queue mode is entered right before send_trajectory_queue.
+        # ---- 1. POSITIONING: drive to retreat wait pose ----
+        # Enter queue mode and use move_through to reach the wait pose.
+        # MotoROS2 will auto-exit queue mode once the positioning queue
+        # drains — this is expected and matches ThrowSkill's pattern.
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to enter queue mode for push positioning")
+            return SkillResult(False, "enter_queue_mode (positioning) failed")
+
         ctx.set_status("POSITIONING", target.class_name)
-        wait_sec, descent_time = self._compute_approach_timing(
-            target, T_grasp_retreat, wait_joint, grasp_retreat_joint,
-        )
+        ctx.move_through(current_joint, wait_joint, wait_joint)
+
+        # ---- 2. WAITING: hold at retreat pose until time to descend ----
+        # No queue is active — just block with sleep_until while the
+        # object approaches.  This keeps the code simple and avoids
+        # filling the queue with hundreds of dummy hold points.
+        ctx.set_status("WAITING", target.class_name)
+        self._wait_for_approach(target, T_grasp_retreat, wait_joint, grasp_retreat_joint)
+
+        # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
+        # The positioning queue has long since drained, so we must re-enter
+        # queue mode (same as ThrowSkill line 128).
+        ctx.set_status("PUSHING", target.class_name)
+        if not ctx.traj_ctrl.enter_queue_mode():
+            ctx.log.error("Failed to enter queue mode for push sweep")
+            ctx.set_active_target(None)
+            ctx.set_status("IDLE", "")
+            return SkillResult(False, "enter_queue_mode (push sweep) failed")
 
         # Chain target for post-push transition (next pick's intercept).
         next_intercept_joint = ctx.scan_next_intercept()
 
-        # ---- 2. Queue mode entry (immediately before dispatch) ----
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to enter queue mode for push")
-            return SkillResult(False, "enter_queue_mode failed")
-
-        # ---- 3. Build & dispatch the FULL trajectory in one queue push ----
-        # positioning (current→wait) + hold (dummy) + descent + stroke + chain
-        self.build_full_push_trajectory(
-            current_joint,
-            wait_joint,
-            grasp_retreat_joint,
-            T_grasp_retreat,
-            T_aim2,
-            theta,
-            hold_sec=wait_sec,
+        # Build & dispatch: descent + push stroke + chain only (compact).
+        self.build_push_trajectory(
+            wait_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
             next_intercept_joint=next_intercept_joint,
         )
 
@@ -336,27 +340,25 @@ class PushSkill(ManipulationSkill):
         return wait_joint, T_wait, grasp_retreat_joint, T_grasp_retreat
 
     # ------------------------------------------------------------------
-    # Approach timing computation (no suction — push-specific)
+    # Wait for object approach (no suction — push-specific)
     # ------------------------------------------------------------------
-    def _compute_approach_timing(
+    def _wait_for_approach(
         self,
         target: "TrackedObject",
         T_grasp: np.ndarray,
         aim_joint: np.ndarray,
         grasp_joint: np.ndarray,
-    ) -> tuple[float, float]:
-        """Compute how long to hold at the wait pose before starting descent.
+    ) -> None:
+        """Block at the wait pose until it's time to start the descent.
 
-        Returns ``(wait_sec, descent_time)``:
+        Computes the object's ETA at the intercept line, estimates the
+        descent duration (aim → grasp via ``trajectory()``), and sleeps
+        until ``ETA − descent_time − PUSH_DESCENT_LEAD``. When this method
+        returns the caller immediately dispatches the descent+push trajectory
+        so the arm arrives at T_grasp just as the object reaches the
+        intercept.
 
-        * **wait_sec** — seconds to hold at ``aim_joint`` before the descent
-          begins, so the arm reaches ``grasp_joint`` exactly when the object
-          arrives at the intercept.
-        * **descent_time** — duration of the aim→grasp descent segment
-          (used by the caller to build the trajectory).
-
-        The hold time is baked into the trajectory as dummy hold points
-        rather than a blocking sleep, keeping the MotoROS2 queue alive.
+        No suction is fired — push uses gripper/TCP contact only.
         """
         ctx = self.ctx
         now = time.time()
@@ -378,11 +380,11 @@ class PushSkill(ManipulationSkill):
 
         wait_sec = max(0.0, eta - descent_time - PUSH_DESCENT_LEAD)
         ctx.log.info(
-            f"Push ambush: hold {wait_sec:.2f}s, then descend {descent_time:.2f}s "
+            f"Push ambush: wait {wait_sec:.2f}s, then descend {descent_time:.2f}s "
             f"(ETA {eta:.2f}s, dist {obj_y - intercept_y:.3f} m, "
             f"belt {v:.3f} m/s, lead {PUSH_DESCENT_LEAD:.2f}s)"
         )
-        return wait_sec, descent_time
+        ctx.sleep_until(now + wait_sec)
 
     # ------------------------------------------------------------------
     # Push target planning (mirrors throw_skill.plan_throw_landing)
@@ -456,104 +458,55 @@ class PushSkill(ManipulationSkill):
         return aim_joint1, grasp_joint1, aim_joint2
 
     # ------------------------------------------------------------------
-    # Full push trajectory build + dispatch (single queue session)
+    # Push trajectory build + dispatch
     # ------------------------------------------------------------------
-    def build_full_push_trajectory(
+    def build_push_trajectory(
         self,
-        current_joint: np.ndarray,
-        wait_joint: np.ndarray,
+        aim_joint: np.ndarray,
         grasp_joint: np.ndarray,
         T_grasp: np.ndarray,
         T_aim2: np.ndarray,
         theta: float,
-        hold_sec: float = 0.0,
         next_intercept_joint: "Optional[np.ndarray]" = None,
     ) -> None:
-        """Build and dispatch the complete push trajectory in one queue push.
+        """Build and dispatch the 3-segment push trajectory.
 
-        Segments (all dispatched in a single ``send_trajectory_queue`` call
-        so the MotoROS2 point-queue never drains to IDLE mid-cycle):
+        Segments:
 
-        0. **Positioning** (current → wait): time-optimal joint interp.
-        1. **Hold / dummy** (wait × N): repeat ``wait_joint`` at ``TRAJ_HZ``
-           for ``hold_sec`` seconds.  These zero-motion points keep the
-           queue alive while the object approaches the intercept.
-        2. **Descent** (wait → grasp): time-optimal joint interp.
-        3. **Push stroke** (grasp → push_end): Cartesian belt-parallel
-           sweep at ``PUSH_SPEED`` for ``PUSH_DISTANCE``.
-        4. **Chain** (push_end → next intercept or grasp).
+        1. **Descent** (aim_joint → grasp_joint): time-optimal joint
+           interpolation via ``trajectory()``. Brings the arm from the high
+           hover down to the near-object pose at belt height.
 
-        No suction release — push is contact-based.
+        2. **Push stroke** (grasp → push_end): rule-based Cartesian straight
+           line at ``PUSH_SPEED`` m/s for ``PUSH_DISTANCE`` m, parallel to
+           the belt surface (constant Z). Direction is from T_grasp towards
+           T_aim2, projected onto the XY plane. Each Cartesian waypoint is
+           converted to joint space via IK. Boundary velocities are zero for
+           smooth concatenation with the adjacent segments.
+
+        3. **Chain** (push_end → next_intercept or grasp): time-optimal
+           transition so the arm flows directly to the next pick cycle,
+           same pattern as ``ThrowSkill.build_throw_trajectory``.
+
+        No suction release is scheduled — push is contact-based, so
+        ``send_trajectory_queue`` is used instead of
+        ``send_trajectory_queue_with_timed_release``.
         """
         ctx = self.ctx
         zero5 = np.zeros(5)
 
         # ================================================================
-        # Segment 0: Startup buffer  (hold at current, queue pump-prime)
-        # ================================================================
-        # _push_waypoints sends one ROS service call per point, and each
-        # round-trip through the URDF→raw bridge takes ~60-100 ms.  The
-        # robot starts executing as soon as the first point arrives, so a
-        # short positioning segment can drain the queue before more points
-        # are pushed.  The startup buffer holds the robot stationary for
-        # ~0.6 s with wide inter-point gaps (200 ms), giving the push
-        # loop enough wall-clock time to fill the queue with upcoming
-        # segments.  After concatenation, a global decimation pass thins
-        # ALL remaining 50 Hz segments to ≥ 150 ms gaps so the push loop
-        # can never fall behind the robot's execution clock.
-        _STARTUP_N = 4
-        _STARTUP_DT = 0.20          # 200 ms between startup points
-        startup_q5 = np.tile(current_joint[:5, None], (1, _STARTUP_N))
-        startup_v5 = np.zeros((5, _STARTUP_N))
-        # First point at t=0 so positions[0] matches current_joints
-        # (overwritten by _build_queue_waypoints anyway).
-        ts_startup = np.arange(0, _STARTUP_N) * _STARTUP_DT
-
-        # ================================================================
-        # Segment 1: Positioning  (current → wait, time-optimal)
-        # ================================================================
-        traj_pos_5, vel_pos_5, ts_pos = trajectory(
-            current_joint[:5], zero5,
-            wait_joint[:5], zero5,
-            ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
-        )
-        # Drop first sample (duplicate of startup's last = current_joint)
-        # and shift timestamps to follow the startup buffer.
-        traj_pos_5 = traj_pos_5[:, 1:]
-        vel_pos_5 = vel_pos_5[:, 1:]
-        ts_pos_shifted = ts_pos[1:] + ts_startup[-1]
-
-        # ================================================================
-        # Segment 2: Hold / dummy  (wait_joint repeated, keeps queue alive)
-        # ================================================================
-        # Sparse rate (~2 Hz) — the robot is stationary during the hold so
-        # high-frequency updates are unnecessary and would bloat the
-        # waypoint count, causing _push_waypoints to fall behind execution.
-        _HOLD_HZ = 2.0
-        dt_hold = 1.0 / _HOLD_HZ
-        n_hold = max(1, int(hold_sec * _HOLD_HZ))
-        hold_q5 = np.tile(wait_joint[:5, None], (1, n_hold))
-        hold_v5 = np.zeros((5, n_hold))
-        pos_end_t = (
-            ts_pos_shifted[-1] if len(ts_pos_shifted) > 0 else ts_startup[-1]
-        )
-        ts_hold = pos_end_t + np.arange(1, n_hold + 1) * dt_hold
-
-        # ================================================================
-        # Segment 3: Descent  (wait → grasp, time-optimal trapezoidal)
+        # Segment 1: Descent  (aim → grasp, time-optimal trapezoidal)
         # ================================================================
         traj_desc_5, vel_desc_5, ts_desc = trajectory(
-            wait_joint[:5], zero5,
+            aim_joint[:5], zero5,
             grasp_joint[:5], zero5,
             ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
         )
-        # Drop first sample (duplicate of hold's last = wait_joint).
-        traj_desc_5 = traj_desc_5[:, 1:]
-        vel_desc_5 = vel_desc_5[:, 1:]
-        ts_desc_shifted = ts_desc[1:] + ts_hold[-1]
+        # traj_desc_5, vel_desc_5: (5, n_desc); ts_desc: (n_desc,)
 
         # ================================================================
-        # Segment 4: Push stroke  (Cartesian, belt-parallel, constant speed)
+        # Segment 2: Push stroke  (Cartesian, belt-parallel, constant speed)
         # ================================================================
         push_dir = self._compute_push_direction(T_grasp, T_aim2)
         traj_stroke_5, vel_stroke_5, ts_stroke = self._build_push_stroke(
@@ -561,24 +514,21 @@ class PushSkill(ManipulationSkill):
         )
 
         # Clamp segment velocities against robot joint limits (Yaskawa alarm
-        # 4414 prevention).
+        # 4414 prevention). Same 2-pass rescale approach as throw_skill.
         traj_stroke_5, vel_stroke_5, ts_stroke = self._clamp_stroke_velocity(
             traj_stroke_5, vel_stroke_5, ts_stroke,
         )
 
-        # Shift stroke timestamps; drop first sample (duplicate of descent's
-        # last = grasp_joint).
-        desc_end_t = (
-            ts_desc_shifted[-1] if len(ts_desc_shifted) > 0 else ts_hold[-1]
-        )
-        ts_stroke_shifted = ts_stroke[1:] + desc_end_t
+        # Shift stroke timestamps to follow descent; drop stroke's first
+        # sample (it duplicates descent's last = grasp_joint).
+        ts_stroke_shifted = ts_stroke[1:] + ts_desc[-1]
         traj_stroke_5 = traj_stroke_5[:, 1:]
         vel_stroke_5 = vel_stroke_5[:, 1:]
 
         # ================================================================
-        # Segment 5: Chain  (push_end → next intercept or grasp)
+        # Segment 3: Chain  (push_end → next intercept or grasp)
         # ================================================================
-        push_end_q5 = traj_stroke_5[:, -1]
+        push_end_q5 = traj_stroke_5[:, -1]      # last waypoint of stroke
         push_end_dq5 = vel_stroke_5[:, -1]      # ~0 (boundary condition)
 
         chain_target = (
@@ -594,70 +544,47 @@ class PushSkill(ManipulationSkill):
             chain_target[:5], zero5,
             ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
         )
+        # Drop chain's first sample (duplicate of stroke's last), shift ts.
         stroke_end_t = (
             ts_stroke_shifted[-1]
             if len(ts_stroke_shifted) > 0
-            else desc_end_t
+            else ts_desc[-1]
         )
         traj_chain_5 = traj_chain_5[:, 1:]
         vel_chain_5 = vel_chain_5[:, 1:]
         ts_chain_shifted = ts_chain[1:] + stroke_end_t
 
         # ================================================================
-        # Concatenate ALL segments into one dispatch
+        # Concatenate all segments
         # ================================================================
         traj_full_5 = np.concatenate(
-            (startup_q5, traj_pos_5, hold_q5,
-             traj_desc_5, traj_stroke_5, traj_chain_5),
-            axis=1,
+            (traj_desc_5, traj_stroke_5, traj_chain_5), axis=1,
         )
         vel_full_5 = np.concatenate(
-            (startup_v5, vel_pos_5, hold_v5,
-             vel_desc_5, vel_stroke_5, vel_chain_5),
-            axis=1,
+            (vel_desc_5, vel_stroke_5, vel_chain_5), axis=1,
         )
-        ts_full = np.concatenate(
-            (ts_startup, ts_pos_shifted, ts_hold,
-             ts_desc_shifted, ts_stroke_shifted, ts_chain_shifted),
-        )
-
-        # ================================================================
-        # Decimate: guarantee push loop outruns robot execution
-        # ================================================================
-        # queue_traj_point service calls through the URDF→raw bridge take
-        # ~60-100 ms each.  Any consecutive points closer than that cause
-        # the robot to consume them faster than they are pushed → queue
-        # drains → code 2.  Decimate to MIN_QUEUE_GAP so every inter-
-        # point gap comfortably exceeds the worst-case service latency.
-        n_before = traj_full_5.shape[1]
-        n_desc = traj_desc_5.shape[1]
-        n_stroke = traj_stroke_5.shape[1]
-        traj_full_5, vel_full_5, ts_full = self._decimate_for_queue(
-            traj_full_5, vel_full_5, ts_full,
-        )
-        n_after = traj_full_5.shape[1]
-
+        ts_full = np.concatenate((ts_desc, ts_stroke_shifted, ts_chain_shifted))
         assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
             f"push traj/vel/ts length mismatch: "
             f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
         )
 
-        # Pad to 6-DOF, set the 6th joint to PUSH_JOINT6_ANGLE.
+        # Pad to 6-DOF, then set the 6th joint to PUSH_JOINT6_ANGLE.
         traj_push = pad(traj_full_5.T).T
         traj_push[5, :] = PUSH_JOINT6_ANGLE
         vel_push = pad(vel_full_5.T).T       # 6th vel = 0 is correct
         final_joint = chain_target
 
+        n_desc = traj_desc_5.shape[1]
+        n_stroke = traj_stroke_5.shape[1]
         ctx.log.info(
-            f"Push traj: {n_after} pts (decimated from {n_before}), "
-            f"hold {hold_sec:.2f}s, "
-            f"d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
-            f"θ={np.degrees(theta):.1f}°, "
+            f"Push traj: descent {n_desc} + stroke {n_stroke} steps "
+            f"(d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
+            f"θ={np.degrees(theta):.1f}°), "
             f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'}"
         )
 
-        # Dispatch the entire trajectory in one queue push. No timed
-        # release — push is contact-based, no suction.
+        # Dispatch. No timed release — push is contact-based, no suction.
         ctx.traj_ctrl.send_trajectory_queue(
             traj_push, vel_push, ts_full, final_joint=final_joint,
         )
@@ -670,34 +597,6 @@ class PushSkill(ManipulationSkill):
             "theta": theta,
             "chained_to_next": chained_to_next,
         }
-
-    # ------------------------------------------------------------------
-    # Legacy wrapper (kept for external callers / back-compat)
-    # ------------------------------------------------------------------
-    def build_push_trajectory(
-        self,
-        aim_joint: np.ndarray,
-        grasp_joint: np.ndarray,
-        T_grasp: np.ndarray,
-        T_aim2: np.ndarray,
-        theta: float,
-        next_intercept_joint: "Optional[np.ndarray]" = None,
-    ) -> None:
-        """Build and dispatch descent + stroke + chain (no positioning/hold).
-
-        Thin wrapper kept for external callers (e.g. ``app.py`` moving
-        strategy) that manage queue mode and positioning themselves.
-        """
-        self.build_full_push_trajectory(
-            aim_joint,              # treated as current_joint (already at wait)
-            aim_joint,              # wait_joint = aim_joint (no extra move)
-            grasp_joint,
-            T_grasp,
-            T_aim2,
-            theta,
-            hold_sec=0.0,           # no hold — caller already waited
-            next_intercept_joint=next_intercept_joint,
-        )
 
     # ------------------------------------------------------------------
     # Queue-safe decimation
