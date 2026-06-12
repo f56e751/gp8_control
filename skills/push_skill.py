@@ -34,10 +34,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 
 from gp8_control.skills.base import ManipulationSkill, SkillResult
-from gp8_control.trajectory.trajectory_primitive import (
-    trajectory,
-    pad,
-)
+from gp8_control.trajectory.trajectory_primitive import trajectory
 
 if TYPE_CHECKING:
     from gp8_control.skills.context import PickRequest
@@ -55,19 +52,18 @@ PUSH_CLASSES: set[str] = {
     "metal",
 }
 
-# Per-class push-plane angle (radians, rotation about +Z in base frame).
-# Determines the sweep direction on the belt plane. Same class keys as
-# throw_skill's THETA_MAP — the push might need a different angle than the
-# throw for the same class.
-PUSH_THETA_MAP: dict[str, float] = {
-    "transparent": -np.pi / 12.0,
-    "metal":       -np.pi * 25.0 / 180.0,
-}
+# NOTE: the old per-class PUSH_THETA_MAP is gone — the push-plane angle
+# ``theta`` is now derived geometrically in ``execute`` as the XY heading
+# from the aim hover (T_aim1) toward the push target (T_aim2).
 
 # Per-class push bin TARGET (absolute base-frame XYZ, m). When a target's
 # class is in this map, T_aim2 is OVERRIDDEN with these coordinates so the
 # push aims at a fixed bin/chute location instead of computing from secondary.
-PUSH_BIN_TARGET_MAP: dict[str, tuple] = {}
+PUSH_BIN_TARGET_MAP: dict[str, tuple] = {
+    "transparent": (1.2, -0.30, 0.0),  
+    "metal":       (1.2,  0.30, 0.0),
+}
+
 
 
 # ---- Push stroke parameters ------------------------------------------------
@@ -75,7 +71,7 @@ PUSH_BIN_TARGET_MAP: dict[str, tuple] = {}
 # TCP speed during the push stroke (m/s). The arm sweeps at this speed
 # parallel to the belt surface. Tune to balance impact force vs. control
 # stability; too fast may exceed joint velocity limits.
-PUSH_SPEED: float = 1.0
+PUSH_SPEED: float = 5.0
 
 # Push stroke distance (m). How far the TCP travels from T_grasp1 in the
 # push direction. Must be long enough to clear the object off the belt but
@@ -99,14 +95,28 @@ PUSH_RETREAT_MIN_X: float = 0.27
 # (viewed from above) so the TCP faces the push direction.
 PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 
+# # Empirical wrist offset (rad) ADDED to joint 6 after IK so the pusher face
+# # lands at the intended angle on hardware — the _push_orientation twist alone
+# # leaves joint 6 ~90° short. Pure flange roll: it does NOT change the approach
+# # axis, so the front/back swing is unaffected. Tune if the gripper is remounted.
+# PUSH_JOINT6_OFFSET: float = np.pi / 2.0
+
 # Minimum time gap (seconds) between consecutive queued trajectory
 # points.  ``queue_traj_point`` round-trip through the URDF→raw
 # bridge takes ~60-100 ms; 150 ms gives a comfortable margin so
 # ``_push_waypoints`` never falls behind the robot's execution clock.
 _MIN_QUEUE_GAP: float = 0.15
 
-FIXED_DELAY_PUSH = 0.45
-HEIGHT_OFFSET = 0.02
+FIXED_DELAY_PUSH = 1.1
+HEIGHT_OFFSET = 0.07
+
+# Swing push amplitude (rad). During the stroke the TCP tilts progressively
+# about the horizontal axis perpendicular to the push direction — from
+# -SWING_ANGLE (leaning *back*) at the start, through vertical at the
+# midpoint, to +SWING_ANGLE (leaning *forward*) at the end — like a paddle
+# swing. The TCP *position* still travels a straight belt-parallel line; only
+# the orientation sweeps. Set to 0.0 for a pure perpendicular push.
+SWING_ANGLE: float = np.radians(20.0)
 
 
 class PushSkill(ManipulationSkill):
@@ -160,6 +170,7 @@ class PushSkill(ManipulationSkill):
         target = request.target
         current_joint = request.current_joint
         aim_joint = request.aim_joint
+        # aim_joint[-1] += PUSH_JOINT6_ANGLE
         grasp_joint = request.grasp_joint
         T_aim = request.T_aim
         T_grasp = request.T_grasp
@@ -167,8 +178,6 @@ class PushSkill(ManipulationSkill):
 
         # Push does NOT use suction — ensure it's off from any prior cycle.
         ctx.traj_ctrl.suction_off()
-
-        theta = PUSH_THETA_MAP.get(target.class_name, 0.0)
 
         # ---- Compute push target (T_aim2) early ----
         # We need the push direction *before* positioning so we can place
@@ -183,14 +192,30 @@ class PushSkill(ManipulationSkill):
                 f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
             )
         else:
+            # No fixed bin: aim at the secondary object. theta=0 here — the
+            # NN-plane rotation is no longer driven by a per-class map; the
+            # geometric theta is computed from T_aim2 just below.
             T_aim2 = self.plan_push_target(
-                T_grasp, theta, T_aim, time.time(), secondary,
+                T_grasp, 0.0, T_aim, time.time(), secondary,
             )
+
+        # theta = XY heading from the aim hover (T_aim1) toward the push
+        # target (T_aim2). Replaces the old per-class PUSH_THETA_MAP.
+        push_heading = self._compute_push_direction(T_aim, T_aim2)
+        theta = float(np.arctan2(push_heading[1], push_heading[0]))
 
         # ---- Compute retreat poses (wait at aim height + grasp at grasp height) ----
         wait_joint, grasp_retreat_joint, T_grasp_retreat = self._compute_retreat_poses(
             T_grasp, T_aim2, T_aim, aim_joint, grasp_joint,
         )
+
+        # Match the aim via-point's wrist to the (push-facing) wait pose so the
+        # POSITIONING move keeps joint 6 put. request.aim_joint hard-sets
+        # joint 6 to 0 (app.py _select_ambush_target), which would otherwise
+        # make move_through swing the wrist ~90° to neutral and back every
+        # cycle. Copy first so we don't mutate the request's array.
+        aim_joint = aim_joint.copy()
+        aim_joint[-1] = wait_joint[-1]
 
         # Re-enter point queue mode each cycle (same as ThrowSkill).
         if not ctx.traj_ctrl.enter_queue_mode():
@@ -268,14 +293,23 @@ class PushSkill(ManipulationSkill):
             dx *= scale
             dy *= scale
 
+        # Bake the push-facing orientation into both poses (replaces the old
+        # joint-6 override). The grasp-retreat pose adopts the *stroke-start*
+        # swing so the descent ends exactly where the push stroke begins; the
+        # high hover stays neutral (swing=0).
+        R_wait = self._push_orientation(push_dir, 0.0)
+        R_grasp = self._push_orientation(push_dir, self._swing_at(0.0))
+
         # Wait pose: retreated XY, aim height
         T_wait = T_grasp.copy()
+        T_wait[:3, :3] = R_wait
         T_wait[0, 3] -= dx
         T_wait[1, 3] -= dy
         T_wait[2, 3] = T_aim[2, 3]
 
         # Grasp retreat pose: retreated XY, grasp height - HEIGHT_OFFSET
         T_grasp_retreat = T_grasp.copy()
+        T_grasp_retreat[:3, :3] = R_grasp
         T_grasp_retreat[0, 3] -= dx
         T_grasp_retreat[1, 3] -= dy
         T_grasp_retreat[2, 3] -= HEIGHT_OFFSET
@@ -286,10 +320,9 @@ class PushSkill(ManipulationSkill):
             ctx.log.warn("Retreat IK failed; falling back to original poses")
             return aim_joint.copy(), grasp_joint.copy(), T_grasp.copy()
 
+        # Full 6-DOF IK already realises the facing+swing — keep all joints.
         wait_joint = np.asarray(ik_wait, dtype=float)
-        wait_joint[-1] = PUSH_JOINT6_ANGLE
         grasp_retreat_joint = np.asarray(ik_grasp, dtype=float)
-        grasp_retreat_joint[-1] = PUSH_JOINT6_ANGLE
         return wait_joint, grasp_retreat_joint, T_grasp_retreat
 
     # ------------------------------------------------------------------
@@ -313,7 +346,7 @@ class PushSkill(ManipulationSkill):
         """
         ctx = self.ctx
         if secondary is None:
-            return T_aim1_fallback.copy()
+            return T_aim1_fallback.copy() 
 
         T_aim2, _, _, neg_wait2 = ctx.planner.plan_throw_landing(
             T_grasp1,
@@ -358,9 +391,11 @@ class PushSkill(ManipulationSkill):
         aim_joint1 = np.asarray(aim_joint1, dtype=float)
         grasp_joint1 = np.asarray(grasp_joint1, dtype=float)
         aim_joint2 = np.asarray(aim_joint2, dtype=float)
-        aim_joint1[-1] = PUSH_JOINT6_ANGLE
-        grasp_joint1[-1] = PUSH_JOINT6_ANGLE
-        aim_joint2[-1] = PUSH_JOINT6_ANGLE
+        # Face the TCP along the push direction (forward == PUSH_JOINT6_ANGLE).
+        j6 = self._facing_joint6(self._compute_push_direction(T_grasp1, T_aim2))
+        aim_joint1[-1] = j6
+        grasp_joint1[-1] = j6
+        aim_joint2[-1] = j6
         return aim_joint1, grasp_joint1, aim_joint2
 
     # ------------------------------------------------------------------
@@ -399,94 +434,99 @@ class PushSkill(ManipulationSkill):
         ``send_trajectory_queue_with_timed_release``.
         """
         ctx = self.ctx
-        zero5 = np.zeros(5)
+        zero6 = np.zeros(6)
 
         # ================================================================
-        # Segment 1: Descent  (aim → grasp, time-optimal trapezoidal)
+        # Segment 1: Descent  (aim → grasp, 6-DOF time-optimal trapezoidal)
         # ================================================================
-        traj_desc_5, vel_desc_5, ts_desc = trajectory(
-            aim_joint[:5], zero5,
-            grasp_joint[:5], zero5,
-            ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
+        traj_desc, vel_desc, ts_desc = trajectory(
+            aim_joint[:6], zero6,
+            grasp_joint[:6], zero6,
+            ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
         )
-        # traj_desc_5, vel_desc_5: (5, n_desc); ts_desc: (n_desc,)
+        # traj_desc, vel_desc: (6, n_desc); ts_desc: (n_desc,)
 
         # ================================================================
-        # Segment 2: Push stroke  (Cartesian, belt-parallel, constant speed)
+        # Segment 2: Push stroke  (straight line + progressive swing, 6-DOF)
         # ================================================================
         push_dir = self._compute_push_direction(T_grasp, T_aim2)
-        traj_stroke_5, vel_stroke_5, ts_stroke = self._build_push_stroke(
+        traj_stroke, vel_stroke, ts_stroke = self._build_push_stroke(
             T_grasp, push_dir, grasp_joint,
         )
 
         # Clamp segment velocities against robot joint limits (Yaskawa alarm
         # 4414 prevention). Same 2-pass rescale approach as throw_skill.
-        traj_stroke_5, vel_stroke_5, ts_stroke = self._clamp_stroke_velocity(
-            traj_stroke_5, vel_stroke_5, ts_stroke,
+        traj_stroke, vel_stroke, ts_stroke = self._clamp_stroke_velocity(
+            traj_stroke, vel_stroke, ts_stroke,
         )
 
         # Shift stroke timestamps to follow descent; drop stroke's first
-        # sample (it duplicates descent's last = grasp_joint).
+        # sample (it duplicates descent's last = grasp pose).
         ts_stroke_shifted = ts_stroke[1:] + ts_desc[-1]
-        traj_stroke_5 = traj_stroke_5[:, 1:]
-        vel_stroke_5 = vel_stroke_5[:, 1:]
+        traj_stroke = traj_stroke[:, 1:]
+        vel_stroke = vel_stroke[:, 1:]
 
         # ================================================================
         # Segment 3: Chain  (push_end → next intercept or grasp)
         # ================================================================
-        push_end_q5 = traj_stroke_5[:, -1]      # last waypoint of stroke
-        push_end_dq5 = vel_stroke_5[:, -1]      # ~0 (boundary condition)
+        push_end_q = traj_stroke[:, -1]         # last waypoint of stroke (6-DOF)
+        push_end_dq = vel_stroke[:, -1]         # ~0 (boundary condition)
 
         chain_target = (
-            np.asarray(next_intercept_joint, dtype=float)
+            np.asarray(next_intercept_joint , dtype=float)
             if next_intercept_joint is not None
             else np.asarray(grasp_joint, dtype=float)
         )
-        chain_target[-1] = PUSH_JOINT6_ANGLE
+        # Hold the stroke-end wrist angle through the chain (no whip); the next
+        # cycle re-orients during its own positioning move.
+
+        chain_target[5] = push_end_q[5]
+        ctx.log.info(
+            f"chain j6: push_end={np.degrees(push_end_q[5]):.1f}° "
+            f"chain_target={np.degrees(chain_target[5]):.1f}° | "
+            f"push_end_q(deg)={np.round(np.degrees(push_end_q), 1)} "
+            f"chain_target(deg)={np.round(np.degrees(chain_target), 1)}"
+        )
         chained_to_next = next_intercept_joint is not None
 
-        traj_chain_5, vel_chain_5, ts_chain = trajectory(
-            push_end_q5, push_end_dq5,
-            chain_target[:5], zero5,
-            ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
+        traj_chain, vel_chain, ts_chain = trajectory(
+            push_end_q, push_end_dq,
+            chain_target[:6], zero6,
+            ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
         )
+
+        ctx.log.info(
+            f"traj_chain(deg)={np.round(np.degrees(traj_chain[-1]), 1)} "
+        )
+
         # Drop chain's first sample (duplicate of stroke's last), shift ts.
         stroke_end_t = (
             ts_stroke_shifted[-1]
             if len(ts_stroke_shifted) > 0
             else ts_desc[-1]
         )
-        traj_chain_5 = traj_chain_5[:, 1:]
-        vel_chain_5 = vel_chain_5[:, 1:]
+        traj_chain = traj_chain[:, 1:]
+        vel_chain = vel_chain[:, 1:]
         ts_chain_shifted = ts_chain[1:] + stroke_end_t
 
         # ================================================================
-        # Concatenate all segments
+        # Concatenate all segments (already 6-DOF — no pad needed)
         # ================================================================
-        traj_full_5 = np.concatenate(
-            (traj_desc_5, traj_stroke_5, traj_chain_5), axis=1,
-        )
-        vel_full_5 = np.concatenate(
-            (vel_desc_5, vel_stroke_5, vel_chain_5), axis=1,
-        )
+        traj_push = np.concatenate((traj_desc, traj_stroke, traj_chain), axis=1)
+        vel_push = np.concatenate((vel_desc, vel_stroke, vel_chain), axis=1)
         ts_full = np.concatenate((ts_desc, ts_stroke_shifted, ts_chain_shifted))
-        assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
+        assert traj_push.shape[1] == vel_push.shape[1] == ts_full.shape[0], (
             f"push traj/vel/ts length mismatch: "
-            f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
+            f"{traj_push.shape[1]}/{vel_push.shape[1]}/{ts_full.shape[0]}"
         )
-
-        # Pad to 6-DOF, then set the 6th joint to PUSH_JOINT6_ANGLE.
-        traj_push = pad(traj_full_5.T).T
-        traj_push[5, :] = PUSH_JOINT6_ANGLE
-        vel_push = pad(vel_full_5.T).T       # 6th vel = 0 is correct
         final_joint = chain_target
 
-        n_desc = traj_desc_5.shape[1]
-        n_stroke = traj_stroke_5.shape[1]
+        n_desc = traj_desc.shape[1]
+        n_stroke = traj_stroke.shape[1]
         ctx.log.info(
             f"Push traj: descent {n_desc} + stroke {n_stroke} steps "
             f"(d={PUSH_DISTANCE:.3f}m @ {PUSH_SPEED:.2f}m/s, "
-            f"θ={np.degrees(theta):.1f}°), "
+            f"θ={np.degrees(theta):.1f}°, swing=±{np.degrees(SWING_ANGLE):.1f}°), "
             f"{'chain→next intercept' if chained_to_next else 'chain→current grasp'}"
         )
 
@@ -501,6 +541,7 @@ class PushSkill(ManipulationSkill):
             "push_distance": PUSH_DISTANCE,
             "push_speed": PUSH_SPEED,
             "theta": theta,
+            "swing": SWING_ANGLE,
             "chained_to_next": chained_to_next,
         }
 
@@ -591,39 +632,120 @@ class PushSkill(ManipulationSkill):
             return np.array([1.0, 0.0, 0.0])
         return delta / norm
 
+    @staticmethod
+    def _facing_joint6(push_dir: np.ndarray) -> float:
+        """Joint-6 angle that points the TCP straight along ``push_dir``.
+
+        In the default grasp orientation (``_R_GRASP_DEFAULT`` in app.py) the
+        tool's facing axis is base **+X**, and the wrist is "facing forward"
+        when joint 6 == ``PUSH_JOINT6_ANGLE`` (NOT 0). Rotating the push
+        direction away from +X by ``yaw`` (its angle in the XY belt plane)
+        therefore needs the same ``yaw`` added on top of ``PUSH_JOINT6_ANGLE``
+        so the TCP keeps looking straight down the push line.
+
+        When ``push_dir`` == +X, ``yaw`` == 0 → joint 6 == ``PUSH_JOINT6_ANGLE``
+        (forward), as required.
+
+        NOTE: flip the sign of ``yaw`` here if the wrist turns the *wrong* way
+        on hardware — it depends on the joint-6 rotation axis direction.
+        """
+        yaw = float(np.arctan2(push_dir[1], push_dir[0]))
+        return PUSH_JOINT6_ANGLE + yaw
+
+    @staticmethod
+    def _swing_at(alpha: float) -> float:
+        """Swing tilt (rad) at stroke progress ``alpha`` ∈ [0, 1].
+
+        Linear sweep from ``-SWING_ANGLE`` (leaning back) at the start to
+        ``+SWING_ANGLE`` (leaning forward) at the end, passing through 0
+        (vertical) at the midpoint.
+        """
+        return SWING_ANGLE * (2.0 * alpha - 1.0)
+
+    @staticmethod
+    def _push_orientation(push_dir: np.ndarray, swing: float) -> np.ndarray:
+        """Tool orientation (3x3) facing along ``push_dir``, tilted by ``swing``.
+
+        Generalises ``_R_GRASP_DEFAULT`` (which faces base +X pointing straight
+        down) to an arbitrary belt-plane heading plus a forward/back tilt:
+
+          * ``swing`` == 0  → approach axis straight down (-Z), tool faces
+            ``push_dir`` (identical to _R_GRASP_DEFAULT when push_dir == +X).
+          * ``swing`` > 0   → approach axis leans *forward* (toward push_dir).
+          * ``swing`` < 0   → approach axis leans *back* (away from push_dir).
+
+        Base columns (tool axes in base frame) before the wrist twist::
+
+            approach (tool X) = -cos(swing)*up + sin(swing)*f
+            side     (tool Y) =  up × f
+            facing   (tool Z) =  sin(swing)*up + cos(swing)*f
+
+        where ``f`` is the unit push direction projected onto the belt plane
+        and ``up`` is base +Z.
+
+        Then the frame is **twisted by ``PUSH_JOINT6_ANGLE`` about the approach
+        axis** (≈ the joint-6/flange axis for a down-pointing tool). The
+        gripper's push-facing axis is the tool **Y** axis (not Z), 90° off the
+        bare frame, so without this twist the IK solves joint 6 ~90° short of
+        its intended baseline. After the twist the tool Y axis aligns with the
+        push axis and sweeps back→front as ``swing`` varies — i.e. the swing
+        shows up on "the TCP's Y direction" as intended.
+
+        NOTE: flip the sign of ``PUSH_JOINT6_ANGLE`` if joint 6 ends up on the
+        wrong side (or the tool Y faces the opposite way) on hardware.
+        """
+        f = np.array([push_dir[0], push_dir[1], 0.0], dtype=float)
+        nf = np.linalg.norm(f)
+        f = f / nf if nf > 1e-9 else np.array([1.0, 0.0, 0.0])
+        up = np.array([0.0, 0.0, 1.0])
+        side = np.cross(up, f)                 # horizontal, ⊥ push_dir
+        c, s = np.cos(swing), np.sin(swing)
+        approach = -c * up + s * f
+        facing = s * up + c * f
+
+        # Twist about the approach axis so joint 6 lands at its
+        # PUSH_JOINT6_ANGLE baseline and the swing acts on the tool Y axis.
+        cb, sb = np.cos(-PUSH_JOINT6_ANGLE), np.sin(-PUSH_JOINT6_ANGLE)
+        side, facing = cb * side + sb * facing, -sb * side + cb * facing
+        return np.column_stack((approach, side, facing))
+
     def _build_push_stroke(
         self,
         T_grasp: np.ndarray,
         direction: np.ndarray,
         grasp_joint: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Constant-speed Cartesian trajectory parallel to the belt surface.
+        """Constant-speed straight-line push with a progressive swing.
 
-        Generates ``n_steps + 1`` waypoints along a straight line:
+        The TCP *position* travels a straight belt-parallel line:
 
-        * Start: ``T_grasp`` (= T_grasp1, at belt height)
+        * Start: ``T_grasp`` (at belt height)
         * End:   ``T_grasp + PUSH_DISTANCE * direction`` (same Z)
 
-        Each waypoint is converted to joint space via IK. If IK fails
-        mid-stroke, the trajectory is truncated with a warning.
+        while the *orientation* sweeps via :meth:`_push_orientation` from
+        ``_swing_at(0)`` (leaning back) to ``_swing_at(1)`` (leaning forward).
+
+        Each waypoint is solved with full 6-DOF IK so the swing — and the
+        push-facing yaw — are realised by the arm/wrist; **all six joints are
+        kept**. If IK fails mid-stroke, the trajectory is truncated.
 
         Joint velocities are computed via central finite differences with
-        boundary velocities forced to zero so the stroke concatenates
-        smoothly with the descent (v=0 at end) and chain (v=0 at start)
-        segments.
+        boundary velocities forced to zero so the stroke concatenates smoothly
+        with the descent (v=0 at end) and chain (v=0 at start) segments.
 
-        Returns ``(traj_5, vel_5, ts)`` with shapes ``(5, n), (5, n), (n,)``.
+        Returns ``(traj_6, vel_6, ts)`` with shapes ``(6, n), (6, n), (n,)``.
         """
         ctx = self.ctx
         total_time = PUSH_DISTANCE / max(PUSH_SPEED, 1e-6)
         n_steps = max(2, int(total_time * ctx.cfg.TRAJ_HZ))
         dt = total_time / n_steps
 
-        # ---- Cartesian waypoints → joint space via IK ----
+        # ---- Cartesian position + swing orientation → joint space via IK ----
         waypoints: list[np.ndarray] = []
         for i in range(n_steps + 1):
             alpha = i / n_steps
             T_wp = T_grasp.copy()
+            T_wp[:3, :3] = self._push_orientation(direction, self._swing_at(alpha))
             T_wp[0, 3] += alpha * PUSH_DISTANCE * direction[0]
             T_wp[1, 3] += alpha * PUSH_DISTANCE * direction[1]
             # Z unchanged — belt-parallel motion.
@@ -634,27 +756,24 @@ class PushSkill(ManipulationSkill):
                     f"truncating stroke to {len(waypoints)} waypoints"
                 )
                 break
-            q = np.asarray(ik, dtype=float)
-            # Only q[:5] is used below; 6th joint is handled by
-            # build_push_trajectory after pad().
-            waypoints.append(q[:5])
+            waypoints.append(np.asarray(ik, dtype=float))   # full 6-DOF
 
         # Fallback: if fewer than 2 waypoints, return a zero-motion segment
         # so the caller can still concatenate without crashing.
         if len(waypoints) < 2:
             ctx.log.warn("Push stroke degenerate (< 2 IK solutions); no-op segment")
-            q0 = np.asarray(grasp_joint[:5], dtype=float)
+            q0 = np.asarray(grasp_joint, dtype=float)
             traj = np.column_stack([q0, q0])
             vel = np.zeros_like(traj)
             ts = np.array([0.0, dt])
             return traj, vel, ts
 
         n = len(waypoints)
-        traj = np.column_stack(waypoints)              # (5, n)
+        traj = np.column_stack(waypoints)              # (6, n)
         ts = np.linspace(0.0, dt * (n - 1), n)        # (n,)
 
         # ---- Joint velocities via central finite differences ----
-        vel = np.zeros_like(traj)                      # (5, n)
+        vel = np.zeros_like(traj)                      # (6, n)
         if n > 2:
             vel[:, 1:-1] = (traj[:, 2:] - traj[:, :-2]) / (2.0 * dt)
         # Boundary: start and end at rest so the stroke concatenates
@@ -681,12 +800,13 @@ class PushSkill(ManipulationSkill):
         stroke while preserving the Cartesian path.
         """
         ctx = self.ctx
-        m1_5 = np.asarray(ctx.M1[:5], dtype=float)
+        # Match the trajectory's DOF (stroke is now full 6-DOF).
+        m1 = np.asarray(ctx.M1[: traj.shape[0]], dtype=float)
 
         for _ in range(2):
             dt_seg = np.maximum(np.diff(ts), 1e-9)
-            seg_vel = np.abs(np.diff(traj, axis=1)) / dt_seg[None, :]  # (5, n-1)
-            ratio = float(np.max(seg_vel / m1_5[:, None]))
+            seg_vel = np.abs(np.diff(traj, axis=1)) / dt_seg[None, :]  # (DOF, n-1)
+            ratio = float(np.max(seg_vel / m1[:, None]))
             if ratio <= 1.0:
                 break
             scale = ratio * 1.05                       # +5% margin
@@ -733,6 +853,7 @@ class PushSkill(ManipulationSkill):
             "push_speed_mps": meta.get("push_speed", ""),
             "push_distance_m": meta.get("push_distance", ""),
             "theta_deg": round(np.degrees(meta.get("theta", 0.0)), 1),
+            "swing_deg": round(np.degrees(meta.get("swing", 0.0)), 1),
             "n_descent": meta.get("n_descent", ""),
             "n_stroke": meta.get("n_stroke", ""),
             "chained": meta.get("chained_to_next", ""),
