@@ -518,13 +518,27 @@ class GP8App:
         intercept_y = self.cfg.GRASP_INTERCEPT_Y
         zero = np.zeros_like(self.M1)
         factor = self.cfg.PICK_FEASIBILITY_FACTOR
-        # The object the prior throw's return swing was committed to. Consume it
-        # here: if we choose this same object below, its request is marked
-        # ``prepositioned`` (the swing already parked the arm at its grasp — no
-        # re-drive / mode-stop). Decided by object identity, not a distance guess.
+        # The object the prior throw's return swing committed to. The chain
+        # ALREADY judged it catchable — once, in scan_next_intercept, gated on
+        # throw_time + move_time — and flew the arm to its grasp. Picking and
+        # throwing that object is ONE committed set, so use it DIRECTLY: no
+        # re-scan, no second feasibility judgment. (Re-judging the same camera
+        # data would only let "catchable" flip to "not" for no real reason.) If
+        # the grab later misses, that's a timing-calibration problem, not a
+        # reason to re-decide the target here.
         committed = self.ctx.committed_next if self.ctx is not None else None
         if self.ctx is not None:
             self.ctx.committed_next = None
+        if committed is not None:
+            req = self._committed_pick_request(committed, current_joint)
+            if req is not None:
+                return req
+            # Only fall through if the intercept is physically impossible now
+            # (out of reach / IK fails) — never because of a re-judged eta.
+            self._node.get_logger().warn(
+                f"Committed {committed.class_name}: intercept geometry "
+                f"unreachable; re-selecting from queue"
+            )
 
         target = None
         target_T_aim = target_T_grasp = None
@@ -621,7 +635,58 @@ class GP8App:
             aim_joint=target_aim_joint,
             grasp_joint=target_grasp_joint,
             secondary=secondary,
-            prepositioned=(target is committed),
+            # This is the fresh-scan path (no commitment), so it always drives.
+            prepositioned=False,
+        )
+
+    def _committed_pick_request(
+        self, obj: TrackedObject, current_joint: np.ndarray
+    ) -> PickRequest | None:
+        """Build the PickRequest for the throw's committed return object directly.
+
+        ``scan_next_intercept`` already judged this object catchable and the
+        return swing parked the arm at its grasp, so we skip the queue scan and
+        the feasibility gate entirely — same intercept geometry as
+        ``_select_ambush_target``, ``prepositioned=True`` (no re-drive). Returns
+        ``None`` only if the intercept pose is physically unreachable / IK fails
+        (a hard impossibility, not a re-judged eta), letting the caller fall
+        back to a fresh scan.
+        """
+        intercept_y = self.cfg.GRASP_INTERCEPT_Y
+        T_grasp = obj.T_grasp_base.copy()
+        T_aim = obj.T_aim_base.copy()
+        approach_dz = T_aim[2, 3] - T_grasp[2, 3]
+        T_grasp[1, 3] = intercept_y
+        T_aim[1, 3] = intercept_y
+        T_grasp[2, 3] = self.cfg.GRASP_Z
+        T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
+        if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
+            return None
+        aim_joint = self.robot.inverse_kinematics(T_aim)
+        grasp_joint = self.robot.inverse_kinematics(T_grasp)
+        if aim_joint is None or grasp_joint is None:
+            return None
+        aim_joint = np.asarray(aim_joint, dtype=float); aim_joint[-1] = 0.0
+        grasp_joint = np.asarray(grasp_joint, dtype=float); grasp_joint[-1] = 0.0
+        # Drop it from the queue (it stays as the active target), then the next
+        # front object becomes the throw's secondary (post-throw chain target).
+        if obj in self.queue._objects:
+            self.queue._objects.remove(obj)
+        secondary = self.queue.head() if self.queue else None
+        self._active_target = obj
+        self._node.get_logger().info(
+            f"Committed pick: {obj.class_name} @ x={float(T_grasp[0, 3]):+.3f} "
+            f"y={intercept_y:.3f} (prepositioned; reusing chain's judgment)"
+        )
+        return PickRequest(
+            target=obj,
+            current_joint=current_joint,
+            T_aim=T_aim,
+            T_grasp=T_grasp,
+            aim_joint=aim_joint,
+            grasp_joint=grasp_joint,
+            secondary=secondary,
+            prepositioned=True,
         )
 
     # ------------------------------------------------------------------
