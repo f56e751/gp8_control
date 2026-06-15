@@ -196,3 +196,49 @@ def pad(x: np.ndarray) -> np.ndarray:
     """Pad array with zero column for 6th joint (from 5-DOF to 6-DOF)."""
     pad_shape = list(x.shape[:-1]) + [1]
     return np.concatenate((x, np.zeros(pad_shape)), axis=-1)
+
+
+def decimate_for_queue(
+    traj: np.ndarray,
+    vel: np.ndarray,
+    ts: np.ndarray,
+    min_gap: float = 0.15,
+):
+    """Thin a (DOF, n) trajectory so consecutive points are >= ``min_gap`` apart.
+
+    MotoROS2 ``queue_traj_point`` is a synchronous service whose round-trip
+    takes ~60-100 ms. If queued points are closer in time than that, the robot
+    consumes them faster than they can be pushed -> the queue drains -> queue
+    mode auto-exits -> code 2 "Must call start_point_queue_mode". Apply this to
+    any trajectory before ``send_trajectory_queue``.
+
+    Keeps the first and last point; retains interior points only when they are
+    >= ``min_gap`` from the last kept point. Velocities are recomputed via
+    central finite differences at the new spacing (boundaries left at rest).
+    Returns ``(traj, vel, ts)`` decimated.
+    """
+    n = traj.shape[1]
+    if n <= 2:
+        return traj, vel, ts
+
+    keep = [0]
+    for i in range(1, n - 1):
+        if ts[i] - ts[keep[-1]] >= min_gap:
+            keep.append(i)
+    keep.append(n - 1)
+    while len(keep) > 2 and ts[keep[-1]] - ts[keep[-2]] < min_gap:
+        keep.pop(-2)
+
+    idx = np.array(keep)
+    traj_dec = traj[:, idx]
+    ts_dec = ts[idx]
+
+    m = len(idx)
+    vel_dec = np.zeros_like(traj_dec)
+    if m > 2:
+        for j in range(1, m - 1):
+            dt2 = ts_dec[j + 1] - ts_dec[j - 1]
+            if dt2 > 1e-9:
+                vel_dec[:, j] = (traj_dec[:, j + 1] - traj_dec[:, j - 1]) / dt2
+
+    return traj_dec, vel_dec, ts_dec

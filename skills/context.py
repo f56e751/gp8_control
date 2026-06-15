@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 import numpy as np
 import rclpy
 
-from gp8_control.trajectory.trajectory_primitive import trajectory
+from gp8_control.trajectory.trajectory_primitive import (
+    trajectory,
+    trajectory_3points,
+    decimate_for_queue,
+)
 
 if TYPE_CHECKING:
     from rclpy.node import Node
@@ -99,6 +103,39 @@ class SkillContext:
             current_joint, zero, grasp_joint, zero,
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
+        # Thin to >= queue-gap so the synchronous point push keeps up with the
+        # robot's consumption — otherwise a long positioning move (e.g. from the
+        # bin-side push_end back to the next intercept) drains the queue and
+        # MotoROS2 exits queue mode (code 2 'Must call start_point_queue_mode').
+        traj, vel, ts = decimate_for_queue(traj, vel, ts)
+        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+
+    def move_through_via(
+        self,
+        current_joint: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+    ) -> None:
+        """Queue-mode move current -> aim -> grasp, ACTUALLY passing through aim.
+
+        Unlike :meth:`move_through` (which ignores ``aim_joint`` and cuts a
+        direct path to ``grasp_joint``), this routes through the ``aim_joint``
+        via-point (zero velocity there) using ``trajectory_3points``. The push
+        skill uses it so the arm rises to the high aim hover before descending
+        to the low push-start pose, instead of cutting a direct (possibly
+        belt-dipping) path from a far parked pose like the bin-side push_end.
+        """
+        zero = np.zeros_like(self.M1)
+        traj, vel, ts = trajectory_3points(
+            current_joint, zero,
+            aim_joint, zero,
+            grasp_joint, zero,
+            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+        )
+        # Thin to >= queue-gap so the synchronous point push keeps up with the
+        # robot's consumption (see move_through) — a long via-routed positioning
+        # has even more points, so this matters more here.
+        traj, vel, ts = decimate_for_queue(traj, vel, ts)
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
 
     def sleep_until(self, deadline: float) -> None:

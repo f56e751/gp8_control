@@ -136,14 +136,14 @@ class Config:
         default_factory=lambda: _env_default("GP8_FORCE_SKILL", "")
     )
 
-    GRASP_INTERCEPT_Y: float = 0.0      # belt-frame Y where the arm waits [m]
+    GRASP_INTERCEPT_Y: float = -0.1      # belt-frame Y where the arm waits [m]
     # Grasp height [m]: belt-surface contact Z. Manually verified pose was
     # z=0.067 (terminal_debug: EE x=0.508 y=0.000, suction ON); lowered ~5 mm
     # to 0.062 for firmer contact.
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
     GRASP_Z: float = 0.062
-    SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
+    SUCTION_LEAD: float = 0.5           # fire suction this many seconds before arrival [s]
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
@@ -175,12 +175,24 @@ class Config:
     OBJECT_MATCH_EPSILON: float = 0.05
 
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
-    # whose ETA < move_time * factor — i.e. objects that will reach the
-    # intercept before the arm can finish positioning. opt_time is known to
-    # over-estimate the real move (~2x), so 0.5 trusts that the real move
-    # is roughly half the planned one; bump higher (toward 1.0) to be more
-    # conservative (drop sooner) or lower to attempt more catches.
-    PICK_FEASIBILITY_FACTOR: float = 0.5
+    # whose ETA < move_time * factor + lead — i.e. objects that will reach the
+    # intercept before the arm can finish positioning.
+    #
+    # In POINT QUEUE MODE the arm follows the timestamps we hand it, so the
+    # real positioning time ≈ the planned opt_time — NOT half of it. The old
+    # 0.5 ("opt_time over-estimates ~2x") therefore under-counted the move and
+    # let un-catchable heads pass: harmless when ETA is huge (object detected
+    # far away), but it bit hard on the push path, where option A parks the arm
+    # at push_end (bin side, far) so the next head's return-positioning is long
+    # AND its move_time already bundles the descent (aim→grasp). The check then
+    # required only ~half that, committed to objects it couldn't reach in time,
+    # and burned a whole late-push cycle — the perceived "delay". 1.0 makes the
+    # requirement match the real queue-mode move. Lower it to attempt more
+    # marginal catches (risking late commits); raise it to drop sooner.
+    # NOTE: tuned for the push ambush path. The throw ambush positioning is a
+    # single direct move (move_through goes straight to grasp), so when throw is
+    # re-enabled a lower / skill-specific factor may catch more there.
+    PICK_FEASIBILITY_FACTOR: float = 1.0
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
@@ -567,11 +579,11 @@ class GP8App:
             )
             eta = (obj_y - intercept_y) / (v + 1e-6)
 
-            # Feasibility: the arm must be parked at the intercept by the time
-            # suction fires (= eta - SUCTION_LEAD), not just by the time the
-            # object actually arrives. Drop heads we can't position in time.
-            # opt_time over-estimates the real move (~2x), so scale by
-            # PICK_FEASIBILITY_FACTOR (default 0.5).
+            # Feasibility: the arm must be in place before the object reaches
+            # the intercept, not just by the time it arrives. Drop heads we
+            # can't position in time. In queue mode the move runs over ~the
+            # planned opt_time, so factor ≈ 1.0 (see PICK_FEASIBILITY_FACTOR);
+            # 0.5 used to under-count the move and commit to un-catchable heads.
             needed = move_time * factor + self.cfg.SUCTION_LEAD
             if eta < needed:
                 self.queue.pop_head()

@@ -191,7 +191,11 @@ class GP8(BaseRobot):
 
         Args:
             T: Desired 4x4 end-effector pose.
-            q_init: Ignored for analytical IK (kept for API compatibility).
+            q_init: Optional joint seed. When given and both wrist solutions
+                are valid, the one closest to ``q_init`` is returned (branch
+                continuity for sampled Cartesian paths — avoids ~pi joint-4/6
+                flips when joint 5 crosses the wrist singularity). When None,
+                the smaller-wrist-rotation solution is returned.
 
         Returns:
             6-vector of joint angles in radians, or None if no valid solution.
@@ -262,17 +266,39 @@ class GP8(BaseRobot):
         valid1 = self._is_within_limits(first_soln)
         valid2 = self._is_within_limits(second_soln)
 
+        def _toward_seed(soln):
+            """Unwrap a solution toward q_init by ±2π so the raw joint path is
+            continuous (e.g. j6 164° next to seed −176° becomes −196°, not a
+            340° command). Falls back to the wrapped value if unwrap exits
+            limits. No-op when no seed is given."""
+            if q_init is None:
+                return soln
+            seed = np.asarray(q_init, dtype=np.float64)
+            unwrapped = soln + np.round((seed - soln) / (2.0 * np.pi)) * (2.0 * np.pi)
+            return unwrapped if self._is_within_limits(unwrapped) else soln
+
         if valid1 and valid2:
-            # Prefer the solution with smaller wrist rotation
+            if q_init is not None:
+                # Continuity: pick the wrist branch closest to the seed so a
+                # sampled Cartesian path (e.g. the push stroke) doesn't flip
+                # joints 4/6 by ~pi mid-motion when the two Euler solutions
+                # cross over at the joint-5 wrist singularity. Compare AFTER
+                # unwrapping so angle wrapping (±2π) doesn't mis-rank branches.
+                seed = np.asarray(q_init, dtype=np.float64)
+                c1, c2 = _toward_seed(first_soln), _toward_seed(second_soln)
+                d1 = float(np.sum((c1 - seed) ** 2))
+                d2 = float(np.sum((c2 - seed) ** 2))
+                return c1 if d1 <= d2 else c2
+            # No seed: prefer the solution with smaller wrist rotation
             return (
                 first_soln
                 if np.abs(first_soln[3]) <= np.abs(second_soln[3])
                 else second_soln
             )
         if valid1:
-            return first_soln
+            return _toward_seed(first_soln)
         if valid2:
-            return second_soln
+            return _toward_seed(second_soln)
 
         # Neither solution is within joint limits
         return None
