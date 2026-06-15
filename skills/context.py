@@ -352,9 +352,10 @@ class SkillContext:
                     self.sleep_until(t_suction)
                     self.traj_ctrl.suction_on()
         self.set_status("WAITING", getattr(target, "class_name", ""))
-        # Wait out the rest until arrival, then return so the throw begins right
-        # as the object reaches the intercept.
-        self.sleep_until(t_arrival)
+        # End the wait THROW_START_LEAD before predicted arrival so the throw's
+        # queue-mode re-entry (~0.4 s) overlaps the object's final approach and the
+        # lift lands on arrival instead of trailing it.
+        self.sleep_until(t_arrival - self.cfg.THROW_START_LEAD)
 
     def scan_next_intercept(
         self, from_joint: np.ndarray, throw_time: float,

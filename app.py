@@ -144,6 +144,15 @@ class Config:
     # relative height above this.
     GRASP_Z: float = 0.062
     SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
+    # Begin the throw this many seconds BEFORE the object's predicted arrival, so
+    # the throw's queue-mode re-entry (~0.4 s) overlaps the object's final approach
+    # and the lift lands ON arrival instead of trailing it. 0 = wait for full
+    # predicted arrival (old behavior). Default 0.2 tuned on hardware; the limit is
+    # the object's actual arrival (too large -> lift before the object is there).
+    # env-overridable for re-tuning without a rebuild.
+    THROW_START_LEAD: float = field(    # [s] — env GP8_THROW_START_LEAD
+        default_factory=lambda: float(os.environ.get("GP8_THROW_START_LEAD", "0.2"))
+    )
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
