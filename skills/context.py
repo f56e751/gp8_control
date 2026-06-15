@@ -43,6 +43,33 @@ class PickRequest:
     prepositioned: bool = False
 
 
+# Fixed-point convergence for earliest_reachable_intercept (intercept-Y <-> move-time
+# depend on each other because the object keeps moving while the arm moves). The loop
+# is cheap (closed-form IK + arithmetic), so we converge tightly.
+_INTERCEPT_TOL = 1e-4          # m
+_INTERCEPT_RELAX = 0.5         # under-relaxation for stability (plan_pick-style)
+_INTERCEPT_MAX_ITERS = 30      # generous cap; a 1-D contraction converges in a few
+
+
+@dataclass
+class Intercept:
+    """Earliest reachable intercept for one object: where + how to grab it.
+
+    ``intercept_y`` is the dynamic belt-frame Y to grab at (NOT the old fixed
+    ``GRASP_INTERCEPT_Y`` line); ``eta`` is the time from now until the object
+    reaches that Y; ``move_time`` is the arm's estimated travel to the grasp pose.
+    Produced by :meth:`SkillContext.earliest_reachable_intercept`.
+    """
+
+    intercept_y: float
+    T_aim: np.ndarray
+    T_grasp: np.ndarray
+    aim_joint: np.ndarray
+    grasp_joint: np.ndarray
+    eta: float
+    move_time: float
+
+
 @dataclass
 class SkillContext:
     """Robot resources + cross-cutting helpers shared by all skills.
@@ -78,6 +105,10 @@ class SkillContext:
     # object — so "already at the grasp" is decided by object identity, not a
     # distance guess. Consumed (cleared) by the next selection.
     committed_next: "Optional[TrackedObject]" = None
+    # The dynamic intercept (Y + grasp/aim poses + joints) chosen for ``committed_next``
+    # at commit time. The catchable judgment is made ONCE here; the next selection
+    # REUSES this instead of recomputing, so the parked pose and the pick pose agree.
+    committed_intercept: "Optional[Intercept]" = None
 
     @property
     def log(self):
@@ -89,6 +120,96 @@ class SkillContext:
     def object_y_now(self, target: "TrackedObject", now: float, v: float) -> float:
         """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases)."""
         return target.T_grasp_base[1, 3] - v * (now - target.detect_time)
+
+    def earliest_reachable_intercept(
+        self,
+        target: "TrackedObject",
+        current_joint: np.ndarray,
+        v: float,
+        now: float,
+        pre_delay: float = 0.0,
+    ) -> "Optional[Intercept]":
+        """Earliest belt-Y at which the arm can grab ``target``, or ``None`` if it
+        can't be caught anywhere in the workspace before passing downstream.
+
+        The object travels in -Y; for its lane X the reach window is
+        ``Y in [-y_b, +y_b]`` with ``y_b = sqrt(MAX_REACH^2 - x^2)``. We grab as
+        EARLY as possible: if the object is still upstream of the entry edge
+        ``+y_b`` when the arm can be ready, wait at ``+y_b``; otherwise meet it
+        where it will be when the arm arrives (which may be downstream of the old
+        ``y=0`` line — that is the point). We give up ONLY when the object would
+        pass the downstream edge ``-y_b`` before the arm — after any ``pre_delay``
+        (e.g. the current throw the arm must finish first) — can reach it. Being
+        upstream (not yet arrived) is never a reason to give up.
+
+        intercept-Y and the arm's ``move_time`` depend on each other (the object
+        keeps moving while the arm moves), so we fixed-point iterate to
+        convergence. The loop is cheap (closed-form IK + arithmetic). The
+        ``PICK_FEASIBILITY_FACTOR`` margin is baked into the arm-travel estimate
+        here, so callers just use the result (or drop on ``None``).
+
+        ``current_joint`` is the move-estimate reference (the pose the arm lifts
+        from). ``pre_delay`` is dead time before the arm starts moving (0 for the
+        immediate pick; the throw duration for the post-throw chain).
+        """
+        cfg = self.cfg
+        x = float(target.T_grasp_base[0, 3])
+        obj_y = self.object_y_now(target, now, v)
+        denom = cfg.MAX_REACH ** 2 - x ** 2
+        if denom <= 0.0:
+            return None                          # lane laterally out of reach (degenerate)
+        y_b = float(np.sqrt(denom))
+        if obj_y < -y_b:
+            return None                          # already past the downstream reach edge
+
+        zero = np.zeros_like(self.M1)
+        factor = cfg.PICK_FEASIBILITY_FACTOR
+        approach_dz = float(target.T_aim_base[2, 3] - target.T_grasp_base[2, 3])
+        T_grasp = target.T_grasp_base.copy()
+        T_aim = target.T_aim_base.copy()
+        T_grasp[0, 3] = x
+        T_aim[0, 3] = x
+
+        y_guess = float(min(obj_y, y_b))         # seed at the object, capped at the entry edge
+        y_eval = y_guess
+        aj = gj = None
+        move_time = 0.0
+        for _ in range(_INTERCEPT_MAX_ITERS):
+            y_eval = y_guess
+            T_grasp[1, 3] = y_eval
+            T_grasp[2, 3] = cfg.GRASP_Z
+            T_aim[1, 3] = y_eval
+            T_aim[2, 3] = cfg.GRASP_Z + approach_dz
+            gj = self.robot.inverse_kinematics(T_grasp)
+            aj = self.robot.inverse_kinematics(T_aim)
+            if gj is None or aj is None:
+                return None
+            gj = np.asarray(gj, dtype=float); gj[-1] = 0.0
+            aj = np.asarray(aj, dtype=float); aj[-1] = 0.0
+            move_time = (
+                opt_time(current_joint, zero, aj, zero, self.M1, self.M2)
+                + opt_time(aj, zero, gj, zero, self.M1, self.M2)
+            )
+            # Where the object will be once the arm is ready (after pre_delay) and
+            # has travelled (move_time padded by the feasibility factor as margin).
+            obj_y_arrival = obj_y - v * (pre_delay + move_time * factor)
+            if obj_y_arrival < -y_b:
+                return None                      # exits downstream before the arm arrives
+            target_y = min(obj_y_arrival, y_b)   # wait at the entry edge if still upstream
+            if abs(target_y - y_eval) < _INTERCEPT_TOL:
+                break
+            y_guess = (1.0 - _INTERCEPT_RELAX) * y_eval + _INTERCEPT_RELAX * target_y
+
+        eta = (obj_y - y_eval) / (v + 1e-6)
+        return Intercept(
+            intercept_y=y_eval,
+            T_aim=T_aim.copy(),
+            T_grasp=T_grasp.copy(),
+            aim_joint=aj,
+            grasp_joint=gj,
+            eta=eta,
+            move_time=move_time,
+        )
 
     def move_through(
         self,
@@ -262,45 +383,37 @@ class SkillContext:
         now = time.time()
         v = self.conveyor.current if self.conveyor is not None else 0.0
         self.queue.update(now, v)
-        zero = np.zeros_like(self.M1)
-        factor = self.cfg.PICK_FEASIBILITY_FACTOR
+        # Walk from the head (most downstream = most urgent) and commit to the
+        # FIRST object the next pick can actually complete. earliest_reachable_intercept
+        # does the same dynamic-Y feasibility as _select_ambush_target, but with
+        # pre_delay=throw_time (the arm only starts moving after this throw finishes),
+        # so "catchable" already accounts for the throw + move. The chosen intercept
+        # is judged ONCE here and stored (committed_intercept) for the next selection
+        # to reuse — no re-judgment.
         for cand in list(self.queue._objects):
-            T_next_grasp = cand.T_grasp_base.copy()
-            T_next_grasp[1, 3] = self.cfg.GRASP_INTERCEPT_Y
-            T_next_grasp[2, 3] = self.cfg.GRASP_Z
-            if np.linalg.norm(T_next_grasp[:2, 3]) > self.cfg.MAX_REACH:
-                continue
-            ik = self.robot.inverse_kinematics(T_next_grasp)
-            if ik is None:
-                continue
-            next_intercept_joint = np.asarray(ik, dtype=float)
-            next_intercept_joint[-1] = 0.0
-            cand_y = self.object_y_now(cand, now, v)
-            eta = max(0.0, (cand_y - self.cfg.GRASP_INTERCEPT_Y) / (v + 1e-6))
-            # SAME gate as _select_ambush_target, plus the throw the arm must
-            # finish first: only chain to / prime an object the next pick can
-            # actually complete (else it would fly to an intercept the pick gate
-            # then rejects).
-            move_time = opt_time(
-                from_joint, zero, next_intercept_joint, zero, self.M1, self.M2,
+            it = self.earliest_reachable_intercept(
+                cand, from_joint, v, now, pre_delay=throw_time,
             )
-            needed = throw_time + move_time * factor
-            if eta < needed:
+            if it is None:
                 self.log.info(
-                    f"Chain skip {cand.class_name}: can't complete in time "
-                    f"(eta {eta:.2f}s < throw {throw_time:.2f}s + move "
-                    f"{move_time:.2f}s × {factor:.2f} = {needed:.2f}s)"
+                    f"Chain skip {cand.class_name}: not catchable after throw "
+                    f"({throw_time:.2f}s) + move"
                 )
                 continue
-            suction_on_at = now + eta - self.cfg.SUCTION_LEAD
-            # Commit this object as the next pick: the swing is heading to its
-            # intercept, so the next selection should grab THIS one (and skip the
-            # re-drive/mode-stop) instead of re-deciding from scratch.
+            # Prime the NEXT object's suction during the return CHAIN, NEVER during
+            # this throw. Catching the next object upstream (+y_b) makes its eta
+            # small, which would otherwise fire the prime mid-throw and RE-GRAB the
+            # object we just released (it'd be carried to the next pick). Clamp to
+            # >= throw end so the prime always lands after the release, on the chain.
+            suction_on_at = max(
+                now + it.eta - self.cfg.SUCTION_LEAD, now + throw_time,
+            )
             self.committed_next = cand
+            self.committed_intercept = it
             self.log.info(
                 f"Chain target: {cand.class_name} at "
-                f"x={float(T_next_grasp[0, 3]):+.3f} (prime in "
-                f"{max(0.0, suction_on_at - now):.2f}s, arrival {eta:.2f}s)"
+                f"x={float(it.T_grasp[0, 3]):+.3f} y={it.intercept_y:+.3f} "
+                f"(prime in {max(0.0, suction_on_at - now):.2f}s, arrival {it.eta:.2f}s)"
             )
-            return next_intercept_joint, suction_on_at
+            return it.grasp_joint, suction_on_at
         return None, None
