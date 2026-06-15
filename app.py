@@ -607,8 +607,11 @@ class GP8App:
         """
         # Drop it from the queue (it stays the active target); the next front
         # object becomes the throw's secondary (post-throw chain target).
-        if obj in self.queue._objects:
-            self.queue._objects.remove(obj)
+        # Remove by IDENTITY, not ==: TrackedObject is a dataclass with numpy
+        # fields, so `obj in list` / `list.remove(obj)` invoke __eq__ → numpy
+        # array truth-value is ambiguous → epoch crash whenever the committed
+        # object isn't the first element compared. Filter by `is` instead.
+        self.queue._objects = [o for o in self.queue._objects if o is not obj]
         secondary = self.queue.head() if self.queue else None
         self._active_target = obj
         self._node.get_logger().info(

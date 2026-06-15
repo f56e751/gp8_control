@@ -36,6 +36,15 @@ THETA_MAP = {
     "metal":       -np.pi * 25.0 / 180.0,
 }
 
+# Throw target bin (base-frame XY, m). The throw HEADING (theta) is computed PER
+# OBJECT as the bearing from that object's grasp to this bin, so the swing re-aims
+# from any grab position — replacing the old fixed per-class THETA_MAP angle, which
+# only matched when grabbing on the y=0 line. Y is downstream-negative (belt -Y).
+# Tune to the measured bin centre. (THETA_MAP is still used by the legacy "moving"
+# strategy in app.py.)
+THROW_BIN_X: float = 1.1
+THROW_BIN_Y: float = -0.25
+
 
 # Per-class throw bin TARGET (absolute base-frame XYZ, m). When a target's
 # class is in this map, T_aim2 is OVERRIDDEN with these coordinates so the
@@ -143,7 +152,13 @@ class ThrowSkill(ManipulationSkill):
             ctx.set_status("IDLE", "")
             return SkillResult(False, "enter_queue_mode (throw) failed")
 
-        theta = THETA_MAP.get(target.class_name, 0.0)
+        # Throw heading = bearing from THIS object's grasp to the fixed bin,
+        # recomputed per object so the swing re-aims from any grab position (the
+        # old fixed per-class THETA_MAP angle only matched a y=0 grasp). theta then
+        # tilts the throw swing toward the bin. See THROW_BIN_X/Y.
+        theta = float(np.arctan2(
+            THROW_BIN_Y - T_grasp[1, 3], THROW_BIN_X - T_grasp[0, 3],
+        ))
 
         # Throw target. If the class has a fixed bin coord in THROW_BIN_TARGET_MAP,
         # override T_aim2 with that absolute base-frame XYZ so the NN aims at the
