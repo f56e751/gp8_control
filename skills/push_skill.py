@@ -567,8 +567,14 @@ class PushSkill(ManipulationSkill):
                 if next_intercept_joint is not None
                 else np.asarray(aim_joint, dtype=float)
             )
-            # Hold the stroke-end wrist angle through the chain (no whip).
-            chain_target[5] = push_end_q[5]
+            # Wrist (joint 6) at the chain end:
+            #  - throw next (next_intercept_joint given): the throw arc starts
+            #    with joint 6 = 0 (ThrowSkill zeroes it), and the committed throw
+            #    uses skip_move so it does NOT re-orient the wrist — so park the
+            #    chain AT 0 here. Holding the push-facing wrist instead makes the
+            #    throw's first segment flip joint 6 -> Yaskawa alarm 4414.
+            #  - else (push->push fallback): hold the stroke-end wrist (no whip).
+            chain_target[5] = 0.0 if next_intercept_joint is not None else push_end_q[5]
             chained_to_next = next_intercept_joint is not None
 
             traj_chain, vel_chain, ts_chain = trajectory(
