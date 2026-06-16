@@ -136,6 +136,20 @@ class Config:
         default_factory=lambda: _env_default("GP8_FORCE_SKILL", "")
     )
 
+    # Per-class skill routing for the ActionSelector (class_name -> skill name).
+    # This is the NORMAL routing used when FORCE_SKILL is empty: cans ("metal")
+    # are PUSHED off the belt, PET bottles ("transparent") are SUCTIONED and
+    # thrown. Any class not listed falls back to the selector's default
+    # ("throw"). FORCE_SKILL still overrides this for single-skill testing.
+    # Edit the values to re-route a class; keys must match the perception's
+    # class_names (metal = can, transparent = PET bottle).
+    SKILL_BY_CLASS: dict = field(
+        default_factory=lambda: {
+            "metal": "push",          # 캔  -> push
+            "transparent": "throw",   # 페트병 -> suction throw
+        }
+    )
+
     GRASP_INTERCEPT_Y: float = -0.1      # belt-frame Y where the arm waits [m]
     # Grasp height [m]: belt-surface contact Z. Manually verified pose was
     # z=0.067 (terminal_debug: EE x=0.508 y=0.000, suction ON); lowered ~5 mm
@@ -387,18 +401,27 @@ class GP8App:
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)
-        # Rule-based for now (always throw); swap this for an RL policy later
-        # to choose push vs throw per object. by_class can override per class.
-        # FORCE_SKILL (env GP8_FORCE_SKILL) pins every object to one skill for
-        # testing; empty -> normal routing.
+        # Rule-based class routing (SKILL_BY_CLASS): cans -> push, PET bottles ->
+        # throw; anything else -> default "throw". Swap this for an RL policy
+        # later by replacing ActionSelector. FORCE_SKILL (env GP8_FORCE_SKILL /
+        # CLI --skill) pins every object to one skill for testing, overriding
+        # the class routing; empty -> normal per-class routing.
         force = self.cfg.FORCE_SKILL or None
         if force is not None:
             self._node.get_logger().warn(
                 f"ActionSelector FORCED to '{force}' skill for ALL objects "
                 f"(GP8_FORCE_SKILL). Disable for normal push/throw routing."
             )
+        else:
+            self._node.get_logger().info(
+                f"ActionSelector per-class routing: {self.cfg.SKILL_BY_CLASS} "
+                f"(default 'throw')"
+            )
         self.selector = ActionSelector(
-            [self.throw_skill, self.push_skill], default="throw", force=force,
+            [self.throw_skill, self.push_skill],
+            default="throw",
+            by_class=self.cfg.SKILL_BY_CLASS,
+            force=force,
         )
 
     def _build_intake(self) -> None:

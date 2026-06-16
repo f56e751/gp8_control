@@ -45,10 +45,12 @@ if TYPE_CHECKING:
 # Push policy (mirrors throw_skill's THETA_MAP / THROW_BIN_TARGET_MAP)
 # =========================================================================
 
-# Classes routed to push instead of throw by the ActionSelector. Objects whose
-# class_name is in this set are handled by PushSkill.can_handle.
+# Classes this skill ACCEPTS (PushSkill.can_handle). The ActionSelector routes
+# by app Config.SKILL_BY_CLASS; this set is the skill's own guard so it refuses
+# anything it shouldn't handle (selector then falls back to throw). Cans
+# ("metal") are pushed; PET bottles ("transparent") are suctioned/thrown, so
+# they are intentionally NOT in this set.
 PUSH_CLASSES: set[str] = {
-    "transparent",
     "metal",
 }
 
