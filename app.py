@@ -143,11 +143,25 @@ class Config:
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
     GRASP_Z: float = 0.062
-    SUCTION_LEAD: float = 0.5           # fire suction this many seconds before arrival [s]
+    # SUCTION_LEAD = 1.0 (throw tuning) won the push/throw merge; push had 0.5.
+    # If push over-primes, split this per-skill instead of re-globalizing.
+    SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
+    # Begin the throw this many seconds BEFORE the object's predicted arrival, so
+    # the throw's queue-mode re-entry (~0.4 s) overlaps the object's final approach
+    # and the lift lands ON arrival instead of trailing it. 0 = wait for full
+    # predicted arrival (old behavior). Default 0.2 tuned on hardware; the limit is
+    # the object's actual arrival (too large -> lift before the object is there).
+    # env-overridable for re-tuning without a rebuild.
+    THROW_START_LEAD: float = field(    # [s] — env GP8_THROW_START_LEAD
+        default_factory=lambda: float(os.environ.get("GP8_THROW_START_LEAD", "0.2"))
+    )
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
-    RELEASE_LEAD: float = 0.0           # [s]
+    # Positive = release earlier; NEGATIVE = release LATER. lead_steps =
+    # round(RELEASE_LEAD * TRAJ_HZ), release_idx = eta_idx - lead_steps, so
+    # -0.1 @ 20 Hz shifts release +2 waypoints (~0.1 s of trajectory time later).
+    RELEASE_LEAD: float = -0.1          # [s]  (negative -> release ~0.1 s later)
 
     # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
     PICK_LOG_CSV: str = field(
@@ -175,24 +189,17 @@ class Config:
     OBJECT_MATCH_EPSILON: float = 0.05
 
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
-    # whose ETA < move_time * factor + lead — i.e. objects that will reach the
-    # intercept before the arm can finish positioning.
-    #
-    # In POINT QUEUE MODE the arm follows the timestamps we hand it, so the
-    # real positioning time ≈ the planned opt_time — NOT half of it. The old
-    # 0.5 ("opt_time over-estimates ~2x") therefore under-counted the move and
-    # let un-catchable heads pass: harmless when ETA is huge (object detected
-    # far away), but it bit hard on the push path, where option A parks the arm
-    # at push_end (bin side, far) so the next head's return-positioning is long
-    # AND its move_time already bundles the descent (aim→grasp). The check then
-    # required only ~half that, committed to objects it couldn't reach in time,
-    # and burned a whole late-push cycle — the perceived "delay". 1.0 makes the
-    # requirement match the real queue-mode move. Lower it to attempt more
-    # marginal catches (risking late commits); raise it to drop sooner.
-    # NOTE: tuned for the push ambush path. The throw ambush positioning is a
-    # single direct move (move_through goes straight to grasp), so when throw is
-    # re-enabled a lower / skill-specific factor may catch more there.
-    PICK_FEASIBILITY_FACTOR: float = 1.0
+    # whose ETA < move_time * factor — i.e. objects that will reach the
+    # intercept before the arm can finish positioning. opt_time is known to
+    # over-estimate the real move (~2x), so this trusts the real move is only
+    # a fraction of the planned one; bump higher (toward 1.0) to be more
+    # conservative (drop sooner) or lower to attempt more borderline catches.
+    # MERGE NOTE: the old push selection gate (factor + SUCTION_LEAD, tuned to
+    # 1.0) is replaced by throw's earliest_reachable_intercept; this factor now
+    # gates the throw chain (scan_next_intercept) + the intercept helper. Push
+    # selection now flows through the dynamic intercept too — validate on push.
+    PICK_FEASIBILITY_FACTOR: float = 1.05
+
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
@@ -275,11 +282,14 @@ class GP8App:
         self.push_skill: PushSkill | None = None
         self.selector: ActionSelector | None = None
 
-        # Drop tracked objects whose extrapolated y has fallen past the
-        # ambush intercept line — those are already past the robot and
-        # uncatchable; the head stays "next-front still in front of the pick".
+        # Coarse drop: only when an object's extrapolated y has fallen below the
+        # WORST-CASE downstream reach edge (-MAX_REACH, the centerline lane). The
+        # precise per-object "still catchable?" test is done by
+        # SkillContext.earliest_reachable_intercept (using the lane-specific -y_b);
+        # this queue prefilter just keeps the head meaningful without prematurely
+        # dropping downstream-but-reachable objects.
         self.queue = TrackedObjectQueue(
-            self.cfg.MAX_REACH, drop_below_y=self.cfg.GRASP_INTERCEPT_Y,
+            self.cfg.MAX_REACH, drop_below_y=-self.cfg.MAX_REACH,
         )
         self.frame_gate = FrameGate(self.cfg.FRAME_COOLDOWN_DISTANCE)
         self.pick_delay = PickDelayTracker(self.cfg.DELAY_EMA_ALPHA)
@@ -514,95 +524,59 @@ class GP8App:
     def _select_ambush_target(
         self, now: float, current_joint: np.ndarray
     ) -> PickRequest | None:
-        """Choose the feasible queue head to intercept at GRASP_INTERCEPT_Y.
+        """Choose the most-downstream catchable object and its EARLIEST intercept.
 
-        Walks the queue from the head, dropping anything we can't actually
-        catch (already past the pick line, out of reach, IK fails, or the
-        object will pass the intercept before the arm finishes positioning).
-        Returns a ``PickRequest`` (target + intercept geometry) for the first
-        feasible head, or ``None`` if no head is catchable this epoch. The
-        selected head is popped and recorded as the active target.
+        Walks the queue from the head (most downstream = most urgent). For each,
+        ``ctx.earliest_reachable_intercept`` returns the dynamic intercept — the
+        earliest belt-Y the arm can grab at (it moves along the belt to meet the
+        object soonest, and will catch it downstream of the old y=0 line if that
+        is where it can still reach it) — or ``None`` when the object can't be
+        caught anywhere in the workspace before it passes the downstream reach
+        edge. ``None`` is the only drop reason. Returns a ``PickRequest`` for the
+        first catchable head, or ``None`` if none is catchable this epoch. The
+        selected head is popped and recorded as the active target. If the prior
+        throw committed a return object, that commitment is honored directly (no
+        re-scan / re-judgment) via ``_committed_pick_request``.
         """
         v = self.conveyor.current
-        intercept_y = self.cfg.GRASP_INTERCEPT_Y
-        zero = np.zeros_like(self.M1)
-        factor = self.cfg.PICK_FEASIBILITY_FACTOR
+        # The object the prior throw's return swing committed to. The chain
+        # ALREADY judged it catchable — once, in scan_next_intercept, gated on
+        # throw_time + move_time — and flew the arm to its grasp. Picking and
+        # throwing that object is ONE committed set, so use it DIRECTLY: no
+        # re-scan, no second feasibility judgment. (Re-judging the same camera
+        # data would only let "catchable" flip to "not" for no real reason.) If
+        # the grab later misses, that's a timing-calibration problem, not a
+        # reason to re-decide the target here.
+        committed = self.ctx.committed_next if self.ctx is not None else None
+        committed_it = self.ctx.committed_intercept if self.ctx is not None else None
+        if self.ctx is not None:
+            self.ctx.committed_next = None
+            self.ctx.committed_intercept = None
+        if committed is not None and committed_it is not None:
+            return self._committed_pick_request(committed, committed_it, current_joint)
 
+        # Walk from the head (most downstream = most urgent). Take the FIRST object
+        # the arm can still catch in its workspace: earliest_reachable_intercept
+        # returns the dynamic intercept (grab at the EARLIEST reachable belt-Y, even
+        # downstream of y=0) or None when the object can't be caught before it passes
+        # the downstream reach edge. None is the ONLY drop reason now.
         target = None
-        target_T_aim = target_T_grasp = None
-        target_aim_joint = target_grasp_joint = None
-        target_obj_y = target_move_time = target_eta = 0.0
-
+        target_it = None
         while self.queue:
             candidate = self.queue.head()
-            obj_y = candidate.T_grasp_base[1, 3] - v * (now - candidate.detect_time)
-
-            # already past the pick line → drop
-            if obj_y <= intercept_y:
+            it = self.ctx.earliest_reachable_intercept(candidate, current_joint, v, now)
+            if it is None:
                 self.queue.pop_head()
                 self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: already past intercept "
-                    f"(y={obj_y:+.3f} <= {intercept_y:+.3f})"
+                    f"Drop {candidate.class_name}: uncatchable in workspace "
+                    f"(out of reach, or passes downstream before the arm arrives)"
                 )
                 continue
-
-            # build intercept pose: detected X, intercept Y, GRASP_Z height
-            T_grasp = candidate.T_grasp_base.copy()
-            T_aim = candidate.T_aim_base.copy()
-            approach_dz = T_aim[2, 3] - T_grasp[2, 3]
-            T_grasp[1, 3] = intercept_y
-            T_aim[1, 3] = intercept_y
-            T_grasp[2, 3] = self.cfg.GRASP_Z
-            T_aim[2, 3] = self.cfg.GRASP_Z + approach_dz
-
-            if np.linalg.norm(T_grasp[:2, 3]) > self.cfg.MAX_REACH:
-                self.queue.pop_head()
-                self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: intercept pose out of reach"
-                )
-                continue
-
-            aim_joint = self.robot.inverse_kinematics(T_aim)
-            grasp_joint = self.robot.inverse_kinematics(T_grasp)
-            if aim_joint is None or grasp_joint is None:
-                self.queue.pop_head()
-                self._node.get_logger().warn(
-                    f"Drop {candidate.class_name}: IK failed"
-                )
-                continue
-            aim_joint = np.asarray(aim_joint, dtype=float); aim_joint[-1] = 0.0
-            grasp_joint = np.asarray(grasp_joint, dtype=float); grasp_joint[-1] = 0.0
-
-            move_time = (
-                opt_time(current_joint, zero, aim_joint, zero, self.M1, self.M2)
-                + opt_time(aim_joint, zero, grasp_joint, zero, self.M1, self.M2)
-            )
-            eta = (obj_y - intercept_y) / (v + 1e-6)
-
-            # Feasibility: the arm must be in place before the object reaches
-            # the intercept, not just by the time it arrives. Drop heads we
-            # can't position in time. In queue mode the move runs over ~the
-            # planned opt_time, so factor ≈ 1.0 (see PICK_FEASIBILITY_FACTOR);
-            # 0.5 used to under-count the move and commit to un-catchable heads.
-            needed = move_time * factor + self.cfg.SUCTION_LEAD
-            if eta < needed:
-                self.queue.pop_head()
-                self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: too late to catch "
-                    f"(eta {eta:.2f}s < move {move_time:.2f}s × {factor:.2f} "
-                    f"+ suction lead {self.cfg.SUCTION_LEAD:.2f}s = {needed:.2f}s)"
-                )
-                continue
-
-            # Feasible — keep this as the target and stop scanning.
-            target = candidate
-            target_T_aim, target_T_grasp = T_aim, T_grasp
-            target_aim_joint, target_grasp_joint = aim_joint, grasp_joint
-            target_obj_y, target_move_time, target_eta = obj_y, move_time, eta
+            target, target_it = candidate, it
             break
 
         if target is None:
-            return None  # no feasible head in the queue this epoch
+            return None  # no catchable head in the queue this epoch
 
         # Commit to the pick.
         secondary = self.queue.peek_next() if self.queue.has_next() else None
@@ -610,19 +584,56 @@ class GP8App:
         # Keep the active target visible in belt_viz while we execute the cycle.
         self._active_target = target
         self._node.get_logger().info(
-            f"Ambush lock: {target.class_name} @ x={target_T_grasp[0, 3]:+.3f} "
-            f"y={intercept_y:.3f} z={target_T_grasp[2, 3]:+.3f} "
-            f"(detected y={target_obj_y:+.3f}; eta {target_eta:.2f}s, "
-            f"move {target_move_time:.2f}s)"
+            f"Ambush lock: {target.class_name} @ x={target_it.T_grasp[0, 3]:+.3f} "
+            f"y={target_it.intercept_y:+.3f} z={target_it.T_grasp[2, 3]:+.3f} "
+            f"(eta {target_it.eta:.2f}s, move {target_it.move_time:.2f}s)"
         )
         return PickRequest(
             target=target,
             current_joint=current_joint,
-            T_aim=target_T_aim,
-            T_grasp=target_T_grasp,
-            aim_joint=target_aim_joint,
-            grasp_joint=target_grasp_joint,
+            T_aim=target_it.T_aim,
+            T_grasp=target_it.T_grasp,
+            aim_joint=target_it.aim_joint,
+            grasp_joint=target_it.grasp_joint,
             secondary=secondary,
+            # Fresh-scan path (no commitment) — always drives.
+            prepositioned=False,
+        )
+
+    def _committed_pick_request(
+        self, obj: TrackedObject, it: "Intercept", current_joint: np.ndarray
+    ) -> PickRequest:
+        """Build the PickRequest for the throw's committed return object directly,
+        REUSING the intercept ``scan_next_intercept`` already computed for it.
+
+        The catchable judgment + dynamic intercept Y were decided ONCE at commit
+        time and the return swing parked the arm at ``it.grasp_joint``; we reuse
+        ``it`` verbatim — no re-scan, no re-judgment, no recompute, so the parked
+        pose and the pick pose are identical. ``prepositioned=True`` so the pick
+        skips the re-drive / mode-stop.
+        """
+        # Drop it from the queue (it stays the active target); the next front
+        # object becomes the throw's secondary (post-throw chain target).
+        # Remove by IDENTITY, not ==: TrackedObject is a dataclass with numpy
+        # fields, so `obj in list` / `list.remove(obj)` invoke __eq__ → numpy
+        # array truth-value is ambiguous → epoch crash whenever the committed
+        # object isn't the first element compared. Filter by `is` instead.
+        self.queue._objects = [o for o in self.queue._objects if o is not obj]
+        secondary = self.queue.head() if self.queue else None
+        self._active_target = obj
+        self._node.get_logger().info(
+            f"Committed pick: {obj.class_name} @ x={float(it.T_grasp[0, 3]):+.3f} "
+            f"y={it.intercept_y:+.3f} (prepositioned; reusing chain's judgment)"
+        )
+        return PickRequest(
+            target=obj,
+            current_joint=current_joint,
+            T_aim=it.T_aim,
+            T_grasp=it.T_grasp,
+            aim_joint=it.aim_joint,
+            grasp_joint=it.grasp_joint,
+            secondary=secondary,
+            prepositioned=True,
         )
 
     # ------------------------------------------------------------------
@@ -721,13 +732,16 @@ class GP8App:
         detect_time = float(snap.get("receipt_time", time.time()))
         v = self.conveyor.current
 
-        # Spatial dedup: each camera frame re-detects every visible object,
-        # so without this the queue fills with duplicates of the same physical
-        # object. Project every existing tracked object (the active pick
-        # target plus everything in the queue) forward to ``detect_time`` and
-        # skip any new detection that lands within OBJECT_MATCH_EPSILON of
-        # one. This is the "spatial association" replacement for the old
-        # FrameGate cooldown.
+        # Spatial dedup: each camera frame re-detects every visible object (the
+        # camera emits no per-object identity), so without this the queue fills
+        # with duplicates of the same physical object. Project every existing
+        # tracked object (active target + queue) forward to ``detect_time``; a new
+        # detection within OBJECT_MATCH_EPSILON of one is the SAME object → instead
+        # of adding it, RE-ANCHOR that track to the fresh detection (resets the
+        # belt-extrapolation reference each frame so drift can't accumulate past
+        # EPSILON and spawn a phantom duplicate). Only a genuinely-new position
+        # becomes a new object. Class-independent: once a spot has an object, any
+        # re-detection there is treated as that same one.
         existing: list[TrackedObject] = []
         if self._active_target is not None:
             existing.append(self._active_target)
@@ -740,13 +754,25 @@ class GP8App:
             return abs(ox - det_x) < eps and abs(oy - det_y) < eps
 
         added = 0
+        refreshed = 0
         for d in detections:
             base_aim = d.get("base_aim", [0.0, 0.0, 0.0])
             base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
             det_x = float(base_grasp[0])
             det_y = float(base_grasp[1])
-            if any(_matches(o, det_x, det_y) for o in existing):
-                continue  # already tracking this physical object
+            match = next((o for o in existing if _matches(o, det_x, det_y)), None)
+            if match is not None:
+                # Same physical object re-detected → RE-ANCHOR the existing track
+                # to this fresh detection instead of adding a duplicate. Resetting
+                # the extrapolation reference (detect_time + pose) every frame keeps
+                # drift below EPSILON so a 2nd "object" never spawns at the same
+                # spot. One physical object stays ONE track. Class kept as-is.
+                match.T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
+                match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
+                match.detect_time = detect_time
+                match.cam_pos = tuple(d.get("cam", [0.0, 0.0, 0.0]))
+                refreshed += 1
+                continue
             T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
             T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
             new_obj = TrackedObject(
@@ -763,8 +789,8 @@ class GP8App:
         if added > 0:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
             self._node.get_logger().info(
-                f"New frame — {added} new object(s) added (queue size: "
-                f"{len(self.queue._objects)}, belt {v:.3f} m/s)"
+                f"New frame — {added} new object(s) added, {refreshed} re-anchored "
+                f"(queue size: {len(self.queue._objects)}, belt {v:.3f} m/s)"
             )
 
     def _on_camera_debug_detections(self, msg: String) -> None:
@@ -797,6 +823,21 @@ class GP8App:
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    def _release_orphan_suction(self) -> None:
+        """Release a return-primed suction that no pick will consume this epoch.
+
+        The throw's return (chain) primes the NEXT pick's vacuum speculatively;
+        only that pick's throw release turns it off. If the pick does not happen
+        (object passed during the throw, queue drained, none feasible), the
+        vacuum would otherwise run indefinitely — turn it off here.
+        """
+        if self.ctx is not None and self.ctx.suction_primed_for_pick:
+            self._node.get_logger().info(
+                "No pick this epoch — releasing orphaned primed suction."
+            )
+            self.traj_ctrl.suction_off()
+            self.ctx.suction_primed_for_pick = False
+
     def run_epoch(self, epoch: int) -> None:
         # Pump ROS callbacks so joint_states and conveyor speed stay fresh.
         # Previously DetectionIntake.poll() spun every epoch; with the HTTP
@@ -819,6 +860,7 @@ class GP8App:
         self.queue.update(now, self.conveyor.current)
         if not self.queue:
             self.frame_gate.reset()
+            self._release_orphan_suction()
             time.sleep(self.cfg.TIME_STEP)
             return
 
@@ -828,6 +870,10 @@ class GP8App:
                 # Decide push vs throw (rule-based today; RL later) and run it.
                 skill = self.selector.select(request)
                 skill.execute(request)
+            else:
+                # No feasible pick this epoch — don't leave a return-primed
+                # vacuum running with nothing to turn it off.
+                self._release_orphan_suction()
             return
 
         # Capture the secondary throw target *before* lock_or_drop_head

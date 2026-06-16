@@ -49,6 +49,7 @@ class TrajectoryController:
         self._node = node
         self.current_joints: list | None = None
         self.current_jointvels: list | None = None
+        self._jmon = None   # [QMODE-DBG] (min,max) joint tracker during a mode switch
 
         cb_group = ReentrantCallbackGroup()
 
@@ -119,6 +120,17 @@ class TrajectoryController:
     def _joint_state_cb(self, msg: JointState) -> None:
         self.current_joints = list(msg.position)
         self.current_jointvels = list(msg.velocity)
+        # [QMODE-DBG] track joint excursion during a mode switch (catches a
+        # transient up-down bobble even when the net move is ~0).
+        jmon = self._jmon
+        if jmon is not None:
+            lo, hi = jmon
+            for i, p in enumerate(self.current_joints):
+                if i < len(lo):
+                    if p < lo[i]:
+                        lo[i] = p
+                    if p > hi[i]:
+                        hi[i] = p
 
     # ------------------------------------------------------------------
     # Trajectory execution
@@ -239,12 +251,25 @@ class TrajectoryController:
 
     def _try_start_queue_mode(self):
         """One stop+start attempt; returns the service result (None on timeout)."""
+        # [QMODE-DBG] watch whether the stop+start physically moves the arm.
+        j0 = list(self.current_joints) if self.current_joints else None
+        self._jmon = ([float(x) for x in j0], [float(x) for x in j0]) if j0 else None
+        t0 = time.time()
         self._stop_current_mode()
         if not self._start_queue_client.wait_for_service(timeout_sec=5.0):
             self._node.get_logger().error("/start_point_queue_mode unavailable.")
+            self._jmon = None
             return None
         fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
         rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        if self._jmon is not None and j0 is not None:
+            lo, hi = self._jmon
+            exc = [round(hi[i] - lo[i], 4) for i in range(len(lo))]
+            self._node.get_logger().info(
+                f"[QMODE-DBG] mode switch {(time.time() - t0) * 1000:.0f}ms; "
+                f"joint excursion (max-min) = {exc} rad"
+            )
+        self._jmon = None
         return fut.result()
 
     def _reset_error(self) -> bool:
@@ -404,6 +429,7 @@ class TrajectoryController:
         timestep: np.ndarray,
         final_joint: np.ndarray,
         release_index: int,
+        suction_on_at: float | None = None,
     ) -> bool:
         """Queue Mode + suction_off interleaved into the point-push.
 
@@ -413,11 +439,17 @@ class TrajectoryController:
         full swing duration, so suction_off landed at the end. The point-queue
         and IO are independent services, so inserting the IO command mid-push
         is safe (no collision/drop).
+
+        ``suction_on_at`` (wall-clock, optional): once the release has fired and
+        this instant passes, fire suction_ON ONCE — to PRIME THE NEXT pick's
+        vacuum during this throw's return (chain) move, so a back-to-back object
+        keeps its full lead. Only fires after the release (never while still
+        holding the thrown object). Returns True iff that next-suction fired.
         """
         waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
         total_duration = waypoints[-1][2]
 
-        state = {"fired": False}
+        state = {"fired": False, "primed_next": False}
         t_start = time.time()
         self.last_throw = {
             "throw_start": t_start,
@@ -439,16 +471,76 @@ class TrajectoryController:
                 f"(IO round-trip {io_ms:.0f} ms)"
             )
 
+        def _prime_next() -> None:
+            # Prime the NEXT pick's vacuum, but only AFTER this object's release
+            # (don't suck while still holding/releasing the thrown object).
+            if (suction_on_at is not None and state["fired"]
+                    and not state["primed_next"] and time.time() >= suction_on_at):
+                self.suction_on()
+                state["primed_next"] = True
+                self._node.get_logger().info(
+                    "Return-prime: suction_on for next pick during chain move."
+                )
+
         if not self._push_waypoints(
-            waypoints, release_index=release_index, release_fn=_release
+            waypoints, release_index=release_index, release_fn=_release,
+            between_fn=_prime_next,
         ):
-            return False
+            return state["primed_next"]
         if not state["fired"]:
             # release_index beyond the pushed points — fire now as a fallback.
             _release()
 
-        self._wait_trajectory_end(total_duration, t_start=t_start)
-        return True
+        # Finish the move, still watching the next-pick suction deadline.
+        t_end = t_start + total_duration + 0.1
+        while time.time() < t_end:
+            rclpy.spin_once(self._node, timeout_sec=0.05)
+            _prime_next()
+        _prime_next()
+        # Settle: wait for the arm to ACTUALLY reach the final pose, not just the
+        # time estimate. The BUSY-throttled push delays execution, so the loop
+        # above can return while the arm is still finishing the return (chain)
+        # move; the NEXT cycle's mode stop would then chop that still-moving arm
+        # (the observed bobble). Waiting here means the next cycle starts from a
+        # stopped arm.
+        self._wait_for_position(final_joint, tolerance=0.03, timeout_sec=1.5)
+        return state["primed_next"]
+
+    def send_trajectory_queue_timed_suction(
+        self,
+        traj: np.ndarray,
+        vel: np.ndarray,
+        timestep: np.ndarray,
+        final_joint: np.ndarray,
+        suction_on_at: float,
+    ) -> bool:
+        """Queue-mode move that fires suction_on ONCE at wall-clock ``suction_on_at``.
+
+        The deadline is checked during BOTH the point-push and the end-wait, so
+        the vacuum is primed on time even while the arm is still positioning
+        (priming early is harmless for a suction gripper). Used for the ambush
+        pre-position: guarantees the full SUCTION_LEAD before object arrival
+        regardless of how long positioning takes. Returns True iff suction was
+        fired before returning (i.e. ``suction_on_at`` had already passed)."""
+        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
+        total_duration = waypoints[-1][2]
+        state = {"fired": False}
+
+        def _fire() -> None:
+            if not state["fired"] and time.time() >= suction_on_at:
+                self.suction_on()
+                state["fired"] = True
+
+        t_start = time.time()
+        if not self._push_waypoints(waypoints, between_fn=_fire):
+            return state["fired"]
+        # Finish the move, still watching the suction deadline.
+        t_end = t_start + total_duration + 0.1
+        while time.time() < t_end:
+            rclpy.spin_once(self._node, timeout_sec=0.02)
+            _fire()
+        _fire()
+        return state["fired"]
 
     def _build_queue_waypoints(
         self,
@@ -491,6 +583,7 @@ class TrajectoryController:
         busy_max_retry: int = 5,
         release_index: int | None = None,
         release_fn=None,
+        between_fn=None,
     ) -> bool:
         """waypoint를 /motoman_gp8_controller/queue_traj_point로 순차 push.
 
@@ -541,6 +634,11 @@ class TrajectoryController:
             if release_fn is not None and release_index is not None and i >= release_index:
                 release_fn()
                 release_fn = None  # fire once
+
+            # Generic per-point hook: e.g. fire an early suction_on the instant
+            # its wall-clock deadline passes, mid-push if needed.
+            if between_fn is not None:
+                between_fn()
 
         if busy_total > 0:
             # BUSY는 push가 MotoROS2 수신 속도보다 빠를 때 발생하는 정상 신호.

@@ -30,10 +30,13 @@ class TrackedObject:
 class TrackedObjectQueue:
     def __init__(self, max_reach: float, drop_below_y: float = 0.0) -> None:
         self._max_reach = max_reach
-        # Objects whose current y has fallen below this line are considered
-        # past the pick point and dropped from the queue (so the head is
-        # always "next-front not yet past the robot"). Default 0.0 matches
-        # the ambush intercept_y.
+        # COARSE drop line: objects whose current y has fallen below this are
+        # past the workspace and removed (keeps the head meaningful). Callers pass
+        # the worst-case downstream reach edge (-max_reach); the PRECISE per-object
+        # "still catchable?" test (lane-specific -y_b, plus arm timing) lives in
+        # SkillContext.earliest_reachable_intercept, NOT here — so this must stay
+        # coarse and must NOT be the old fixed intercept line, or it would drop
+        # downstream-but-still-reachable objects.
         self._drop_below_y = drop_below_y
         self._objects: list[TrackedObject] = []
 
