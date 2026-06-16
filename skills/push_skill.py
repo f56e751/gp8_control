@@ -263,8 +263,13 @@ class PushSkill(ManipulationSkill):
         ctx.move_through_via(current_joint, aim_joint, grasp_retreat_joint)
 
         # ---- 2. WAITING: block until the object arrives ----
+        # Use the SAME arrival lead as throw (THROW_START_LEAD): it only needs to
+        # cover queue-mode re-entry so the stroke lands ON arrival. FIXED_DELAY_PUSH
+        # (0.8) was stale — it used to also cover the descent, but the descent now
+        # runs during POSITIONING (append_descent=False), so 0.8 fired the stroke
+        # ~0.6 s too early and missed. Match throw, no separate push delay.
         ctx.set_status("WAITING", target.class_name)
-        ctx.wait_for_arrival(target, T_grasp[1, 3], offset = FIXED_DELAY_PUSH)
+        ctx.wait_for_arrival(target, T_grasp[1, 3], offset=ctx.cfg.THROW_START_LEAD)
 
         # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
         ctx.set_status("PUSHING", target.class_name)
