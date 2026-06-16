@@ -398,6 +398,9 @@ class GP8App:
             publish_state=self._publish_belt_state,
             set_status=self._set_status,
             set_active_target=self._set_active_target,
+            # Deferred: self.selector is built just below; the lambda is only
+            # called at run time (after setup), by which point it is set.
+            skill_for=lambda obj: self.selector.skill_for(obj),
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)

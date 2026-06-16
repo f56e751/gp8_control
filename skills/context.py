@@ -101,6 +101,9 @@ class SkillContext:
     publish_state: Callable[[], None]
     set_status: Callable[[str, str], None]
     set_active_target: Callable[["Optional[TrackedObject]"], None]
+    # Skill NAME that will handle a given object (wired to ActionSelector.skill_for).
+    # Lets the chain pre-position the NEXT object with the skill that will run it.
+    skill_for: Callable[["TrackedObject"], str]
     # Set True by the prior throw's return (chain) when it already primed the
     # NEXT pick's suction (vacuum ON). The upcoming pick then must NOT re-prime
     # or clear it; it is reset to False once that pick consumes it.
@@ -462,6 +465,17 @@ class SkillContext:
                     f"({throw_time:.2f}s) + move"
                 )
                 continue
+            if self.skill_for(cand) != "throw":
+                # Immediate next object routes to a DIFFERENT skill (e.g. a can ->
+                # push). Do NOT pre-position/commit it here — this chain only parks
+                # at a THROW grasp (where the committed pick then primes suction at
+                # the grasp). A non-throw next does its OWN skill's approach fresh
+                # next cycle. Keeps "approach + manipulate" one set per skill.
+                self.log.info(
+                    f"Chain stop: next {cand.class_name} routes to "
+                    f"'{self.skill_for(cand)}', not throw — no throw pre-position"
+                )
+                return None, None
             # Prime the NEXT object's suction during the return CHAIN, NEVER during
             # this throw. Catching the next object upstream (+y_b) makes its eta
             # small, which would otherwise fire the prime mid-throw and RE-GRAB the

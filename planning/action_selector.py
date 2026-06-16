@@ -52,13 +52,23 @@ class ActionSelector:
         self.by_class = dict(by_class or {})
         self.force = force
 
-    def select(self, request: "PickRequest") -> "ManipulationSkill":
-        """Return the skill that should handle ``request.target``."""
+    def skill_for(self, target) -> str:
+        """Skill NAME that will handle ``target`` (force > by_class > default,
+        with a can_handle fallback to default).
+
+        Exposed so the chaining logic can pre-position the NEXT object with the
+        SAME skill that will actually run it — keeping "approach + manipulate"
+        one set per skill.
+        """
         # Testing override: pin to one skill, ignoring routing and can_handle.
         if self.force is not None:
-            return self.skills[self.force]
-        name = self.by_class.get(request.target.class_name, self.default)
+            return self.force
+        name = self.by_class.get(target.class_name, self.default)
         skill = self.skills.get(name)
-        if skill is None or not skill.can_handle(request.target):
-            skill = self.skills[self.default]
-        return skill
+        if skill is None or not skill.can_handle(target):
+            name = self.default
+        return name
+
+    def select(self, request: "PickRequest") -> "ManipulationSkill":
+        """Return the skill that should handle ``request.target``."""
+        return self.skills[self.skill_for(request.target)]

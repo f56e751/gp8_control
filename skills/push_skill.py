@@ -278,16 +278,27 @@ class PushSkill(ManipulationSkill):
         # Per-class stroke distance (falls back to PUSH_DISTANCE).
         push_distance = PUSH_DISTANCE_MAP.get(target.class_name, PUSH_DISTANCE)
 
+        # Chain: pre-position the NEXT object ONLY when it is a THROW pick.
+        # scan_next_intercept returns (grasp_joint, _) and commits the object iff
+        # the next routes to throw; a push/none next -> (None, None) (it does its
+        # OWN push approach fresh next cycle). When throw-next, the stroke chains
+        # straight to that grasp and the committed throw primes suction THERE next
+        # cycle — so a throw after a push no longer cold-starts from push_end and
+        # fires suction mid-transit ("suction at the floor"). push_time is a rough
+        # stroke-duration estimate for the chain's feasibility gate.
+        push_time = push_distance / PUSH_SPEED
+        next_intercept_joint, _ = ctx.scan_next_intercept(grasp_retreat_joint, push_time)
+
         # Build & dispatch: STROKE ONLY (append_descent=False) — the arm already
-        # descended to grasp_retreat during POSITIONING and waited there, so the
-        # descent segment is skipped and only the stroke runs now. Ends at
-        # push_end (no chain); the next cycle's POSITIONING flows from push_end
-        # toward the next pick, giving inter-pick flow without the chain's
-        # blocking wait (the chain can't run async: MotoROS2 needs the queue to
-        # drain before queue-mode re-entry).
+        # descended to grasp_retreat during POSITIONING and waited there. Append a
+        # chain to the next throw grasp when there is one (one queued trajectory,
+        # same as ThrowSkill); else end at push_end and the next cycle approaches
+        # fresh.
         self.build_push_trajectory(
             grasp_retreat_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
-            append_chain=False, append_descent=False, push_distance=push_distance,
+            next_intercept_joint=next_intercept_joint,
+            append_chain=next_intercept_joint is not None,
+            append_descent=False, push_distance=push_distance,
         )
 
         # ---- 4. Cleanup ----
