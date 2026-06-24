@@ -25,10 +25,8 @@ from rclpy.executors import MultiThreadedExecutor
 
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.perception.stream_detection_source import StreamDetectionSource
-from gp8_control.perception.conveyor_speed import ConveyorSpeedTracker
+from gp8_control.conveyor import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
-from gp8_control.perception import extrinsics as _extrinsics
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
 from gp8_control.tracking import (
@@ -47,15 +45,6 @@ from gp8_control.skills import (
     PickRequest,
     ThrowSkill,
     PushSkill,
-)
-
-
-# Tool orientation used to assemble grasp/aim 4x4 from the corrected base
-# position published by the camera_debug node (which owns the camera→base
-# transform, Z offsets, and v*delay back-projection). Must match the value
-# camera_debug uses (kept identical to the legacy DetectionIntake default).
-_R_GRASP_DEFAULT = np.array(
-    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
 )
 
 
@@ -80,14 +69,6 @@ def _env_default(key: str, default: str) -> str:
 class Config:
     # Network
     ROBOT_IP: str = "192.168.255.1"
-    # Perception is consumed from the camera PC's HTTP NDJSON stream
-    # (see perception/perception_client.py for the wire contract).
-    PERCEPTION_URL: str = field(
-        default_factory=lambda: _env_default(
-            "GP8_PERCEPTION_URL", "http://147.46.175.15:8080/detections/stream"
-        )
-    )
-    PERCEPTION_RECONNECT_DELAY: float = 2.0
 
     # Workspace
     MAX_REACH: float = 0.65
@@ -95,10 +76,6 @@ class Config:
     CONVEYOR_TOPIC: str = "/conveyor/speed"
     CONVEYOR_STALE_SECONDS: float = 2.0
     TARGET_DISTANCE: float = 1.2
-
-    # Detection (Z offsets shared with camera_debug via perception.extrinsics)
-    DETECTION_OFFSET_AIM: float = _extrinsics.DETECTION_OFFSET_AIM
-    DETECTION_OFFSET_GRASP: float = _extrinsics.DETECTION_OFFSET_GRASP
 
     # Fixed lead (s) folded into the throw-landing projection so the aim
     # accounts for belt travel during the swing (planner.plan_throw_landing).
@@ -213,14 +190,6 @@ class Config:
     ]))
     INITIAL_T: np.ndarray = field(default_factory=lambda: np.array([[0.4], [0.0], [0.1]]))
 
-    # Fixed extrinsics (shared with camera_debug via perception.extrinsics)
-    T_ROBOT2BASE: np.ndarray = field(
-        default_factory=lambda: _extrinsics.T_ROBOT2BASE.copy()
-    )
-    T_BASE2CAM: np.ndarray = field(
-        default_factory=lambda: _extrinsics.T_BASE2CAM.copy()
-    )
-
     def throw_decoding(self) -> ThrowDecodingConfig:
         return ThrowDecodingConfig(
             throw_time_scale=self.THROW_TIME_SCALE,
@@ -264,9 +233,7 @@ class GP8App:
         self._executor: MultiThreadedExecutor | None = None
         self.traj_ctrl: TrajectoryController | None = None
         self.moveit_ctrl: MoveItController | None = None
-        self.detection_source: StreamDetectionSource | None = None
         self.conveyor: ConveyorSpeedTracker | None = None
-        self.intake: DetectionIntake | None = None
 
         self.M1: np.ndarray | None = None
         self.M2: np.ndarray | None = None
@@ -290,6 +257,7 @@ class GP8App:
             self.cfg.MAX_REACH, drop_below_y=-self.cfg.MAX_REACH,
         )
         self.frame_gate = FrameGate(self.cfg.FRAME_COOLDOWN_DISTANCE)
+        self.detection_intake = DetectionIntake(self.cfg.OBJECT_MATCH_EPSILON)
 
     # ------------------------------------------------------------------
     # Setup
@@ -377,7 +345,7 @@ class GP8App:
             queue=self.queue,
             M1=self.M1,
             M2=self.M2,
-            intake=self._intake_new_detections,
+            intake=self._ingest_detections,
             publish_state=self._publish_belt_state,
             set_status=self._set_status,
             set_active_target=self._set_active_target,
@@ -408,21 +376,6 @@ class GP8App:
             default="throw",
             by_class=self.cfg.SKILL_BY_CLASS,
             force=force,
-        )
-
-    def _build_intake(self) -> None:
-        # node=None: the stream source is fed by its own background thread,
-        # so poll() reads the latest snapshot without pumping ROS callbacks.
-        self.intake = DetectionIntake(
-            node=None,
-            sam_client=self.detection_source,
-            T_robot2base=self.cfg.T_ROBOT2BASE,
-            T_base2cam=self.cfg.T_BASE2CAM.copy(),
-            offset_aim=self.cfg.DETECTION_OFFSET_AIM,
-            offset_grasp=self.cfg.DETECTION_OFFSET_GRASP,
-            time_step=self.cfg.TIME_STEP,
-            logger=self._node.get_logger(),
-            log_raw=False,   # raw cam positions go to belt_viz, not the bringup log
         )
 
     def _enable_robot(self) -> None:
@@ -657,101 +610,19 @@ class GP8App:
     # ------------------------------------------------------------------
     # Epoch stages
     # ------------------------------------------------------------------
-    def _intake_new_detections(self, now: float) -> None:
-        """Stage 1: poll SAM (subject to frame-gate cooldown).
+    def _ingest_detections(self, now: float) -> None:
+        """Fold the latest camera_debug snapshot into the queue (spatial dedup).
 
-        TODO(duplicate-detection): SAM does not emit object identity, so
-        successive frames re-detect the same physical object as new
-        TrackedObjects → robot picks the same item multiple times. The
-        current ``FrameGate`` is a coarse time-based workaround that caps
-        total throughput (1 poll per cooldown_distance/belt_speed seconds)
-        and cannot distinguish "same object" from "new object at similar
-        position". Better fixes, in order of preference:
-          1. Spatial association at intake — match new detection to
-             existing TrackedObject within ε of its conveyor-compensated
-             position; merge instead of adding. Cheap (~15 LOC), removes
-             cooldown, enables EMA pose refinement as a bonus.
-          2. Persistence threshold — require N consecutive frames before
-             locking; combine with (1) for noise rejection.
-          3. **SAM server change** — add per-track identity (ReID feature
-             or tracking ID) to the detection output. May be the cleanest
-             long-term fix; needs upstream cooperation since this client
-             only consumes positions/class_names.
+        Thin wrapper around ``DetectionIntake.ingest`` (perception/): the
+        detection→queue association lives there; the app keeps only the
+        frame-gate bookkeeping keyed on whether anything new was added.
         """
-        snap = self._cam_latest
-        if snap is None:
-            return  # waiting for the first /camera_debug/detections message
-        detections = [d for d in snap.get("detections", []) if d.get("in_workspace")]
-        if not detections:
-            return
-
-        # camera_debug already applied the camera→base transform, Z offsets,
-        # and v*delay back-projection. ``receipt_time`` is the moment for
-        # which the corrected positions are valid; the queue extrapolates
-        # forward from there.
-        detect_time = float(snap.get("receipt_time", time.time()))
-        v = self.conveyor.current
-
-        # Spatial dedup: each camera frame re-detects every visible object (the
-        # camera emits no per-object identity), so without this the queue fills
-        # with duplicates of the same physical object. Project every existing
-        # tracked object (active target + queue) forward to ``detect_time``; a new
-        # detection within OBJECT_MATCH_EPSILON of one is the SAME object → instead
-        # of adding it, RE-ANCHOR that track to the fresh detection (resets the
-        # belt-extrapolation reference each frame so drift can't accumulate past
-        # EPSILON and spawn a phantom duplicate). Only a genuinely-new position
-        # becomes a new object. Class-independent: once a spot has an object, any
-        # re-detection there is treated as that same one.
-        existing: list[TrackedObject] = []
-        if self._active_target is not None:
-            existing.append(self._active_target)
-        existing.extend(self.queue._objects)
-        eps = self.cfg.OBJECT_MATCH_EPSILON
-
-        def _matches(obj: TrackedObject, det_x: float, det_y: float) -> bool:
-            ox = float(obj.T_grasp_base[0, 3])
-            oy = float(obj.T_grasp_base[1, 3] - v * (detect_time - obj.detect_time))
-            return abs(ox - det_x) < eps and abs(oy - det_y) < eps
-
-        added = 0
-        refreshed = 0
-        for d in detections:
-            base_aim = d.get("base_aim", [0.0, 0.0, 0.0])
-            base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
-            det_x = float(base_grasp[0])
-            det_y = float(base_grasp[1])
-            match = next((o for o in existing if _matches(o, det_x, det_y)), None)
-            if match is not None:
-                # Same physical object re-detected → RE-ANCHOR the existing track
-                # to this fresh detection instead of adding a duplicate. Resetting
-                # the extrapolation reference (detect_time + pose) every frame keeps
-                # drift below EPSILON so a 2nd "object" never spawns at the same
-                # spot. One physical object stays ONE track. Class kept as-is.
-                match.T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
-                match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
-                match.detect_time = detect_time
-                match.cam_pos = tuple(d.get("cam", [0.0, 0.0, 0.0]))
-                refreshed += 1
-                continue
-            T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
-            T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
-            new_obj = TrackedObject(
-                T_aim_base=T_aim_base,
-                T_grasp_base=T_grasp_base,
-                class_name=d.get("class", "?"),
-                detect_time=detect_time,
-                cam_pos=tuple(d.get("cam", [0.0, 0.0, 0.0])),
-            )
-            self.queue.add(new_obj)
-            existing.append(new_obj)  # dedupe within the same intake too
-            added += 1
-
-        if added > 0:
+        added = self.detection_intake.ingest(
+            self._cam_latest, self.queue, self._active_target,
+            self.conveyor.current, self._node.get_logger(),
+        )
+        if added:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
-            self._node.get_logger().info(
-                f"New frame — {added} new object(s) added, {refreshed} re-anchored "
-                f"(queue size: {len(self.queue._objects)}, belt {v:.3f} m/s)"
-            )
 
     def _on_camera_debug_detections(self, msg: String) -> None:
         try:
@@ -795,7 +666,7 @@ class GP8App:
         self.conveyor.check_freshness()
         self._publish_belt_state()                # live belt + queue snapshot
 
-        self._intake_new_detections(now)
+        self._ingest_detections(now)
         self.queue.update(now, self.conveyor.current)
         if not self.queue:
             self.frame_gate.reset()

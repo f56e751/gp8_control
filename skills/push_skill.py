@@ -732,7 +732,8 @@ class PushSkill(ManipulationSkill):
     def _facing_joint6(push_dir: np.ndarray) -> float:
         """Joint-6 angle that points the TCP straight along ``push_dir``.
 
-        In the default grasp orientation (``_R_GRASP_DEFAULT`` in app.py) the
+        In the default grasp orientation (``_R_GRASP_DEFAULT`` in
+        perception/detection_intake.py) the
         tool's facing axis is base **+X**, and the wrist is "facing forward"
         when joint 6 == ``PUSH_JOINT6_ANGLE`` (NOT 0). Rotating the push
         direction away from +X by ``yaw`` (its angle in the XY belt plane)

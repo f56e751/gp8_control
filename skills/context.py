@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from gp8_control.robots.gp8 import GP8
     from gp8_control.controllers.trajectory_controller import TrajectoryController
     from gp8_control.planning import PickThrowPlanner
-    from gp8_control.perception.conveyor_speed import ConveyorSpeedTracker
+    from gp8_control.conveyor import ConveyorSpeedTracker
     from gp8_control.tracking import TrackedObject, TrackedObjectQueue
 
 
