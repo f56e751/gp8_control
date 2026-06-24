@@ -26,6 +26,7 @@ the RL training stack.
 | `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, `gp8_manager`. **Does NOT start `camera_debug`** — run that separately. |
 | `launch/sim_bringup.launch.py` | Software-in-the-loop sim — `mock_robot` + `fake_belt` + RSP + MoveIt + RViz + the app (no hardware). |
 | `launch/debug_robot.launch.py` | Minimal bringup (bridge + TF + MoveIt) for interactive scripts. |
+| `belt_viz.py` | TUI rendering the live belt — every tracked object (`●`), the active target (`◉`), and app status — from `/gp8_manager/tracked_state` (published by `app.py`). Works in real or sim. |
 | `terminal_debug.py` | 키보드 기반 EE jog / 회전 / home / 석션 / Queue Mode sweep / FJT mismatch 테스트 도구. |
 | `tests/queue_test.py` | TrajectoryController Queue 메서드 3가지 시나리오 분리 검증. |
 | `tests/queue_test_throw.py` | torch NN throw trajectory + pick→throw 연속 테스트. |
@@ -181,6 +182,34 @@ If the encoder node is *not* running, `gp8_manager` falls back to
 `Config.CONVEYOR_SPEED` (hardcoded) and logs a warning — picking still
 works but is less accurate when the belt speed drifts.
 
+**확인 / 가짜 발행 (디버그):**
+
+```bash
+ros2 topic echo /conveyor/speed      # 값 흐름 확인
+ros2 topic hz   /conveyor/speed      # 발행 주기 확인
+# 인코더 없이 가짜 속도로 테스트 (camera_debug/app 단독 점검):
+ros2 topic pub /conveyor/speed std_msgs/msg/Float64 "{data: 0.12}" -r 10
+```
+
+> 시뮬(`sim_bringup`)에서는 `fake_belt` 가 `/conveyor/speed` 를 직접 발행하므로
+> 인코더도 위 가짜 pub 도 필요 없습니다.
+
+### `belt_viz` — 벨트 상태 시각화 (실행 중인 gp8_manager 모니터)
+
+`gp8_manager` 가 발행하는 `/gp8_manager/tracked_state` 를 구독해 벨트를 ASCII
+스트립으로 실시간 렌더링합니다 — **무엇이 잡혔는지** 한눈에 봅니다: 추적 물체
+(`●`), 현재 잡는 타깃(`◉`), max reach / pick 지점, 상태
+(`IDLE`/`POSITIONING`/`WAITING`/`THROWING`/`PUSHING`), 벨트 속도. 메시지 사이에도
+belt 속도로 외삽돼 부드럽게 흐릅니다.
+
+```bash
+ros2 run gp8_control belt_viz
+```
+
+- **`app.py`(gp8_manager)가 떠 있어야** 보입니다 (그 노드가 토픽을 발행). 실로봇·
+  시뮬(`sim_bringup`) **둘 다** 동작.
+- TUI 라 **SSH 로 그대로** 보입니다 (GUI/RViz 불필요).
+
 ### micro-ROS Agent (once per boot)
 
 Needed to bridge MotoROS2 ↔ ROS 2. Without it, `/write_single_io` /
@@ -285,6 +314,7 @@ PICK_APPROACH_OFFSET = (-0.2, 0, 0) # pick approach (dx, dy, dz) in meters
 | pick↔throw 연속 끊김 측정 | `queue_test_throw` → `p` |
 | 전체 pipeline 통합 (실로봇) | `gp8_bringup.launch.py` + `camera_debug` (+ encoder) |
 | 전체 pipeline 시뮬 (무하드웨어) | `sim_bringup.launch.py` + `belt_viz` |
+| 벨트 위 물체/타깃/상태 보기 | `belt_viz` (실로봇·시뮬 공통) |
 
 ## Simulation (SIL — no hardware)
 
