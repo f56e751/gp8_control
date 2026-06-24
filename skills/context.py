@@ -104,6 +104,13 @@ class SkillContext:
     # Skill NAME that will handle a given object (wired to ActionSelector.skill_for).
     # Lets the chain pre-position the NEXT object with the skill that will run it.
     skill_for: Callable[["TrackedObject"], str]
+    # Default standby pose (6-DOF joint vector, wrist/j6 = 0) the post-action
+    # chain returns to when there is NO next object to pre-position. Computed once
+    # in GP8App._build_skills from cfg.INITIAL_R/T (the boot pose). Skills reach it
+    # via ManipulationSkill.idle_target() — see base.py. Returning a TARGET (not a
+    # motion) keeps the return folded into each skill's single chained trajectory,
+    # so no extra dispatch / queue-mode re-entry (which would chop the swing).
+    idle_joint: np.ndarray
     # Set True by the prior throw's return (chain) when it already primed the
     # NEXT pick's suction (vacuum ON). The upcoming pick then must NOT re-prime
     # or clear it; it is reset to False once that pick consumes it.

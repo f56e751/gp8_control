@@ -335,6 +335,18 @@ class GP8App:
         new file plus one entry in the selector list here — no other app.py
         changes — which keeps push/throw work from colliding.
         """
+        # Default standby pose for the idle chain: the same boot/initial pose
+        # _move_to_initial_pose uses (cfg.INITIAL_R/T), wrist zeroed. Computed
+        # once here so a skill's post-action chain can return to it when no next
+        # object is queued (ManipulationSkill.idle_target -> ctx.idle_joint),
+        # instead of parking low at the belt (e.g. a push's push_end).
+        idle_T = _make_transform(self.cfg.INITIAL_R, self.cfg.INITIAL_T)
+        idle_joint = self.robot.inverse_kinematics(idle_T)
+        if idle_joint is None:
+            raise RuntimeError("IK failed for idle/initial pose (cfg.INITIAL_R/T).")
+        idle_joint = np.asarray(idle_joint, dtype=float)
+        idle_joint[-1] = 0.0
+
         self.ctx = SkillContext(
             cfg=self.cfg,
             node=self._node,
@@ -352,6 +364,7 @@ class GP8App:
             # Deferred: self.selector is built just below; the lambda is only
             # called at run time (after setup), by which point it is set.
             skill_for=lambda obj: self.selector.skill_for(obj),
+            idle_joint=idle_joint,
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)

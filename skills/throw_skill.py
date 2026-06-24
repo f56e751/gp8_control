@@ -298,9 +298,10 @@ class ThrowSkill(ManipulationSkill):
             throw velocity). The follow-through release→aim_joint2 is dropped
             (wasted motion once the object is gone), so the arm heads to the
             next pick immediately instead of parking at the 8 cm hover first.
-          - no next pick -> ORIGINAL behaviour: keep the full arc up to
-            aim_joint2 (8 cm hover, dq(T)=0) and chain back to the current
-            intercept (``grasp_joint``) from rest.
+          - no next pick -> keep the full arc up to aim_joint2 (8 cm hover,
+            dq(T)=0) and chain to the shared idle/standby pose
+            (``idle_target()``) from rest, so the arm parks high instead of at
+            this object's grasp.
 
         The timed suction release still fires at ``release_idx``
         (= eta_idx - lead_steps); in the cut case that is the last arc
@@ -352,8 +353,8 @@ class ThrowSkill(ManipulationSkill):
         #   * next pick known -> CUT at the release sample and fly straight to
         #     it from the actual release state (large velocity); drop the
         #     wasted release→aim_joint2 follow-through.
-        #   * no next pick    -> ORIGINAL: keep the full arc to aim_joint2
-        #     (8 cm hover, at rest) and chain back to grasp_joint.
+        #   * no next pick    -> keep the full arc to aim_joint2 (8 cm hover,
+        #     at rest) and chain to the idle/standby pose (idle_target()).
         # Either branch then appends one fresh time-optimal trajectory() from
         # (start_q5, start_dq5) to chain_target — only the start state / target
         # differ, so the concat/dispatch code below stays shared.
@@ -375,7 +376,11 @@ class ThrowSkill(ManipulationSkill):
             ts_pre = ts_ext
             start_q5 = traj_ext[-1]                     # aim_joint2 at rest
             start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
-            chain_target = np.asarray(grasp_joint, dtype=float)
+            # No next pick -> return to the shared standby pose (idle_target),
+            # NOT back to this object's grasp. The chain starts from aim_joint2
+            # (high hover, at rest), so the move to idle stays high — no belt
+            # sweep. copy() so the shared ctx.idle_joint is never mutated.
+            chain_target = self.idle_target().copy()
             chained_to_next = False
 
         zero5 = np.zeros(5)
@@ -415,7 +420,7 @@ class ThrowSkill(ManipulationSkill):
             f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
             f"{release_idx}/{traj_throw.shape[1] - 1} (eta step {eta_idx}, "
             f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, "
-            f"{'cut@release->next intercept' if chained_to_next else 'full arc->current grasp'})"
+            f"{'cut@release->next intercept' if chained_to_next else 'full arc->idle pose'})"
         )
 
         primed_next = ctx.traj_ctrl.send_trajectory_queue_with_timed_release(

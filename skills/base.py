@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from gp8_control.skills.context import SkillContext, PickRequest
     from gp8_control.tracking import TrackedObject
 
@@ -48,6 +50,19 @@ class ManipulationSkill(ABC):
         (e.g. a class out of the throw envelope) so the selector falls back.
         """
         return True
+
+    def idle_target(self) -> "np.ndarray":
+        """Joint pose the post-action chain returns to when there is NO next
+        object to pre-position.
+
+        Default: the shared standby pose on the context
+        (:attr:`SkillContext.idle_joint`, from ``cfg.INITIAL_R/T``, wrist zeroed),
+        computed once at setup. Override to give a skill its own idle pose —
+        mirrors :meth:`can_handle` (base default + per-skill override). Returns a
+        TARGET, not a motion, so the return stays folded into the skill's single
+        chained trajectory (no extra dispatch / queue-mode re-entry).
+        """
+        return self.ctx.idle_joint
 
     @abstractmethod
     def execute(self, request: "PickRequest") -> "SkillResult":

@@ -285,24 +285,26 @@ class PushSkill(ManipulationSkill):
 
         # Chain: pre-position the NEXT object ONLY when it is a THROW pick.
         # scan_next_intercept returns (grasp_joint, _) and commits the object iff
-        # the next routes to throw; a push/none next -> (None, None) (it does its
-        # OWN push approach fresh next cycle). When throw-next, the stroke chains
-        # straight to that grasp and the committed throw primes suction THERE next
-        # cycle — so a throw after a push no longer cold-starts from push_end and
-        # fires suction mid-transit ("suction at the floor"). push_time is a rough
-        # stroke-duration estimate for the chain's feasibility gate.
+        # the next routes to throw; a push/none next -> (None, None). When
+        # throw-next, the stroke chains straight to that grasp and the committed
+        # throw primes suction THERE next cycle — so a throw after a push no longer
+        # cold-starts from push_end and fires suction mid-transit ("suction at the
+        # floor"). push_time is a rough stroke-duration estimate for the chain's
+        # feasibility gate.
         push_time = push_distance / PUSH_SPEED
         next_intercept_joint, _ = ctx.scan_next_intercept(grasp_retreat_joint, push_time)
 
         # Build & dispatch: STROKE ONLY (append_descent=False) — the arm already
-        # descended to grasp_retreat during POSITIONING and waited there. Append a
-        # chain to the next throw grasp when there is one (one queued trajectory,
-        # same as ThrowSkill); else end at push_end and the next cycle approaches
-        # fresh.
+        # descended to grasp_retreat during POSITIONING and waited there. ALWAYS
+        # append a chain (one queued trajectory, same as ThrowSkill): to the next
+        # throw's grasp when there is one, else to the shared idle/standby pose
+        # (build_push_trajectory's fallback) so the arm parks HIGH instead of low
+        # at push_end — which is what made the next throw cold-start by sweeping
+        # the belt up from the bin.
         self.build_push_trajectory(
             grasp_retreat_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
             next_intercept_joint=next_intercept_joint,
-            append_chain=next_intercept_joint is not None,
+            append_chain=True,
             append_descent=False, push_distance=push_distance,
         )
 
@@ -554,32 +556,35 @@ class PushSkill(ManipulationSkill):
         n_stroke = traj_stroke.shape[1]
 
         # ================================================================
-        # Segment 3: Chain  (push_end → next intercept or grasp) — OPTIONAL
+        # Segment 3: Chain  (push_end → next intercept or idle pose) — OPTIONAL
         # ================================================================
-        # With append_chain=False the dispatch ENDS at the hit (push_end): the
-        # NEXT cycle's POSITIONING flows from push_end toward the next pick, so
-        # we keep inter-pick flow WITHOUT a chain segment. MotoROS2 needs the
-        # point queue to drain before queue-mode re-entry, so a chain can't run
-        # asynchronously (it would block the next pick's dispatch and trip code
-        # 2 'Must call start_point_queue_mode'). Ending at push_end removes that
-        # blocking delay.
+        # execute() now ALWAYS chains (append_chain=True): to the next throw's
+        # grasp when there is one, else to the shared idle/standby pose — so the
+        # arm parks HIGH instead of low at push_end. (append_chain=False is kept
+        # as a still-valid option for any caller that wants to END at push_end:
+        # then the NEXT cycle's POSITIONING flows from push_end. MotoROS2 needs
+        # the point queue to drain before queue-mode re-entry, so a chain can't
+        # run asynchronously — it would block the next pick's dispatch and trip
+        # code 2 'Must call start_point_queue_mode'.)
         push_end_q = traj_stroke[:, -1]         # last waypoint of stroke (6-DOF)
         push_end_dq = vel_stroke[:, -1]         # ~0 (boundary condition)
 
         if append_chain:
+            # Chain target: the next throw's grasp if committed, else the shared
+            # idle/standby pose (idle_target). copy() so ctx.idle_joint is never
+            # mutated by the wrist write below.
             chain_target = (
                 np.asarray(next_intercept_joint, dtype=float)
                 if next_intercept_joint is not None
-                else np.asarray(aim_joint, dtype=float)
+                else self.idle_target().copy()
             )
-            # Wrist (joint 6) at the chain end:
-            #  - throw next (next_intercept_joint given): the throw arc starts
-            #    with joint 6 = 0 (ThrowSkill zeroes it), and the committed throw
-            #    uses skip_move so it does NOT re-orient the wrist — so park the
-            #    chain AT 0 here. Holding the push-facing wrist instead makes the
-            #    throw's first segment flip joint 6 -> Yaskawa alarm 4414.
-            #  - else (push->push fallback): hold the stroke-end wrist (no whip).
-            chain_target[5] = 0.0 if next_intercept_joint is not None else push_end_q[5]
+            # Wrist (joint 6) at the chain end = 0 either way:
+            #  - throw next: the throw arc starts with joint 6 = 0 (ThrowSkill
+            #    zeroes it), and the committed throw uses skip_move so it does NOT
+            #    re-orient the wrist — parking the chain anywhere else would flip
+            #    joint 6 on the throw's first segment -> Yaskawa alarm 4414.
+            #  - idle: the standby pose already has joint 6 = 0.
+            chain_target[5] = 0.0
             chained_to_next = next_intercept_joint is not None
 
             traj_chain, vel_chain, ts_chain = trajectory(
@@ -614,7 +619,7 @@ class PushSkill(ManipulationSkill):
             f"(d={push_distance:.3f}m @ {PUSH_SPEED:.2f}m/s, "
             f"θ={np.degrees(theta):.1f}°, swing "
             f"{np.degrees(SWING_BIAS - SWING_ANGLE):+.0f}°→{np.degrees(SWING_BIAS + SWING_ANGLE):+.0f}°), "
-            f"{'chain→next intercept' if chained_to_next else 'end at push_end (no chain)'}"
+            f"{'chain→next intercept' if chained_to_next else ('chain→idle pose' if append_chain else 'end at push_end (no chain)')}"
         )
 
         # Thin to ≥ _MIN_QUEUE_GAP between points so the synchronous point-push
