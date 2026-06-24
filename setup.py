@@ -44,6 +44,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "launch"), glob("launch/*.py")),
         (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
+        (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
     ],
     package_data={
         f"{package_name}.gui": ["static/*", "static/css/*"],
@@ -59,6 +60,7 @@ setup(
         "console_scripts": [
             "gp8_app = gp8_control.app:main",
             "mock_robot = gp8_control.mock.mock_robot:main",
+            "fake_belt = gp8_control.mock.fake_belt:main",
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",
             "terminal_debug = gp8_control.terminal_debug:main",

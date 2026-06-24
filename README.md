@@ -17,10 +17,14 @@ the RL training stack.
 | `trajectory/trajectory_primitive.py` | `opt_time`, `trajectory_3points`, `new_trajectory`, etc. |
 | `controllers/trajectory_controller.py` | FJT action client with suction release-on-pass logic. |
 | `controllers/moveit_controller.py` | MoveIt 2 wrapper (used only for initial-pose planning). |
-| `perception/` | HTTP NDJSON detection stream client + source adapter, camera→robot intake/transform, conveyor speed tracker. |
-| `mock/mock_robot.py` | Fake MotoROS2 for dev work without the physical robot. |
+| `camera_debug.py` | Perception node (`camera_debug`) — reads the camera PC's HTTP NDJSON stream, applies the camera→base transform + `v×delay` back-projection, and publishes corrected detections on `/camera_debug/detections`. **Must run for `app.py` to pick.** |
+| `perception/` | Supports `camera_debug`: HTTP stream client (`perception_client`), camera/base extrinsics (`extrinsics`), and the control-side detection intake/dedup (`detection_intake`, consumed by `app.py`). |
+| `conveyor/` | `ConveyorSpeedTracker` — subscribes `/conveyor/speed` (encoder node) and exposes the live belt speed to the app + skills. |
+| `mock/mock_robot.py` | Fake MotoROS2 (incl. Point Queue Mode + real-time playback) for dev/sim without the physical robot. |
+| `mock/fake_belt.py` | Fake `camera_debug` for simulation — spawns objects on the belt, publishes `/camera_debug/detections` + `/conveyor/speed`. |
 | `gui/` | Flask-based web GUI for manual EE jogging and status. |
-| `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, `gp8_manager` (perception streamed from the camera PC). |
+| `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, `gp8_manager`. **Does NOT start `camera_debug`** — run that separately. |
+| `launch/sim_bringup.launch.py` | Software-in-the-loop sim — `mock_robot` + `fake_belt` + RSP + MoveIt + RViz + the app (no hardware). |
 | `launch/debug_robot.launch.py` | Minimal bringup (bridge + TF + MoveIt) for interactive scripts. |
 | `terminal_debug.py` | 키보드 기반 EE jog / 회전 / home / 석션 / Queue Mode sweep / FJT mismatch 테스트 도구. |
 | `tests/queue_test.py` | TrajectoryController Queue 메서드 3가지 시나리오 분리 검증. |
@@ -36,28 +40,28 @@ the RL training stack.
   is configured)
 - `esp32_encoder` ROS 2 node publishing `/conveyor/speed` (optional, falls
   back to hardcoded speed)
-- Camera PC's HTTP detection stream reachable — set its URL via env var
-  before launching:
+- Camera PC's HTTP detection stream reachable. The **`camera_debug` node**
+  (not `app.py`) reads it — set the URL in the terminal that runs
+  `camera_debug`:
   ```bash
   export GP8_PERCEPTION_URL=http://<camera-pc-ip>:8080/detections/stream
   ```
-  Perception (RealSense + SAM/DINO) runs entirely on the camera PC; the
-  robot PC consumes the NDJSON stream via `StreamDetectionSource`. The
-  public GitHub copy ships with a placeholder URL so no internal infra IPs
-  leak.
+  Perception (RealSense + SAM/DINO) runs on the camera PC; `camera_debug`
+  consumes the NDJSON stream, applies the camera→base transform, and
+  republishes `/camera_debug/detections`, which `app.py` subscribes to. The
+  public GitHub copy ships with a placeholder URL so no internal infra IPs leak.
 
-  > **카메라 PC 송출이 켜져 있어야 picking이 동작합니다.** 송출이 꺼져
-  > 있어도 `app.py`는 죽지 않고 (백그라운드 스레드가 2초마다 재접속 시도)
-  > 노드는 뜨지만, 탐지 결과가 계속 비어 있어 **물체를 집지 못합니다.**
-  > 노드 기동/디버깅만이면 카메라 없이도 실행됩니다.
+  > **`camera_debug` 가 떠 있어야 picking이 동작합니다.** `app.py` 는
+  > `/camera_debug/detections` 만 구독하므로, `camera_debug` 가 없으면 노드는
+  > 떠도 탐지가 비어 **물체를 못 집습니다.** (앱 단독 기동/디버깅은 카메라
+  > 없이도 됨.) `camera_debug` 는 송출이 꺼져 있어도 죽지 않고 2초마다 재접속.
   >
-  > 로봇 PC에서 스트림 도달 여부 확인:
+  > 스트림 도달 여부 확인 (camera_debug 띄우는 PC에서):
   > ```bash
   > curl -N "$GP8_PERCEPTION_URL" | head
   > ```
-  > JSON 라인이 흐르면 OK. 연결 거부면 카메라 PC 송출이 꺼졌거나 IP/포트가
-  > 다른 것 — 송출 서버 코드는 이 repo가 아니라 카메라 PC에 있는 별도
-  > 코드이며, 스트림 와이어 규약은 `perception/perception_client.py` 참고.
+  > JSON 라인이 흐르면 OK. 송출 서버 코드는 이 repo가 아니라 카메라 PC에 있는
+  > 별도 코드이며, 스트림 와이어 규약은 `perception/perception_client.py` 참고.
 - [`uv`](https://astral.sh/uv) for Python venv management
 - ESP32 conveyor encoder on `/dev/ttyUSB0` (user in `dialout` group)
 
@@ -83,13 +87,16 @@ micro-ROS Agent / Docker).
 
 1. **micro-ROS Agent (docker)** — 부팅당 1회. 없으면 `/write_single_io` /
    `/start_traj_mode` 가 안 뜨고 노드가 *"Waiting for …"* 에서 멈춤.
-2. **Terminal 1 — bringup** (bridge + cameras + MoveIt + gp8_manager)
-3. **Terminal 2 — conveyor encoder** (`/conveyor/speed` 발행, 선택)
+2. **Terminal 1 — bringup** (bridge + robot_state_publisher + MoveIt + gp8_manager)
+3. **Terminal 2 — `camera_debug`** (`/camera_debug/detections` 발행) —
+   **picking 하려면 필수.** bringup 에 포함되지 않으니 따로 띄움.
+4. **Terminal 3 — conveyor encoder** (`/conveyor/speed` 발행; camera_debug 의
+   back-projection + 앱 속도보정에 쓰임, 선택이지만 권장)
 
 펜던트는 **REMOTE + AUTO**, 알람 없는 상태여야 함. 자세한 명령은 아래 각
 섹션 참고.
 
-### Terminal 1 — bringup (bridge + cameras + MoveIt + gp8_manager)
+### Terminal 1 — bringup (bridge + robot_state_publisher + MoveIt + gp8_manager)
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -102,23 +109,42 @@ package's `.venv/bin/python` (found by walking up from the launch file) so
 that torch is available. Override the venv location with
 `GP8_VENV_PYTHON=/path/to/python` if needed.
 
+### Terminal 2 — `camera_debug` (publishes `/camera_debug/detections`)
+
+`app.py` subscribes to `/camera_debug/detections`; that topic is produced by
+the **`camera_debug` node**, which `gp8_bringup` does **not** start. Run it in
+its own terminal (on the robot PC) or picking never happens:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+export GP8_PERCEPTION_URL=http://<camera-pc-ip>:8080/detections/stream
+ros2 run gp8_control camera_debug
+```
+
+It reads the camera PC's HTTP stream (`GP8_PERCEPTION_URL`), applies the
+camera→base transform + `v×delay` back-projection, and publishes the corrected
+detections. It also subscribes to `/conveyor/speed` for the back-projection.
+A live TUI shows raw vs corrected positions.
+
 ### Skill 선택 — throw만 / push만 실행 (디버그)
 
-`gp8_manager` 는 매 객체를 `ActionSelector` 가 push/throw 스킬로 라우팅합니다
-(기본: 전부 throw). 디버그·테스트용으로 **모든 객체를 한 스킬로 고정**할 수 있습니다.
+`gp8_manager` 는 매 객체를 `ActionSelector` 가 push/throw 스킬로 라우팅합니다.
+**기본 라우팅은 클래스별**(`Config.SKILL_BY_CLASS`): `metal`(캔) → **push**,
+`transparent`(페트병) → **throw**, 그 외 → throw. 디버그·테스트용으로 **모든
+객체를 한 스킬로 고정**할 수 있습니다.
 
 | 모드 | 실행 |
 |---|---|
-| 정상 라우팅 (기본) | `ros2 launch gp8_control gp8_bringup.launch.py` |
+| 정상 라우팅 (기본, 클래스별) | `ros2 launch gp8_control gp8_bringup.launch.py` |
 | throw 만 | `GP8_FORCE_SKILL=throw ros2 launch gp8_control gp8_bringup.launch.py` |
 | push 만 | `GP8_FORCE_SKILL=push ros2 launch gp8_control gp8_bringup.launch.py` |
 
-- 우선순위: CLI `--skill {throw,push}` > 환경변수 `GP8_FORCE_SKILL` > 기본(정상 라우팅).
-- 기동 로그에 `ActionSelector FORCED to '<skill>' skill for ALL objects` 가 뜨면 적용된 것.
-- ⚠️ **`push` 는 아직 실제 스윕이 아니라 디버그 모션**입니다 — 객체가 잡힐 때마다
-  EE 를 위로 5cm 올렸다 다시 5cm 내리는 한 사이클만 수행합니다
-  (`skills/push_skill.py`). 정상 라우팅에서는 `can_handle()` 이 `False` 라
-  선택되지 않고, **강제(force)할 때만** 동작합니다.
+- 우선순위: CLI `--skill {throw,push}` > 환경변수 `GP8_FORCE_SKILL` > 기본(클래스별 라우팅).
+- 기동 로그에 `ActionSelector FORCED to '<skill>' skill for ALL objects` 가 뜨면 강제 모드.
+- `push` 는 **실제 접촉 스윕**입니다 (`skills/push_skill.py`) — intercept 에서 대기 후
+  벨트면과 평행하게 등속 직선으로 밀어내며 스윙을 줍니다. `metal` 클래스에 한해
+  `can_handle()` 이 `True` (정상 라우팅에서 캔이 push 로 감).
 
 bringup 없이 앱만 단독으로 띄울 땐 venv python 으로 플래그를 직접 줄 수 있습니다
 (torch 때문에 venv 필요; move_group/bridge 가 없어 실제 picking 은 안 됨):
@@ -128,7 +154,7 @@ PYTHONPATH=$HOME/ros2_ws/src:$PYTHONPATH \
   ~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.app --skill push
 ```
 
-### Terminal 2 — conveyor encoder (publishes `/conveyor/speed`)
+### Terminal 3 — conveyor encoder (publishes `/conveyor/speed`)
 
 Lives in a sibling package:
 <https://github.com/f56e751/esp32_encoder>
@@ -222,13 +248,13 @@ ros2 run gp8_control queue_test
 
 메뉴:
 - `1` 단순 2점 이동 — `send_trajectory_queue` (like `_move_to_initial_pose`)
-- `2` 3점 경로 (pick 유사) — `send_trajectory_queue` (like `_execute_pick`)
-- `3` release_joint 테스트 — `send_trajectory_queue_with_release` (like `_execute_transfer`)
+- `2` 3점 경로 (pick 유사) — `send_trajectory_queue`
+- `3` release_joint 테스트 — `send_trajectory_queue_with_release`
 - `q` 종료 (자동으로 FJT 모드 복귀)
 
 ### 3. `queue_test_throw` — torch NN throw 테스트
 
-`_execute_transfer` 와 동일 경로 재현: FCN 추론 → `new_trajectory` 합성 → Queue 전송. torch가 필요하므로 **venv python** 으로 실행.
+throw 경로 재현: FCN 추론 → `new_trajectory` 합성 → Queue 전송 (`ThrowSkill` 과 동일 primitive). torch가 필요하므로 **venv python** 으로 실행.
 
 ```bash
 PYTHONPATH=$HOME/ros2_ws/src:$PYTHONPATH ~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.tests.queue_test_throw
@@ -257,11 +283,50 @@ PICK_APPROACH_OFFSET = (-0.2, 0, 0) # pick approach (dx, dy, dz) in meters
 | `TrajectoryController` Queue 메서드 버그 재현 | `queue_test` |
 | throw NN 추론 결과 확인 | `queue_test_throw` → `t` |
 | pick↔throw 연속 끊김 측정 | `queue_test_throw` → `p` |
-| 전체 pipeline 통합 | `ros2 launch gp8_control gp8_bringup.launch.py` |
+| 전체 pipeline 통합 (실로봇) | `gp8_bringup.launch.py` + `camera_debug` (+ encoder) |
+| 전체 pipeline 시뮬 (무하드웨어) | `sim_bringup.launch.py` + `belt_viz` |
+
+## Simulation (SIL — no hardware)
+
+Run the **full pipeline** (detection → intake/dedup → selection → push/throw
+routing → skill → motion) with no robot and no camera, by swapping in two fakes:
+
+- `mock_robot` — fakes MotoROS2 incl. **Point Queue Mode** (the path the app
+  actually uses), playing queued points back in real time so the app's
+  wall-clock timing (eta, suction lead) stays meaningful.
+- `fake_belt` — fakes `camera_debug`: spawns objects on the belt and publishes
+  `/camera_debug/detections` + `/conveyor/speed`.
+
+```bash
+# one terminal — mock_robot + fake_belt + RSP + MoveIt + RViz + app
+ros2 launch gp8_control sim_bringup.launch.py
+#   tune:  belt_speed:=0.08 spawn_interval:=4.0   |   headless (SSH): rviz:=false
+#   one skill:  GP8_FORCE_SKILL=throw ros2 launch gp8_control sim_bringup.launch.py
+
+# another terminal — belt strip TUI (objects, queue, target, status)
+ros2 run gp8_control belt_viz
+```
+
+Watch the arm intercept belt objects in RViz (3D) and the belt state in
+`belt_viz` (TUI — works over SSH; use `rviz:=false`). The real robot can be
+powered off; `mock_robot` replaces it. **Don't run `gp8_bringup` at the same
+time** — the `/joint_states_urdf` topics would collide.
+
+> **Caveats** — kinematic only (no grasp/throw physics); a "picked" object is
+> not removed from the belt (`fake_belt` keeps flowing it until it passes), so
+> use this to verify **motion path / interception timing**, not grasp success.
+> RViz Fixed Frame defaults to `base_link` — change it if your URDF root differs.
 
 ## Topology
 
 ```
+camera PC (RealSense + SAM/DINO)  ─ HTTP NDJSON detection stream
+          │  (GP8_PERCEPTION_URL)
+          ▼
+  camera_debug  ─ cam→base transform + v×delay back-projection
+               ─ /camera_debug/detections   (corrected base-frame poses)
+          │                                  (+ subscribes /conveyor/speed)
+          ▼
 MotoROS2 (on YRC1000micro)  ─ /joint_states (joint_1..6, BEST_EFFORT)
                             ─ /follow_joint_trajectory  (joint_1..6)
                             ─ /write_single_io, /read_single_io, /start_traj_mode
@@ -269,17 +334,20 @@ MotoROS2 (on YRC1000micro)  ─ /joint_states (joint_1..6, BEST_EFFORT)
           │  (ROS 2 DDS over 192.168.255.x)
           ▼
   motoros2_name_bridge  ─ /joint_states_urdf  (joint_1_s..6_t)
-                       ─ /motoman_gp8_controller/follow_joint_trajectory
+                       ─ /motoman_gp8_controller/{follow_joint_trajectory,
+                          queue_traj_point, start_point_queue_mode, ...}
           │
           ▼
   gp8_manager (app.py)
-   ├─ /joint_states_urdf      (subscribe)
-   ├─ /conveyor/speed          (subscribe — esp32_encoder)
-   ├─ HTTP NDJSON detection stream ← camera PC (GP8_PERCEPTION_URL)
-   └─ FJT action → bridge → MotoROS2
+   ├─ /joint_states_urdf       (subscribe)
+   ├─ /conveyor/speed           (subscribe — esp32_encoder)
+   ├─ /camera_debug/detections  (subscribe — camera_debug)
+   └─ Point Queue Mode → bridge → MotoROS2
 ```
 
 ## Status
 
 Production-tested on YRC1000micro + MotoROS2 0.2.1 + Humble as of
-2026-04. Pick timing (`fixed_delay`) is learned adaptively per run.
+2026-04. Picks via the **ambush** strategy (park at the reachable intercept,
+fire suction on arrival); per-class push/throw routing (`metal`→push,
+`transparent`→throw).
