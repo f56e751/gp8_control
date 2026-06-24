@@ -25,16 +25,11 @@ from rclpy.executors import MultiThreadedExecutor
 
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.controllers.pick_delay_tracker import PickDelayTracker
 from gp8_control.perception.stream_detection_source import StreamDetectionSource
 from gp8_control.perception.conveyor_speed import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.perception import extrinsics as _extrinsics
-from gp8_control.trajectory.trajectory_primitive import (
-    trajectory,
-    trajectory_3points,
-    opt_time,
-)
+from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
 from gp8_control.tracking import (
     TrackedObject,
@@ -44,8 +39,6 @@ from gp8_control.tracking import (
 from gp8_control.planning import (
     PickThrowPlanner,
     ThrowDecodingConfig,
-    TargetStatus,
-    lock_or_drop_head,
 )
 from gp8_control.planning.action_selector import ActionSelector
 from gp8_control.robots.gp8 import GP8
@@ -55,7 +48,6 @@ from gp8_control.skills import (
     ThrowSkill,
     PushSkill,
 )
-from gp8_control.skills.throw_skill import THETA_MAP
 
 
 # Tool orientation used to assemble grasp/aim 4x4 from the corrected base
@@ -108,22 +100,14 @@ class Config:
     DETECTION_OFFSET_AIM: float = _extrinsics.DETECTION_OFFSET_AIM
     DETECTION_OFFSET_GRASP: float = _extrinsics.DETECTION_OFFSET_GRASP
 
-    # Pick-cycle delay starts at 0 (first pick uncompensated), then the
-    # first observed overhead is adopted as-is, later picks EMA-smooth.
+    # Fixed lead (s) folded into the throw-landing projection so the aim
+    # accounts for belt travel during the swing (planner.plan_throw_landing).
     FIXED_DELAY_THROW: float = 0.2
-    DELAY_EMA_ALPHA: float = 0.3
 
     # Pick-lead convergence guard: cap on how far ahead (seconds) plan_pick
     # projects the object before aiming. Bounds the fixed-point iteration so
     # it can't diverge to the reach boundary. Set near the real pick time.
     MAX_PICK_LEAD: float = 1.2
-
-    # Pick strategy:
-    #   "ambush" — park the arm at a fixed intercept line (GRASP_INTERCEPT_Y)
-    #              ahead of time and fire suction when the object arrives.
-    #              Avoids moving-intercept lead timing entirely.
-    #   "moving" — legacy predictive-intercept pick (plan_pick + lock).
-    PICK_STRATEGY: str = "ambush"
 
     # Test override for the push/throw ActionSelector. Empty = normal routing
     # (every object -> throw today). Set to a skill name ("throw" or "push")
@@ -306,7 +290,6 @@ class GP8App:
             self.cfg.MAX_REACH, drop_below_y=-self.cfg.MAX_REACH,
         )
         self.frame_gate = FrameGate(self.cfg.FRAME_COOLDOWN_DISTANCE)
-        self.pick_delay = PickDelayTracker(self.cfg.DELAY_EMA_ALPHA)
 
     # ------------------------------------------------------------------
     # Setup
@@ -494,55 +477,6 @@ class GP8App:
             traj, vel, timestep, final_joint=initial_joint
         )
         time.sleep(1.0)
-
-    # ------------------------------------------------------------------
-    # Pick execution (legacy "moving" strategy)
-    # ------------------------------------------------------------------
-    def _execute_pick(self, current_joint, aim_joint, grasp_joint, plan_time) -> None:
-        """Send pick trajectory and update PickDelayTracker with measured overhead.
-
-        ``plan_time`` is the epoch's ``now`` — the instant the target position
-        was predicted. Logging ``t_start - plan_time`` exposes the planning/IK
-        compute latency that is *not* folded into ``fixed_delay`` (which only
-        measures from ``t_start`` onward), the prime suspect for a consistent
-        downstream pick offset.
-        """
-        t_start = time.time()
-        zero = np.zeros_like(self.M1)
-        traj, vel, ts = trajectory_3points(
-            current_joint, zero, aim_joint, zero, grasp_joint, zero,
-            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
-        )
-        traj_duration = float(np.sum(ts))
-        # Pick: ROS1 customcontroller와 동일하게 grasp pose 직전(diff<0.05)에
-        # 미리 suction_on 발사 — 공압 지연 보정. 도착 후 별도 attach wait 불필요.
-        self.traj_ctrl.send_trajectory_queue_with_attach(
-            traj, vel, ts,
-            final_joint=grasp_joint,
-            attach_target_joint=grasp_joint,
-        )
-        elapsed = time.time() - t_start
-
-        observed_overhead = elapsed - traj_duration
-        compute_latency = t_start - plan_time           # now -> traj send (Δc), uncompensated
-        prev = self.pick_delay.value                    # fixed_delay actually used this pick
-        self.pick_delay.update(observed_overhead)
-
-        v = self.conveyor.current
-        predicted_lead = traj_duration + prev           # what the planner aimed with
-        actual_lead = compute_latency + elapsed         # now -> grasp arrival
-        shortfall = actual_lead - predicted_lead        # >0 => arm arrives downstream (late)
-        self._node.get_logger().info(
-            "Pick timing diagnostics:\n"
-            f"  belt speed       : {v:7.3f} m/s\n"
-            f"  predicted traj   : {traj_duration*1000:7.0f} ms\n"
-            f"  actual traj+oh   : {elapsed*1000:7.0f} ms   (overhead {observed_overhead*1000:+.0f} ms)\n"
-            f"  compute lag Δc   : {compute_latency*1000:7.0f} ms   (now->send; NOT in fixed_delay)\n"
-            f"  fixed_delay used : {prev*1000:7.0f} ms   -> next {self.pick_delay.value*1000:.0f} ms\n"
-            f"  predicted lead   : {predicted_lead*1000:7.0f} ms   (traj + fixed_delay)\n"
-            f"  actual lead      : {actual_lead*1000:7.0f} ms   (now -> grasp arrival)\n"
-            f"  => shortfall     : {shortfall*1000:+7.0f} ms = {v*shortfall*1000:+.1f} mm downstream"
-        )
 
     # ------------------------------------------------------------------
     # Target selection (ambush strategy)
@@ -825,27 +759,6 @@ class GP8App:
         except (ValueError, TypeError):
             pass
 
-    def _execute_cycle(
-        self,
-        current_joint: np.ndarray,
-        aim_joint1: np.ndarray,
-        grasp_joint1: np.ndarray,
-        aim_joint2: np.ndarray,
-        T_grasp1: np.ndarray,
-        T_aim2: np.ndarray,
-        theta: float,
-        plan_time: float,
-    ) -> None:
-        """Legacy "moving" strategy: pick (suction mid-trajectory) → throw."""
-        # _execute_pick uses send_trajectory_queue_with_attach, which fires
-        # suction_on while the arm is still approaching (diff<0.05) — matches
-        # ROS1 customcontroller. No post-arrival sleep needed; vacuum has
-        # been forming during the final approach.
-        self._execute_pick(current_joint, aim_joint1, grasp_joint1, plan_time)
-
-        params = self.planner.compute_throw_params(T_grasp1, T_aim2, theta)
-        self.throw_skill.build_throw_trajectory(grasp_joint1, aim_joint2, params)
-
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -890,60 +803,15 @@ class GP8App:
             time.sleep(self.cfg.TIME_STEP)
             return
 
-        if self.cfg.PICK_STRATEGY == "ambush":
-            request = self._select_ambush_target(now, current_joint)
-            if request is not None:
-                # Decide push vs throw (rule-based today; RL later) and run it.
-                skill = self.selector.select(request)
-                skill.execute(request)
-            else:
-                # No feasible pick this epoch — don't leave a return-primed
-                # vacuum running with nothing to turn it off.
-                self._release_orphan_suction()
-            return
-
-        # Capture the secondary throw target *before* lock_or_drop_head
-        # mutates the queue. Without this, the only way to recover the
-        # secondary would be queue.head() *after* the head was popped —
-        # an implicit ordering contract that's easy to break by accident.
-        secondary = self.queue.peek_next() if self.queue.has_next() else None
-
-        lock = lock_or_drop_head(
-            self.queue,
-            self.planner,
-            current_joint,
-            self.conveyor.current,
-            now,
-            fixed_delay=self.pick_delay.value,
-        )
-        if lock.status == TargetStatus.DROPPED_IK:
-            self._node.get_logger().warn("IK failed in pick adjustment; dropping target")
-            return
-        if lock.status == TargetStatus.DROPPED_PASSED:
-            self._node.get_logger().info("Target passed the reachable arc; dropping")
-            return
-        if lock.status == TargetStatus.WAIT:
-            time.sleep(self.cfg.TIME_STEP)
-            return
-        # LOCKED
-        target_obj = lock.target
-        T_aim1, T_grasp1 = lock.T_aim, lock.T_grasp
-
-        self.traj_ctrl.suction_off()
-        theta = THETA_MAP.get(target_obj.class_name, 0.0)
-
-        T_aim2 = self.throw_skill.plan_throw_landing(T_grasp1, theta, T_aim1, now, secondary)
-
-        keyframes = self.throw_skill.solve_keyframe_joints(T_aim1, T_grasp1, T_aim2)
-        if keyframes is None:
-            return
-        aim_joint1, grasp_joint1, aim_joint2 = keyframes
-
-        self._node.get_logger().info(f"Target locked: {target_obj.class_name}")
-        self._execute_cycle(
-            current_joint, aim_joint1, grasp_joint1, aim_joint2,
-            T_grasp1, T_aim2, theta, now,
-        )
+        request = self._select_ambush_target(now, current_joint)
+        if request is not None:
+            # Decide push vs throw (rule-based today; RL later) and run it.
+            skill = self.selector.select(request)
+            skill.execute(request)
+        else:
+            # No feasible pick this epoch — don't leave a return-primed
+            # vacuum running with nothing to turn it off.
+            self._release_orphan_suction()
 
     def run(self) -> None:
         self.setup()
