@@ -60,6 +60,10 @@ setup(
         "console_scripts": [
             "gp8_app = gp8_control.app:main",
             "mock_robot = gp8_control.mock.mock_robot:main",
+            # MuJoCo-backed twin (Level B). NOTE: needs `mujoco` in the uv venv,
+            # so launch it with .venv/bin/python -m gp8_control.mock.mujoco_robot
+            # (or sim_mujoco.launch.py) — plain `ros2 run` uses system python.
+            "mujoco_robot = gp8_control.mock.mujoco_robot:main",
             "fake_belt = gp8_control.mock.fake_belt:main",
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",

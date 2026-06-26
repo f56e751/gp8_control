@@ -21,10 +21,12 @@ the RL training stack.
 | `perception/` | Supports `camera_debug`: HTTP stream client (`perception_client`), camera/base extrinsics (`extrinsics`), and the control-side detection intake/dedup (`detection_intake`, consumed by `app.py`). |
 | `conveyor/` | `ConveyorSpeedTracker` — subscribes `/conveyor/speed` (encoder node) and exposes the live belt speed to the app + skills. |
 | `mock/mock_robot.py` | Fake MotoROS2 (incl. Point Queue Mode + real-time playback) for dev/sim without the physical robot. |
+| `mock/mujoco_robot.py` | MuJoCo-backed twin of `mock_robot` (Level B) — same ROS contract, but drives the vendored MuJoCo model and renders the GP8 live. Run under the venv (`-m gp8_control.mock.mujoco_robot`) / `sim_mujoco.launch.py`. |
 | `mock/fake_belt.py` | Fake `camera_debug` for simulation — spawns objects on the belt, publishes `/camera_debug/detections` + `/conveyor/speed`. |
 | `gui/` | Flask-based web GUI for manual EE jogging and status. |
 | `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, `gp8_manager`. **Does NOT start `camera_debug`** — run that separately. |
 | `launch/sim_bringup.launch.py` | Software-in-the-loop sim — `mock_robot` + `fake_belt` + RSP + MoveIt + RViz + the app (no hardware). |
+| `launch/sim_mujoco.launch.py` | Level B sim — `mujoco_robot` (MuJoCo twin) + `fake_belt` + MoveIt + the app; watch the GP8 in the MuJoCo window. `headless:=true` / `physics:=true`. |
 | `launch/debug_robot.launch.py` | Minimal bringup (bridge + TF + MoveIt) for interactive scripts. |
 | `belt_viz.py` | TUI rendering the live belt — every tracked object (`●`), the active target (`◉`), and app status — from `/gp8_manager/tracked_state` (published by `app.py`). Works in real or sim. |
 | `terminal_debug.py` | 키보드 기반 EE jog / 회전 / home / 석션 / Queue Mode sweep / FJT mismatch 테스트 도구. |
@@ -346,6 +348,58 @@ time** — the `/joint_states_urdf` topics would collide.
 > not removed from the belt (`fake_belt` keeps flowing it until it passes), so
 > use this to verify **motion path / interception timing**, not grasp success.
 > RViz Fixed Frame defaults to `base_link` — change it if your URDF root differs.
+
+### MuJoCo digital twin (Level B)
+
+Same SIL pipeline, but the kinematic `mock_robot` is swapped for `mujoco_robot`:
+a MuJoCo-backed twin that speaks the **identical** ROS contract (Point Queue
+Mode, FJT, `/joint_states_urdf`, `/write_single_io`, …) and renders the GP8
+executing the app's commands live, on the real robot meshes, over the belt,
+intercepting the objects perception reports. The app is unchanged — it drives
+this exactly as it drives the real robot.
+
+One-time: install MuJoCo into the same uv venv that runs the app (for torch):
+
+```bash
+uv pip install --python ~/ros2_ws/src/gp8_control/.venv/bin/python 'mujoco>=3.1'
+```
+
+```bash
+# MuJoCo window + fake_belt + MoveIt + app (no hardware)
+ros2 launch gp8_control sim_mujoco.launch.py
+#   headless (SSH, renders to /mujoco/image):  headless:=true
+#   physics: arm grasps/throws/pushes real boxes (twin owns the belt):  physics:=true
+#   tune belt:  belt_speed:=0.08 spawn_interval:=4.0
+#   one skill:  GP8_FORCE_SKILL=throw ros2 launch gp8_control sim_mujoco.launch.py
+```
+
+- **kinematic** (default) — the MuJoCo arm is a perfectly stable mirror of the
+  commanded joint trajectory; belt boxes mirror `/camera_debug/detections`, so
+  what you *see* matches what the app *perceives* and reaches for.
+  `/joint_states_urdf` is numerically identical to `mock_robot`. No contact /
+  grasp: verifies motion path / interception timing, not grasp success.
+- **`physics:=true`** — the **coherent twin + camera bridge**: the twin OWNS the
+  belt. It spawns physics boxes, rides them down a real conveyor surface (added
+  in the GP8's reach via `MjSpec`, since the vendored belt sits in the env's own
+  frame), and **publishes `/camera_debug/detections` + `/conveyor/speed` itself**
+  from the MuJoCo box positions — so it *replaces* `fake_belt` (the launch does
+  not start it in this mode). The app perceives the real boxes, and
+  `/write_single_io` ON welds the nearest box to the gripper: it rides the swing
+  and **flies on release** (throw), while the pusher geom **shoves** boxes (push).
+  So the objects truly react. `/joint_states_urdf` reports the actual tracked
+  qpos. (The fling speed is taken from the *commanded* trajectory via gp8 FK, so
+  the throw is right even though the position servos lag a fast swing.)
+- **`headless:=true`** — no window; frames publish on `/mujoco/image`
+  (`sensor_msgs/Image`), viewable over SSH in `rqt_image_view` / RViz. Needs an
+  offscreen GL backend (`MUJOCO_GL=egl` is set automatically; use `osmesa` on a
+  CPU-only box).
+
+The twin runs under the venv python (system python has no `mujoco`), so launch
+it via `sim_mujoco.launch.py` or
+`~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.mock.mujoco_robot`,
+**not** `ros2 run`. Kinematics agreement (gp8 FK vs this model) is gated by
+`sim/preview_gp8_check.py`. Don't run `gp8_bringup` or `sim_bringup` at the same
+time — `/joint_states_urdf` would collide.
 
 ## Topology
 

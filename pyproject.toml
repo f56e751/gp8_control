@@ -17,6 +17,12 @@ dependencies = [
     "opencv-python",
 ]
 
+[project.optional-dependencies]
+# MuJoCo digital twin (Level B sim) — only needed to run mujoco_robot /
+# sim_mujoco.launch.py. Kept out of the base deps so the real-robot deployment
+# doesn't pull it. Install with:  uv sync --extra sim
+sim = ["mujoco>=3.1"]
+
 [tool.uv]
 # `uv sync` creates .venv/ next to this file; launch files auto-detect it
 # by walking up from the launch file location.
