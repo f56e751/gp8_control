@@ -175,16 +175,20 @@ class PushSkill(ManipulationSkill):
         return target.class_name in PUSH_CLASSES
 
     def arrival_lead(self) -> float:
-        """Push needs MORE lead than the shared base: it waits BEHIND the contact
-        line (parked at ``grasp_retreat``, ``PUSH_RETREAT_DISTANCE`` back), so on
-        top of the base queue-reentry/dispatch budget the stroke still has to
-        travel from the retreat pose to the contact line before it hits the object.
-        Add that pre-travel time (distance / speed). Nominal retreat distance — the
-        actual retreat may be clamped shorter by ``PUSH_RETREAT_MIN_X`` (see
-        ``_compute_retreat_poses``), so this slightly over-estimates, erring on the
-        side of acting a touch early rather than late.
+        """End the WAITING block this many seconds before the object arrives.
+
+        Push has NO suction to forgive a late hit (unlike throw, whose object is
+        already cup-held), so this lead must equal the FULL post-wait latency —
+        queue re-entry + scan + dispatch + the stroke's retreat->contact pre-travel
+        — NOT throw's small forgiving base (cfg.ACTION_START_LEAD). Empirically
+        ~0.8 s on hardware (feature/push, which timed correctly); the merge cut it
+        to throw's 0.2 s and push started hitting behind the object. That 0.8
+        ALREADY includes the retreat pre-travel, so it is NOT composed on top of
+        the base (no double-count). If the merge's extra scan_next_intercept still
+        leaves the hit trailing, bump FIXED_DELAY_PUSH or move the scan off the
+        contact path.
         """
-        return super().arrival_lead() + PUSH_RETREAT_DISTANCE / PUSH_SPEED
+        return FIXED_DELAY_PUSH
 
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
@@ -275,12 +279,11 @@ class PushSkill(ManipulationSkill):
         ctx.move_through_via(current_joint, aim_joint, grasp_retreat_joint)
 
         # ---- 2. WAITING: block until the object arrives ----
-        # End the wait arrival_lead() s before arrival. Unlike throw (which waits AT
-        # the grasp pose, so only the shared queue-reentry/dispatch budget matters),
-        # push waits BEHIND the contact line at grasp_retreat, so arrival_lead()
-        # adds the stroke's retreat->contact pre-travel on top of that shared budget
-        # — see PushSkill.arrival_lead(). FIXED_DELAY_PUSH (0.8) was stale (it also
-        # covered the descent, now done during POSITIONING) and is no longer used.
+        # End the wait arrival_lead() s before arrival. Push has no suction to
+        # forgive a late hit, so the lead must equal the FULL post-wait latency
+        # (queue re-entry + scan + dispatch + stroke retreat->contact pre-travel) —
+        # ~0.8 s (FIXED_DELAY_PUSH), NOT throw's small forgiving base. See
+        # PushSkill.arrival_lead().
         ctx.set_status("WAITING", target.class_name)
         ctx.wait_for_arrival(target, T_grasp[1, 3], offset=self.arrival_lead())
 
