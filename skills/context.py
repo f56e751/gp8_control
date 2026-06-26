@@ -432,6 +432,27 @@ class SkillContext:
             start_lead = self.cfg.ACTION_START_LEAD
         self.sleep_until(t_arrival - start_lead)
 
+    def lifted_standby_joint(self, end_joint: np.ndarray) -> np.ndarray:
+        """Park pose for when a next object EXISTS but wasn't committed for
+        pre-position (it routes to a different skill, or isn't reachable after this
+        action). Keeps the action's end XY but RAISES Z to the home/idle height, so
+        the arm lifts straight up off the belt — avoiding the low-to-low belt sweep
+        that motivated parking at home — WITHOUT the wasteful full trip to the home
+        pose. Only a truly empty queue (no next object detected yet) returns all the
+        way home (via idle_joint); the callers choose between the two. Falls back to
+        idle_joint on FK/IK failure.
+        """
+        end_joint = np.asarray(end_joint, dtype=float)
+        T = self.robot.forward_kinematics(end_joint[:6])
+        T[2, 3] = float(self.cfg.INITIAL_T[2, 0])      # home/idle Z (cfg.INITIAL_T)
+        q = self.robot.inverse_kinematics(T, q_init=end_joint[:6])
+        if q is None:
+            self.log.warn("lifted-standby IK failed; parking at home/idle pose")
+            return self.idle_joint
+        q = np.asarray(q, dtype=float)
+        q[-1] = 0.0
+        return q
+
     def scan_next_intercept(
         self, from_joint: np.ndarray, throw_time: float,
     ) -> "tuple[Optional[np.ndarray], Optional[float]]":

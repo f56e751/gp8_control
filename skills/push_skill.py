@@ -601,14 +601,22 @@ class PushSkill(ManipulationSkill):
         push_end_dq = vel_stroke[:, -1]         # ~0 (boundary condition)
 
         if append_chain:
-            # Chain target: the next throw's grasp if committed, else the shared
-            # idle/standby pose (idle_target). copy() so ctx.idle_joint is never
-            # mutated by the wrist write below.
-            chain_target = (
-                np.asarray(next_intercept_joint, dtype=float)
-                if next_intercept_joint is not None
-                else self.idle_target().copy()
-            )
+            # Chain target (3-way): the next THROW's grasp if committed; else, when
+            # the queue is EMPTY (no next object detected yet, ①a), the full
+            # home/standby pose; else (a next object exists but was NOT committed —
+            # different skill or unreachable after the push, ①b/②) the lifted
+            # standby — push_end raised to home Z, so the arm clears the belt without
+            # the wasted home round-trip. copy() so ctx.idle_joint is never mutated
+            # by the wrist write below.
+            if next_intercept_joint is not None:
+                chain_target = np.asarray(next_intercept_joint, dtype=float)
+                chain_dest = "next intercept"
+            elif not ctx.queue:
+                chain_target = self.idle_target().copy()
+                chain_dest = "home/idle (queue empty)"
+            else:
+                chain_target = ctx.lifted_standby_joint(push_end_q)
+                chain_dest = "lifted standby (uncommitted next)"
             # Wrist (joint 6) at the chain end = 0 either way:
             #  - throw next: the throw arc starts with joint 6 = 0 (ThrowSkill
             #    zeroes it), and the committed throw uses skip_move so it does NOT
@@ -635,6 +643,7 @@ class PushSkill(ManipulationSkill):
             final_joint = chain_target
         else:
             chained_to_next = False
+            chain_dest = "push_end (no chain)"
             final_joint = push_end_q
 
         traj_push = np.concatenate(seg_traj, axis=1)
@@ -650,7 +659,7 @@ class PushSkill(ManipulationSkill):
             f"(d={push_distance:.3f}m @ {PUSH_SPEED:.2f}m/s, "
             f"θ={np.degrees(theta):.1f}°, swing "
             f"{np.degrees(SWING_BIAS - SWING_ANGLE):+.0f}°→{np.degrees(SWING_BIAS + SWING_ANGLE):+.0f}°), "
-            f"{'chain→next intercept' if chained_to_next else ('chain→idle pose' if append_chain else 'end at push_end (no chain)')}"
+            f"chain→{chain_dest}"
         )
 
         # Thin to ≥ _MIN_QUEUE_GAP between points so the synchronous point-push

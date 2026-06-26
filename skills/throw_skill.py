@@ -371,17 +371,26 @@ class ThrowSkill(ManipulationSkill):
             start_dq5 = np.clip(vel_ext[cut], -ctx.M1[:5], ctx.M1[:5])
             chain_target = np.asarray(next_intercept_joint, dtype=float)
             chained_to_next = True
+            chain_dest = "next intercept"
         else:
             traj_pre_5 = traj_ext.T                    # (5, n_steps+1) full arc
             vel_pre_5 = vel_ext.T
             ts_pre = ts_ext
             start_q5 = traj_ext[-1]                     # aim_joint2 at rest
             start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
-            # No next pick -> return to the shared standby pose (idle_target),
-            # NOT back to this object's grasp. The chain starts from aim_joint2
-            # (high hover, at rest), so the move to idle stays high — no belt
-            # sweep. copy() so the shared ctx.idle_joint is never mutated.
-            chain_target = self.idle_target().copy()
+            # No committed next pick. Only trek all the way to the home/standby pose
+            # when the queue is EMPTY (no next object detected yet, ①a). When a next
+            # object DOES exist but wasn't committed (different skill, or unreachable
+            # after the throw — ①b/②), don't go home: lift the follow-through
+            # (aim_joint2) to home Z and park there, so the next skill approaches
+            # fresh from near the belt instead of after a wasted home round-trip.
+            # copy() so the shared ctx.idle_joint is never mutated.
+            if not ctx.queue:
+                chain_target = self.idle_target().copy()
+                chain_dest = "home/idle (queue empty)"
+            else:
+                chain_target = ctx.lifted_standby_joint(aim_joint2)
+                chain_dest = "lifted standby (uncommitted next)"
             chained_to_next = False
 
         zero5 = np.zeros(5)
@@ -421,7 +430,7 @@ class ThrowSkill(ManipulationSkill):
             f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
             f"{release_idx}/{traj_throw.shape[1] - 1} (eta step {eta_idx}, "
             f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, "
-            f"{'cut@release->next intercept' if chained_to_next else 'full arc->idle pose'})"
+            f"{'cut@release' if chained_to_next else 'full arc'}->{chain_dest})"
         )
 
         primed_next = ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
