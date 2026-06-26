@@ -367,6 +367,7 @@ class SkillContext:
         target: "TrackedObject",
         intercept_y: float,
         skip_move: bool = False,
+        start_lead: "Optional[float]" = None,
     ) -> None:
         """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
 
@@ -423,10 +424,13 @@ class SkillContext:
                     self.sleep_until(t_suction)
                     self.traj_ctrl.suction_on()
         self.set_status("WAITING", getattr(target, "class_name", ""))
-        # End the wait THROW_START_LEAD before predicted arrival so the throw's
+        # End the wait `start_lead` s before predicted arrival so the post-wait
         # queue-mode re-entry (~0.4 s) overlaps the object's final approach and the
-        # lift lands on arrival instead of trailing it.
-        self.sleep_until(t_arrival - self.cfg.THROW_START_LEAD)
+        # lift lands on arrival instead of trailing it. start_lead defaults to the
+        # shared cfg.ACTION_START_LEAD; the skill passes its own arrival_lead().
+        if start_lead is None:
+            start_lead = self.cfg.ACTION_START_LEAD
+        self.sleep_until(t_arrival - start_lead)
 
     def scan_next_intercept(
         self, from_joint: np.ndarray, throw_time: float,

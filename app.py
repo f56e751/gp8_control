@@ -121,14 +121,18 @@ class Config:
     # SUCTION_LEAD = 1.0 (throw tuning) won the push/throw merge; push had 0.5.
     # If push over-primes, split this per-skill instead of re-globalizing.
     SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
-    # Begin the throw this many seconds BEFORE the object's predicted arrival, so
-    # the throw's queue-mode re-entry (~0.4 s) overlaps the object's final approach
-    # and the lift lands ON arrival instead of trailing it. 0 = wait for full
-    # predicted arrival (old behavior). Default 0.2 tuned on hardware; the limit is
-    # the object's actual arrival (too large -> lift before the object is there).
-    # env-overridable for re-tuning without a rebuild.
-    THROW_START_LEAD: float = field(    # [s] — env GP8_THROW_START_LEAD
-        default_factory=lambda: float(os.environ.get("GP8_THROW_START_LEAD", "0.2"))
+    # SHARED base arrival-lead for every skill: end the WAITING block this many
+    # seconds BEFORE the object's predicted arrival so the post-wait queue-mode
+    # re-entry (~0.4 s) + trajectory dispatch overlap the object's final approach
+    # and the action lands ON arrival instead of trailing it. This covers ONLY the
+    # queue-reentry/dispatch budget common to all skills; a skill that needs MORE
+    # lead (e.g. push must also cover its stroke's retreat->contact pre-travel)
+    # adds its own extra by overriding ManipulationSkill.arrival_lead() — see
+    # base.py. 0 = wait for full predicted arrival (old behavior). Default 0.2
+    # tuned on hardware; the limit is the object's actual arrival (too large ->
+    # act before the object is there). env-overridable for re-tuning w/o a rebuild.
+    ACTION_START_LEAD: float = field(    # [s] — env GP8_ACTION_START_LEAD
+        default_factory=lambda: float(os.environ.get("GP8_ACTION_START_LEAD", "0.2"))
     )
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the

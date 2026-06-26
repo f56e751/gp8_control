@@ -137,6 +137,7 @@ class ThrowSkill(ManipulationSkill):
         ctx.position_and_prime(
             current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
             skip_move=prepositioned,
+            start_lead=self.arrival_lead(),
         )
 
         # Lift + throw — same path as the moving strategy.

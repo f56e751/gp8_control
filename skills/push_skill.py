@@ -174,6 +174,18 @@ class PushSkill(ManipulationSkill):
         """Accept objects whose class_name is in PUSH_CLASSES."""
         return target.class_name in PUSH_CLASSES
 
+    def arrival_lead(self) -> float:
+        """Push needs MORE lead than the shared base: it waits BEHIND the contact
+        line (parked at ``grasp_retreat``, ``PUSH_RETREAT_DISTANCE`` back), so on
+        top of the base queue-reentry/dispatch budget the stroke still has to
+        travel from the retreat pose to the contact line before it hits the object.
+        Add that pre-travel time (distance / speed). Nominal retreat distance — the
+        actual retreat may be clamped shorter by ``PUSH_RETREAT_MIN_X`` (see
+        ``_compute_retreat_poses``), so this slightly over-estimates, erring on the
+        side of acting a touch early rather than late.
+        """
+        return super().arrival_lead() + PUSH_RETREAT_DISTANCE / PUSH_SPEED
+
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
     # ------------------------------------------------------------------
@@ -263,13 +275,14 @@ class PushSkill(ManipulationSkill):
         ctx.move_through_via(current_joint, aim_joint, grasp_retreat_joint)
 
         # ---- 2. WAITING: block until the object arrives ----
-        # Use the SAME arrival lead as throw (THROW_START_LEAD): it only needs to
-        # cover queue-mode re-entry so the stroke lands ON arrival. FIXED_DELAY_PUSH
-        # (0.8) was stale — it used to also cover the descent, but the descent now
-        # runs during POSITIONING (append_descent=False), so 0.8 fired the stroke
-        # ~0.6 s too early and missed. Match throw, no separate push delay.
+        # End the wait arrival_lead() s before arrival. Unlike throw (which waits AT
+        # the grasp pose, so only the shared queue-reentry/dispatch budget matters),
+        # push waits BEHIND the contact line at grasp_retreat, so arrival_lead()
+        # adds the stroke's retreat->contact pre-travel on top of that shared budget
+        # — see PushSkill.arrival_lead(). FIXED_DELAY_PUSH (0.8) was stale (it also
+        # covered the descent, now done during POSITIONING) and is no longer used.
         ctx.set_status("WAITING", target.class_name)
-        ctx.wait_for_arrival(target, T_grasp[1, 3], offset=ctx.cfg.THROW_START_LEAD)
+        ctx.wait_for_arrival(target, T_grasp[1, 3], offset=self.arrival_lead())
 
         # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
         ctx.set_status("PUSHING", target.class_name)

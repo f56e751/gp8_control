@@ -64,6 +64,21 @@ class ManipulationSkill(ABC):
         """
         return self.ctx.idle_joint
 
+    def arrival_lead(self) -> float:
+        """Seconds before the object's predicted arrival to END the WAITING block.
+
+        The wait helpers (``ctx.position_and_prime`` / ``ctx.wait_for_arrival``)
+        stop ``arrival_lead()`` seconds early so the post-wait queue-mode re-entry
+        + trajectory dispatch overlap the object's final approach and the action
+        lands ON arrival. Default: the shared
+        :attr:`~gp8_control.app.Config.ACTION_START_LEAD` budget (queue re-entry +
+        dispatch) common to all skills. Override to ADD a skill-specific lead —
+        mirrors :meth:`can_handle` / :meth:`idle_target` (base default + per-skill
+        override). E.g. push waits BEHIND the contact line, so it overrides this to
+        add its stroke's retreat->contact pre-travel.
+        """
+        return self.ctx.cfg.ACTION_START_LEAD
+
     @abstractmethod
     def execute(self, request: "PickRequest") -> "SkillResult":
         """Perform the full manipulation for the selected target.
