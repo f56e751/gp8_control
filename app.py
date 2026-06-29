@@ -179,6 +179,18 @@ class Config:
     # selection now flows through the dynamic intercept too — validate on push.
     PICK_FEASIBILITY_FACTOR: float = 1.05
 
+    # opt_time -> real positioning-time calibration for the SKILL TIMELINE model
+    # (skills' t_to_contact, consumed by earliest_reachable_intercept). opt_time is
+    # only a proxy for the real positioning move; this scales it. Default 1.0 = use
+    # opt_time as-is (conservative: do NOT shrink it — under-estimating positioning
+    # is what makes push strike behind the object). Lower it (<1) only if HW logs
+    # show opt_time over-estimates the real positioning move. ONLY the push timeline
+    # uses it today (throw keeps PICK_FEASIBILITY_FACTOR); env-overridable for
+    # re-tuning without a rebuild. See PushSkill.t_to_contact / base.py.
+    OPT_TIME_TO_REAL: float = field(    # env GP8_OPT_TIME_TO_REAL
+        default_factory=lambda: float(os.environ.get("GP8_OPT_TIME_TO_REAL", "1.0"))
+    )
+
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85
@@ -368,6 +380,9 @@ class GP8App:
             # Deferred: self.selector is built just below; the lambda is only
             # called at run time (after setup), by which point it is set.
             skill_for=lambda obj: self.selector.skill_for(obj),
+            # Same deferred lookup, resolved to the skill OBJECT (name -> object via
+            # the selector's skills map) so the intercept solver can use its timeline.
+            skill_obj_for=lambda obj: self.selector.skills[self.selector.skill_for(obj)],
             idle_joint=idle_joint,
         )
         self.throw_skill = ThrowSkill(self.ctx)
@@ -494,11 +509,20 @@ class GP8App:
         target_it = None
         while self.queue:
             candidate = self.queue.head()
-            it = self.ctx.earliest_reachable_intercept(candidate, current_joint, v, now)
+            # Place/judge the intercept with the timeline of the skill that will
+            # ACTUALLY run this object (push has a much larger time-to-contact than
+            # throw). Routing is geometry-independent, so resolving it here matches
+            # the skill selected later at run_epoch.
+            skill = self.ctx.skill_obj_for(candidate)
+            it = self.ctx.earliest_reachable_intercept(
+                candidate, current_joint, v, now,
+                t_to_contact_fn=skill.t_to_contact,
+            )
             if it is None:
                 self.queue.pop_head()
                 self._node.get_logger().info(
-                    f"Drop {candidate.class_name}: uncatchable in workspace "
+                    f"Drop id={candidate.track_id} {candidate.class_name} "
+                    f"(conf {candidate.conf:.2f}): uncatchable in workspace "
                     f"(out of reach, or passes downstream before the arm arrives)"
                 )
                 continue
@@ -514,7 +538,8 @@ class GP8App:
         # Keep the active target visible in belt_viz while we execute the cycle.
         self._active_target = target
         self._node.get_logger().info(
-            f"Ambush lock: {target.class_name} @ x={target_it.T_grasp[0, 3]:+.3f} "
+            f"Ambush lock: id={target.track_id} {target.class_name} "
+            f"(conf {target.conf:.2f}) @ x={target_it.T_grasp[0, 3]:+.3f} "
             f"y={target_it.intercept_y:+.3f} z={target_it.T_grasp[2, 3]:+.3f} "
             f"(eta {target_it.eta:.2f}s, move {target_it.move_time:.2f}s)"
         )
@@ -552,7 +577,8 @@ class GP8App:
         secondary = self.queue.head() if self.queue else None
         self._active_target = obj
         self._node.get_logger().info(
-            f"Committed pick: {obj.class_name} @ x={float(it.T_grasp[0, 3]):+.3f} "
+            f"Committed pick: id={obj.track_id} {obj.class_name} (conf {obj.conf:.2f}) "
+            f"@ x={float(it.T_grasp[0, 3]):+.3f} "
             f"y={it.intercept_y:+.3f} (prepositioned; reusing chain's judgment)"
         )
         return PickRequest(
@@ -695,6 +721,13 @@ class GP8App:
         if request is not None:
             # Decide push vs throw (rule-based today; RL later) and run it.
             skill = self.selector.select(request)
+            # DIAGNOSTIC: id + class -> skill in one line. A PET (transparent)
+            # showing "-> push" here means its TRACK is labelled metal (latched or
+            # ghost) — cross-check against [track-MATCH-MISMATCH] / [track-NEW].
+            self._node.get_logger().info(
+                f"Route id={request.target.track_id} {request.target.class_name} "
+                f"(conf {request.target.conf:.2f}) -> {skill.name}"
+            )
             skill.execute(request)
         else:
             # No feasible pick this epoch — don't leave a return-primed

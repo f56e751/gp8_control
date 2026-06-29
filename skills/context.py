@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from gp8_control.planning import PickThrowPlanner
     from gp8_control.conveyor import ConveyorSpeedTracker
     from gp8_control.tracking import TrackedObject, TrackedObjectQueue
+    from gp8_control.skills.base import ManipulationSkill
 
 
 @dataclass
@@ -104,6 +105,11 @@ class SkillContext:
     # Skill NAME that will handle a given object (wired to ActionSelector.skill_for).
     # Lets the chain pre-position the NEXT object with the skill that will run it.
     skill_for: Callable[["TrackedObject"], str]
+    # The SKILL OBJECT (not just its name) that will handle a given object. Lets the
+    # intercept solver query that skill's t_to_contact() timeline — push and throw
+    # have different setup/positioning/contact costs, so the grasp must be placed
+    # using the skill that will actually run. Wired in GP8App._build_skills.
+    skill_obj_for: Callable[["TrackedObject"], "ManipulationSkill"]
     # Default standby pose (6-DOF joint vector, wrist/j6 = 0) the post-action
     # chain returns to when there is NO next object to pre-position. Computed once
     # in GP8App._build_skills from cfg.INITIAL_R/T (the boot pose). Skills reach it
@@ -143,6 +149,7 @@ class SkillContext:
         v: float,
         now: float,
         pre_delay: float = 0.0,
+        t_to_contact_fn: "Optional[Callable[[float], float]]" = None,
     ) -> "Optional[Intercept]":
         """Earliest belt-Y at which the arm can grab ``target``, or ``None`` if it
         can't be caught anywhere in the workspace before passing downstream.
@@ -205,9 +212,17 @@ class SkillContext:
                 opt_time(current_joint, zero, aj, zero, self.M1, self.M2)
                 + opt_time(aj, zero, gj, zero, self.M1, self.M2)
             )
-            # Where the object will be once the arm is ready (after pre_delay) and
-            # has travelled (move_time padded by the feasibility factor as margin).
-            obj_y_arrival = obj_y - v * (pre_delay + move_time * factor)
+            # Where the object will be once the arm reaches CONTACT (after pre_delay).
+            # The contact budget is the skill's real timeline (t_to_contact_fn:
+            # setup + positioning + contact offset) when supplied, else the legacy
+            # opt_time*factor proxy. This is the placement+feasibility fix: the old
+            # proxy omitted queue-re-entry + push pre-travel, so the grasp was aimed
+            # upstream of where the object actually was at strike.
+            budget = (
+                t_to_contact_fn(move_time) if t_to_contact_fn is not None
+                else move_time * factor
+            )
+            obj_y_arrival = obj_y - v * (pre_delay + budget)
             if obj_y_arrival < -y_b:
                 return None                      # exits downstream before the arm arrives
             target_y = min(obj_y_arrival, y_b)   # wait at the entry edge if still upstream
@@ -488,26 +503,35 @@ class SkillContext:
         # is judged ONCE here and stored (committed_intercept) for the next selection
         # to reuse — no re-judgment.
         for cand in list(self.queue._objects):
-            it = self.earliest_reachable_intercept(
-                cand, from_joint, v, now, pre_delay=throw_time,
-            )
-            if it is None:
-                self.log.info(
-                    f"Chain skip {cand.class_name}: not catchable after throw "
-                    f"({throw_time:.2f}s) + move"
-                )
-                continue
+            # GATE BEFORE judging catchability: if the most-downstream remaining
+            # candidate routes to a DIFFERENT skill (e.g. a can -> push), STOP the
+            # chain here. This must come BEFORE the catchability test: judging the can
+            # with its (larger) push budget + pre_delay=throw_time can mark it
+            # uncatchable-after-throw and `continue` PAST it, committing an upstream
+            # PET — which then bypasses the can next epoch via the committed path and
+            # STARVES it, even though the IMMEDIATE pick (pre_delay=0) might still
+            # catch it. Stopping first guarantees the can is re-evaluated fresh next
+            # epoch. (This chain only ever pre-positions a THROW grasp; a non-throw
+            # next does its OWN skill's approach fresh — one set per skill.)
             if self.skill_for(cand) != "throw":
-                # Immediate next object routes to a DIFFERENT skill (e.g. a can ->
-                # push). Do NOT pre-position/commit it here — this chain only parks
-                # at a THROW grasp (where the committed pick then primes suction at
-                # the grasp). A non-throw next does its OWN skill's approach fresh
-                # next cycle. Keeps "approach + manipulate" one set per skill.
                 self.log.info(
-                    f"Chain stop: next {cand.class_name} routes to "
+                    f"Chain stop: next id={cand.track_id} {cand.class_name} routes to "
                     f"'{self.skill_for(cand)}', not throw — no throw pre-position"
                 )
                 return None, None
+            # cand routes to throw here; judge catchability with its timeline (== the
+            # legacy budget, since throw doesn't override t_to_contact).
+            cand_skill = self.skill_obj_for(cand)
+            it = self.earliest_reachable_intercept(
+                cand, from_joint, v, now, pre_delay=throw_time,
+                t_to_contact_fn=cand_skill.t_to_contact,
+            )
+            if it is None:
+                self.log.info(
+                    f"Chain skip id={cand.track_id} {cand.class_name}: not catchable "
+                    f"after throw ({throw_time:.2f}s) + move"
+                )
+                continue
             # Prime the NEXT object's suction during the return CHAIN, NEVER during
             # this throw. Catching the next object upstream (+y_b) makes its eta
             # small, which would otherwise fire the prime mid-throw and RE-GRAB the
@@ -519,7 +543,7 @@ class SkillContext:
             self.committed_next = cand
             self.committed_intercept = it
             self.log.info(
-                f"Chain target: {cand.class_name} at "
+                f"Chain target: id={cand.track_id} {cand.class_name} at "
                 f"x={float(it.T_grasp[0, 3]):+.3f} y={it.intercept_y:+.3f} "
                 f"(prime in {max(0.0, suction_on_at - now):.2f}s, arrival {it.eta:.2f}s)"
             )

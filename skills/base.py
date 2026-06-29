@@ -79,6 +79,28 @@ class ManipulationSkill(ABC):
         """
         return self.ctx.cfg.ACTION_START_LEAD
 
+    def t_to_contact(self, move_time: float) -> float:
+        """Wall-clock from "the arm starts moving toward the target" to "contact
+        lands ON the object" — the budget ``earliest_reachable_intercept`` uses to
+        place the grasp intercept (and judge feasibility): the object is aimed at
+        where it will be ``t_to_contact`` from now.
+
+        ``move_time`` is the solver's per-iteration ``opt_time`` positioning
+        estimate (passed in so this stays a cheap scalar inside the fixed point —
+        no re-planning). The full decomposition is
+        ``T_setup (queue re-entry) + T_position + T_contact_offset``; a skill whose
+        contact is timing-critical overrides this to add its real terms.
+
+        Base default = the LEGACY estimate ``move_time * PICK_FEASIBILITY_FACTOR``,
+        so a skill that doesn't override (THROW) keeps byte-identical behaviour —
+        throw parks at the grasp and grabs PASSIVELY on the object's arrival
+        (suction primed early), so it is timing-forgiving and its working heuristic
+        is left untouched. Mirrors :meth:`arrival_lead` / :meth:`idle_target`
+        (base default + per-skill override). PUSH overrides this — its contact is an
+        active, timed sweep with no forgiveness, so it needs the honest timeline.
+        """
+        return move_time * self.ctx.cfg.PICK_FEASIBILITY_FACTOR
+
     @abstractmethod
     def execute(self, request: "PickRequest") -> "SkillResult":
         """Perform the full manipulation for the selected target.

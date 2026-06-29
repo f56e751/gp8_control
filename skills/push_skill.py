@@ -190,6 +190,31 @@ class PushSkill(ManipulationSkill):
         """
         return FIXED_DELAY_PUSH
 
+    def t_to_contact(self, move_time: float) -> float:
+        """Honest push timeline (overrides the base legacy heuristic).
+
+        Push contact is an ACTIVE, timed sweep with NO suction forgiveness, so the
+        intercept MUST be placed where the object will be at the REAL strike time,
+        not where the bare positioning estimate lands. The real budget from "arm
+        starts moving" to "stroke contacts the object" is::
+
+            T_setup#1 (enter_queue_mode before POSITIONING, push_skill.py:262)
+          + T_position (move_through_via: rise to aim hover + descend to retreat)
+          + T_setup#2 (enter_queue_mode before the stroke, push_skill.py:292)
+          + T_contact_offset (stroke travels grasp_retreat -> contact line)
+
+        The two queue re-entries (~0.4 s EACH) and the retreat->contact pre-travel
+        are exactly what the old ``move_time * factor`` omitted — why the arm aimed
+        upstream of where the can actually was and struck the next object. T_setup
+        is the controller's MEASURED rolling average; T_position is opt_time scaled
+        by OPT_TIME_TO_REAL; T_contact_offset = PUSH_RETREAT_DISTANCE / PUSH_SPEED.
+        """
+        ctx = self.ctx
+        t_setup = ctx.traj_ctrl.qmode_ms_avg / 1000.0          # one queue re-entry (measured)
+        t_position = move_time * ctx.cfg.OPT_TIME_TO_REAL
+        t_pre_travel = PUSH_RETREAT_DISTANCE / max(PUSH_SPEED, 1e-6)
+        return 2.0 * t_setup + t_position + t_pre_travel        # setup#1 + setup#2
+
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
     # ------------------------------------------------------------------
@@ -286,6 +311,32 @@ class PushSkill(ManipulationSkill):
         # PushSkill.arrival_lead().
         ctx.set_status("WAITING", target.class_name)
         ctx.wait_for_arrival(target, T_grasp[1, 3], offset=self.arrival_lead())
+
+        # ---- 2b. STALE-STROKE GUARD ----
+        # If timing slipped and the object has already passed the ENTIRE stroke span,
+        # do NOT fire: the stroke would sweep into the NEXT object (the observed
+        # "pushed the next PET"). The stroke runs grasp_retreat -> push_end; the only
+        # belt-Y range it can still contact is between those two ends. The push
+        # heading's Y sign is geometry-dependent (for an intercept UPSTREAM of the bin
+        # the stroke actually sweeps downstream-in-Y), so compare against the
+        # most-DOWNSTREAM (smallest-Y) stroke end, not just grasp_retreat. Drop
+        # cleanly (same cleanup as the queue-fail path). The timeline fix (skill-aware
+        # t_to_contact) should make this rare; this is the hard safety net.
+        push_dir_guard = self._compute_push_direction(T_grasp_retreat, T_aim2)
+        push_distance_guard = PUSH_DISTANCE_MAP.get(target.class_name, PUSH_DISTANCE)
+        stroke_end_y = T_grasp_retreat[1, 3] + push_distance_guard * push_dir_guard[1]
+        stroke_min_y = min(float(T_grasp_retreat[1, 3]), float(stroke_end_y))
+        obj_y_now = ctx.object_y_now(target, time.time(), ctx.conveyor.current)
+        if obj_y_now < stroke_min_y:
+            ctx.log.warn(
+                f"Push abort: id={target.track_id} {target.class_name} already past the "
+                f"stroke (y={obj_y_now:+.3f} < stroke_min {stroke_min_y:+.3f}); "
+                f"skipping stale stroke"
+            )
+            ctx.traj_ctrl.suction_off()
+            ctx.set_active_target(None)
+            ctx.set_status("IDLE", "")
+            return SkillResult(False, "object passed stroke span; push aborted")
 
         # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
         ctx.set_status("PUSHING", target.class_name)

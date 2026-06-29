@@ -50,6 +50,13 @@ class TrajectoryController:
         self.current_joints: list | None = None
         self.current_jointvels: list | None = None
         self._jmon = None   # [QMODE-DBG] (min,max) joint tracker during a mode switch
+        # Measured point-queue-mode re-entry cost (the dominant fixed overhead the
+        # timeline model — SkillContext.earliest_reachable_intercept via the skills'
+        # t_to_contact — must account for). last = most recent attempt; avg = EMA so
+        # a one-off slow switch (e.g. a reset_error retry) doesn't spike the estimate.
+        # Seeded to ~0.4 s so cycle 1 has a sane non-zero T_setup before any measurement.
+        self.last_qmode_ms: float | None = None
+        self.qmode_ms_avg: float = 400.0
 
         cb_group = ReentrantCallbackGroup()
 
@@ -262,15 +269,25 @@ class TrajectoryController:
             return None
         fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
         rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        res = fut.result()
+        # Record the measured switch cost so the timeline model's T_setup tracks the
+        # real controller latency. last_qmode_ms keeps the raw value (diagnostic);
+        # the EMA folds ONLY a SUCCESSFUL switch (result_code 1) so a 10 s service
+        # timeout (res None) or an alarm-blocked attempt can't spike qmode_ms_avg and
+        # transiently over-place / drop catchable pushes for several cycles.
+        dt_ms = (time.time() - t0) * 1000.0
+        self.last_qmode_ms = dt_ms
+        if res is not None and res.result_code.value == 1:
+            self.qmode_ms_avg = 0.3 * dt_ms + 0.7 * self.qmode_ms_avg   # EMA, alpha=0.3
         if self._jmon is not None and j0 is not None:
             lo, hi = self._jmon
             exc = [round(hi[i] - lo[i], 4) for i in range(len(lo))]
             self._node.get_logger().info(
-                f"[QMODE-DBG] mode switch {(time.time() - t0) * 1000:.0f}ms; "
+                f"[QMODE-DBG] mode switch {dt_ms:.0f}ms; "
                 f"joint excursion (max-min) = {exc} rad"
             )
         self._jmon = None
-        return fut.result()
+        return res
 
     def _reset_error(self) -> bool:
         """Call MotoROS2 /reset_error to clear an active alarm/error.
