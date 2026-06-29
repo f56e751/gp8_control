@@ -33,6 +33,13 @@ def _make_transform(R: np.ndarray, t) -> np.ndarray:
     return T
 
 
+def _fmt_votes(votes: dict) -> str:
+    """Compact 'cls:weight' dump (highest first) for the reclass log."""
+    return "{" + ", ".join(
+        f"{k}:{v:.2f}" for k, v in sorted(votes.items(), key=lambda kv: -kv[1])
+    ) + "}"
+
+
 # Tool orientation: tool pointing down at the belt. Must match the value the
 # camera_debug node assumes when it reports base_grasp / base_aim.
 _R_GRASP_DEFAULT = np.array(
@@ -108,6 +115,8 @@ class DetectionIntake:
             base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
             det_x = float(base_grasp[0])
             det_y = float(base_grasp[1])
+            det_class = d.get("class", "?")
+            conf = float(d.get("confidence", -1.0))
             match = next((o for o in existing if _matches(o, det_x, det_y)), None)
             if match is not None:
                 # Re-anchor the existing track to this fresh detection instead of
@@ -118,17 +127,44 @@ class DetectionIntake:
                 match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
                 match.detect_time = detect_time
                 match.cam_pos = tuple(d.get("cam", [0.0, 0.0, 0.0]))
+                match.conf = conf
+                # Class is VOTED, not latched: add this frame's confidence-weighted
+                # vote and adopt the running argmax. The spawn frame is often the
+                # noisy entry-edge frame (low conf), so a PET that misfired as metal
+                # on spawn is corrected here once consistent higher-confidence
+                # transparent detections outweigh it — instead of being pushed
+                # forever. Log only the flip (no per-frame spam).
+                prev_class = match.class_name
+                voted = match.vote_class(det_class, conf)
+                if voted != prev_class:
+                    match.class_name = voted
+                    if logger is not None:
+                        logger.warn(
+                            f"[track-RECLASS] id={match.track_id} {prev_class} -> "
+                            f"{voted} (votes {_fmt_votes(match.class_votes)}; "
+                            f"det {det_class} conf={conf:.2f})"
+                        )
                 refreshed += 1
                 continue
             new_obj = TrackedObject(
                 T_aim_base=_make_transform(_R_GRASP_DEFAULT, base_aim),
                 T_grasp_base=_make_transform(_R_GRASP_DEFAULT, base_grasp),
-                class_name=d.get("class", "?"),
+                class_name=det_class,
                 detect_time=detect_time,
                 cam_pos=tuple(d.get("cam", [0.0, 0.0, 0.0])),
+                conf=conf,
             )
+            # Seed the class vote with the spawn frame's confidence so a confident
+            # spawn class isn't flipped by one stray frame, but a low-confidence one
+            # (the usual misfire) is easily outvoted. class_name stays det_class here.
+            new_obj.vote_class(det_class, conf)
             queue.add(new_obj)
             existing.append(new_obj)  # dedupe within the same intake too
+            if logger is not None:
+                logger.info(
+                    f"[track-NEW] id={new_obj.track_id} class={new_obj.class_name} "
+                    f"x={det_x:+.3f} y={det_y:+.3f} conf={conf:.2f}"
+                )
             added += 1
 
         if added > 0 and logger is not None:

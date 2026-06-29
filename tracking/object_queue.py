@@ -11,9 +11,16 @@ about object lifecycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import itertools
+from dataclasses import dataclass, field
 
 import numpy as np
+
+
+# Monotonic per-process track-id source. Diagnostic: lets logs follow one
+# physical object across dedup re-anchors, and exposes duplicate/ghost tracks
+# (a NEW id appearing for an object that should have re-matched an existing one).
+_track_id_counter = itertools.count(1)
 
 
 @dataclass
@@ -25,6 +32,33 @@ class TrackedObject:
     # Raw camera-frame position [cx, cy, cz] (m) reported by the perception
     # stream, kept verbatim for belt_viz / diagnostics. None on legacy paths.
     cam_pos: tuple | None = None
+    # Latest detection confidence (camera_debug "confidence"); -1.0 until set.
+    # Updated on every dedup re-anchor so it reflects the most recent sighting.
+    conf: float = -1.0
+    # Stable id assigned at creation and KEPT across re-anchors, so logs can
+    # follow this track and spot duplicates. Diagnostic only (not used for logic).
+    track_id: int = field(default_factory=lambda: next(_track_id_counter))
+    # Confidence-weighted class-vote tally {class_name: cumulative_weight}. The
+    # class is NOT latched at spawn — the first frame is often the noisy entry-edge
+    # frame, so a PET whose spawn misfired as "metal" would otherwise be routed to
+    # push forever. Every detection adds its confidence here (see vote_class) and
+    # the EFFECTIVE class_name is the running argmax.
+    class_votes: dict = field(default_factory=dict)
+
+    def vote_class(self, cls: str, conf: float) -> str:
+        """Add a confidence-weighted vote for ``cls``; return the winning class.
+
+        Weight = max(conf, 0) + a tiny floor (so a missing/zero-confidence frame
+        still counts once). Cumulative over the track's life, so a low-confidence
+        spawn misclassification is quickly overridden by consistent higher-
+        confidence detections, while a genuinely-confident class isn't flipped by a
+        couple of stray frames. Does NOT mutate class_name — the caller adopts the
+        returned winner (so it can log a flip).
+        """
+        self.class_votes[cls] = (
+            self.class_votes.get(cls, 0.0) + max(float(conf), 0.0) + 1e-3
+        )
+        return max(self.class_votes, key=self.class_votes.get)
 
 
 class TrackedObjectQueue:
