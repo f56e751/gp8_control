@@ -38,7 +38,7 @@ import time
 
 
 _CMD_HEADER = [
-    "cmd_id", "iso_time", "t_queued", "planned_dur_s", "planned_end_t",
+    "cmd_id", "skill", "iso_time", "t_queued", "planned_dur_s", "planned_end_t",
     "actual_dur_s", "actual_end_t", "err_s", "reached",
     *[f"start_j{i + 1}" for i in range(6)],
     *[f"target_j{i + 1}" for i in range(6)],
@@ -69,6 +69,7 @@ class MotionLogger:
         self._tol = float(arrival_tol_rad)
         self._cmd_id = 0
         self._pending: "dict | None" = None
+        self._label = ""          # op label (skill name) tagged onto commands
         self._enabled = False
         self._cmd_f = self._sample_f = None
         self._cmd_w = self._sample_w = None
@@ -77,10 +78,13 @@ class MotionLogger:
         try:
             out_dir = os.path.expanduser(out_dir)
             os.makedirs(out_dir, exist_ok=True)
-            self._cmd_f = open(os.path.join(out_dir, "motion_commands.csv"),
-                               "w", newline="")
-            self._sample_f = open(os.path.join(out_dir, "motion_samples.csv"),
-                                  "w", newline="")
+            # Stamp filenames per run so successive launches don't overwrite each
+            # other (each run -> its own pair of CSVs).
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._cmd_f = open(
+                os.path.join(out_dir, f"motion_commands_{stamp}.csv"), "w", newline="")
+            self._sample_f = open(
+                os.path.join(out_dir, f"motion_samples_{stamp}.csv"), "w", newline="")
             self._cmd_w = csv.writer(self._cmd_f)
             self._sample_w = csv.writer(self._sample_f)
             self._cmd_w.writerow(_CMD_HEADER)
@@ -102,6 +106,13 @@ class MotionLogger:
     def enabled(self) -> bool:
         return self._enabled
 
+    def set_label(self, label: str) -> None:
+        """Tag subsequent on_command() rows with this op label (e.g. skill name)."""
+        if not self._enabled:
+            return
+        with self._lock:
+            self._label = label or ""
+
     # ------------------------------------------------------------------
     def on_command(self, start_joint, target_joint, planned_dur_s: float) -> None:
         """Record that a trajectory was just queued (start, target, planned dur)."""
@@ -117,6 +128,7 @@ class MotionLogger:
                 self._cmd_id += 1
                 self._pending = {
                     "id": self._cmd_id,
+                    "skill": self._label,
                     "t_queued": now,
                     "planned_dur": float(planned_dur_s),
                     "planned_end": now + float(planned_dur_s),
@@ -175,7 +187,7 @@ class MotionLogger:
         actual_dur = actual_end - p["t_queued"]
         err = actual_dur - p["planned_dur"]
         self._cmd_w.writerow([
-            p["id"], _iso(p["t_queued"]), f"{p['t_queued']:.4f}",
+            p["id"], p.get("skill", ""), _iso(p["t_queued"]), f"{p['t_queued']:.4f}",
             f"{p['planned_dur']:.4f}", f"{p['planned_end']:.4f}",
             f"{actual_dur:.4f}", f"{actual_end:.4f}", f"{err:+.4f}",
             int(bool(reached)),

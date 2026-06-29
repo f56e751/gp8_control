@@ -728,6 +728,9 @@ class GP8App:
                 f"Route id={request.target.track_id} {request.target.class_name} "
                 f"(conf {request.target.conf:.2f}) -> {skill.name}"
             )
+            # Tag this cycle's queued commands with the skill (push/throw) for the
+            # diagnostic motion CSV (no-op unless GP8_MOTION_LOG_DIR is set).
+            self.traj_ctrl.set_motion_op(skill.name)
             skill.execute(request)
         else:
             # No feasible pick this epoch — don't leave a return-primed

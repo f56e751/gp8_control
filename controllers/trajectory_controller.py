@@ -136,6 +136,11 @@ class TrajectoryController:
     # Joint state
     # ------------------------------------------------------------------
 
+    def set_motion_op(self, label: str) -> None:
+        """Tag subsequent queued commands with an op label (e.g. skill name) for the
+        diagnostic MotionLogger's CSV. No-op unless GP8_MOTION_LOG_DIR is set."""
+        self._motion_logger.set_label(label)
+
     def _joint_state_cb(self, msg: JointState) -> None:
         self.current_joints = list(msg.position)
         self.current_jointvels = list(msg.velocity)
@@ -633,6 +638,17 @@ class TrajectoryController:
                 waypoints[0][0], waypoints[-1][0], waypoints[-1][2],
             )
 
+        # [PUSH-DIAG] (only when motion logging is on) measure per-point queue
+        # round-trip + WHEN the arm actually starts moving, on ONE clock, to verify
+        # whether the startup dead-time is the per-point push round-trips (H1) or
+        # MotoROS2-side startup AFTER queueing (H2). current_joints updates during
+        # spin_until_future_complete, so we can spot motion-start mid-push.
+        _diag = self._motion_logger.enabled
+        _t0 = time.time()
+        _start_pos = list(waypoints[0][0]) if waypoints else None
+        _per_pt_ms = []
+        _t_move = None
+
         busy_total = 0
         for i, (pos, v, t) in enumerate(waypoints):
             req = QueueTrajPoint.Request()
@@ -642,6 +658,7 @@ class TrajectoryController:
             req.point.time_from_start = _seconds_to_duration(t)
 
             ok = False
+            _t_pt = time.time()
             for _ in range(busy_max_retry + 1):
                 fut = self._queue_point_client.call_async(req)
                 rclpy.spin_until_future_complete(self._node, fut, timeout_sec=2.0)
@@ -667,6 +684,15 @@ class TrajectoryController:
                 )
                 return False
 
+            if _diag:
+                _per_pt_ms.append((time.time() - _t_pt) * 1000.0)
+                if (_t_move is None and _start_pos is not None
+                        and self.current_joints is not None):
+                    dev = max(abs(a - b) for a, b in
+                              zip(self.current_joints, _start_pos))
+                    if dev > 0.01:          # arm has physically started moving
+                        _t_move = time.time() - _t0
+
             # Interleave the release: once the release waypoint is queued,
             # fire suction_off (the IO command rides between point commands).
             if release_fn is not None and release_index is not None and i >= release_index:
@@ -683,6 +709,17 @@ class TrajectoryController:
             # 큐가 깊지 않을 때 흔하며, 재시도로 자연스럽게 흡수됨.
             self._node.get_logger().debug(
                 f"Queue push: {busy_total} BUSY retries across {len(waypoints)} pts"
+            )
+        if _diag:
+            n = len(_per_pt_ms)
+            avg = sum(_per_pt_ms) / n if n else 0.0
+            mx = max(_per_pt_ms) if _per_pt_ms else 0.0
+            move_s = (f"{_t_move * 1000:.0f}ms (DURING push)"
+                      if _t_move is not None else "NOT until push done (-> H2)")
+            self._node.get_logger().info(
+                f"[PUSH-DIAG] {n} pts queued in {(time.time() - _t0) * 1000:.0f}ms "
+                f"(avg {avg:.0f}, max {mx:.0f} ms/pt; busy={busy_total}); "
+                f"arm motion start = {move_s}"
             )
         return True
 
