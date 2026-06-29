@@ -7,6 +7,7 @@ WriteSingleIO service for suction gripper control via MotoROS2.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import numpy as np
@@ -27,6 +28,8 @@ from motoros2_interfaces.srv import (
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from gp8_control.utils.motion_logger import MotionLogger
 
 JOINT_NAMES = [
     "joint_1_s", "joint_2_l", "joint_3_u",
@@ -57,6 +60,15 @@ class TrajectoryController:
         # Seeded to ~0.4 s so cycle 1 has a sane non-zero T_setup before any measurement.
         self.last_qmode_ms: float | None = None
         self.qmode_ms_avg: float = 400.0
+
+        # Opt-in diagnostic logger: predicted (planned trajectory duration) vs
+        # ACTUAL move time + actual joint trace, to chase per-cycle timing drift.
+        # No-op unless GP8_MOTION_LOG_DIR is set; never affects control. See
+        # gp8_control.utils.motion_logger.
+        self._motion_logger = MotionLogger(
+            os.environ.get("GP8_MOTION_LOG_DIR"),
+            logger=self._node.get_logger(),
+        )
 
         cb_group = ReentrantCallbackGroup()
 
@@ -127,6 +139,7 @@ class TrajectoryController:
     def _joint_state_cb(self, msg: JointState) -> None:
         self.current_joints = list(msg.position)
         self.current_jointvels = list(msg.velocity)
+        self._motion_logger.on_sample(self.current_joints)   # diag (no-op if off)
         # [QMODE-DBG] track joint excursion during a mode switch (catches a
         # transient up-down bobble even when the net move is ~0).
         jmon = self._jmon
@@ -611,6 +624,14 @@ class TrajectoryController:
         if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
             self._node.get_logger().error("queue_traj_point service unavailable.")
             return False
+
+        # diag (no-op if off): log the queued command — start = snapped current
+        # position (waypoints[0]), target = final point, planned dur = its
+        # time_from_start. The actual reach time is filled from joint samples.
+        if waypoints:
+            self._motion_logger.on_command(
+                waypoints[0][0], waypoints[-1][0], waypoints[-1][2],
+            )
 
         busy_total = 0
         for i, (pos, v, t) in enumerate(waypoints):
