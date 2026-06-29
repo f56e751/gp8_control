@@ -568,8 +568,10 @@ class PushSkill(ManipulationSkill):
            line at ``PUSH_SPEED`` m/s for ``PUSH_DISTANCE`` m, parallel to
            the belt surface (constant Z). Direction is from T_grasp towards
            T_aim2, projected onto the XY plane. Each Cartesian waypoint is
-           converted to joint space via IK. Boundary velocities are zero for
-           smooth concatenation with the adjacent segments.
+           converted to joint space via IK. The stroke STARTS at rest (the arm was
+           parked at grasp_retreat waiting); its EXIT velocity is carried into the
+           chain (continuized — see the build code) so there is no full stop at
+           push_end.
 
         3. **Chain** (push_end → next_intercept or grasp): time-optimal
            transition so the arm flows directly to the next pick cycle,
@@ -649,7 +651,27 @@ class PushSkill(ManipulationSkill):
         # run asynchronously — it would block the next pick's dispatch and trip
         # code 2 'Must call start_point_queue_mode'.)
         push_end_q = traj_stroke[:, -1]         # last waypoint of stroke (6-DOF)
-        push_end_dq = vel_stroke[:, -1]         # ~0 (boundary condition)
+        # CONTINUIZE stroke -> chain: feed the stroke's natural EXIT velocity into the
+        # chain's START (push_end_dq) instead of starting the chain from REST. The
+        # chain trajectory then begins at full speed, so its POSITIONS flow
+        # continuously out of the stroke rather than accelerating from a standstill —
+        # which is what removes the visible "push, then stop, rotate + move" pause and
+        # its overrun beyond the planned timestamps (throw stays ≈planned because its
+        # arc is continuous; push overran ~+0.13s from this stop). Mirrors the throw's
+        # release-velocity carry (build_throw_trajectory). Clipped to the joint-vel
+        # limits (Yaskawa alarm 4414 safety). NOTE: the queued velocities are
+        # re-derived from positions by _decimate_for_queue, so it's the continuous
+        # POSITIONS (from the carried start vel) that matter; vel_stroke's last column
+        # is updated only to keep the pre-decimation arrays self-consistent.
+        if traj_stroke.shape[1] >= 2:
+            _dt_end = max(float(ts_stroke[-1] - ts_stroke[-2]), 1e-9)
+            push_end_dq = np.clip(
+                (traj_stroke[:, -1] - traj_stroke[:, -2]) / _dt_end,
+                -ctx.M1[:6], ctx.M1[:6],
+            )
+            vel_stroke[:, -1] = push_end_dq     # queued stroke now exits at speed
+        else:
+            push_end_dq = vel_stroke[:, -1]
 
         if append_chain:
             # Chain target (3-way): the next THROW's grasp if committed; else, when
