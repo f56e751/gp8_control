@@ -45,6 +45,12 @@ def _seconds_to_duration(seconds: float) -> Duration:
     return Duration(sec=sec, nanosec=nanosec)
 
 
+def _max_abs_diff(a, b) -> float:
+    """Max per-element |a_i - b_i| over the shared length (joint-space distance)."""
+    n = min(len(a), len(b))
+    return max((abs(float(a[i]) - float(b[i])) for i in range(n)), default=0.0)
+
+
 class TrajectoryController:
     """Executes joint trajectories and controls suction gripper I/O via ROS 2."""
 
@@ -731,6 +737,137 @@ class TrajectoryController:
                 qmode_ms=self.last_qmode_ms,
             )
         return True
+
+    def _push_one_point(
+        self, pos, vel, t, *, busy_retry_delay: float = 0.015, busy_max_retry: int = 5,
+    ) -> "int | None":
+        """Push ONE queue point; return its result_code (BUSY retried in place).
+
+        SUCCESS=1, WRONG_MODE=2, INIT_FAILURE=3, BUSY=4, INVALID_JOINT_LIST=5,
+        UNABLE_TO_PROCESS_POINT=6; ``None`` = service timeout. BUSY exhaustion
+        returns 4 (a reject) rather than silently dropping the point, so the
+        caller can abort instead of leaving a gap. The human-readable message
+        (carries the '204'/init text on a re-checked start position) is logged.
+        """
+        req = QueueTrajPoint.Request()
+        req.joint_names = JOINT_NAMES
+        req.point.positions = [float(x) for x in pos]
+        req.point.velocities = [float(x) for x in vel]
+        req.point.time_from_start = _seconds_to_duration(float(t))
+        for _ in range(busy_max_retry + 1):
+            fut = self._queue_point_client.call_async(req)
+            rclpy.spin_until_future_complete(self._node, fut, timeout_sec=2.0)
+            res = fut.result()
+            if res is None:
+                self._node.get_logger().error("[PERSIST] queue point: service timeout")
+                return None
+            code = int(res.result_code.value)
+            if code == 4:  # BUSY -> brief wait, retry same point
+                time.sleep(busy_retry_delay)
+                continue
+            if code != 1:
+                self._node.get_logger().warn(
+                    f"[PERSIST] queue reject code={code} msg='{res.message}'")
+            return code
+        return 4  # BUSY exhausted -> treat as reject (do NOT drop silently)
+
+    def push_segments_persistent(
+        self, segments, *, wait: bool = True, tail_buffer: float = 0.3,
+        join_tol: float = 0.05,
+    ):
+        """Stage-C 영속 큐 프리미티브 — N 세그먼트를 하나의 큐 세션에 연속 스트리밍.
+
+        세그먼트마다 큐모드를 재진입(stop+start, 측정 ~0.41s = dispatch 오버헤드의
+        61%)하는 대신, 큐를 비우지 않고 다음 세그먼트 점들을 이어붙여 재진입을 제거.
+
+        segments: ``[(traj, vel, timestep, final_joint), ...]`` (send_trajectory_queue
+        와 동일 형식; **속도-연속**이어야 함). 하나의 **순증가** 타임라인으로 병합:
+        - 첫 세그먼트의 첫 점만 측정 현재 위치로 스냅(큐 초기화 — MotoROS2는 새 큐의
+          첫 점이 현재 위치와 일치해야 함; 거부는 result_code 3/6 + 메시지의 '204').
+        - 이후 세그먼트는 직전 세그먼트 끝 시각 뒤로 offset; 공유 경계점(seg[0] ≈ 직전
+          끝점, ``join_tol`` 이내)은 **중복 제거**해 시각이 strictly-increasing 유지.
+        - 정지(zero-vel) settle 점은 **마지막에 한 번만** 부여(중간 정지/속도 불연속 방지).
+
+        호출 전 ``enter_queue_mode()`` 1회 필요. 반환 ``(ok, seg_codes)`` —
+        ``seg_codes[i]`` = 세그먼트 i가 받은 result_code들.
+
+        **거부 시 즉시 중단(abort-on-reject)**: 어떤 점이든 non-SUCCESS면 그 자리에서
+        푸시를 멈춰 큐에 **연속 prefix만** 남긴다(구멍 없음). 따라서 큐 드레인
+        (WRONG_MODE=2)이든, 비-빈 큐 append 재검사(INIT_FAILURE=3/UNABLE=6)든,
+        영리한 재개를 시도하지 않고 안전하게 실패를 알린다 — 팔은 큐된 prefix를 마치고
+        정지(물리적으로 안전). 복구(현재 위치 재측정 후 일반 경로)는 호출자 책임.
+
+        NOTE(Stage-C 게이트): 비-빈 큐 append가 시작점 재검사를 받는지 여부는
+        ``tests/persistent_queue_spike.py``로 HW 검증. 기본 skill 경로엔 미연결.
+        """
+        n_seg = len(segments)
+        if n_seg == 0:
+            return True, []
+        if self.current_joints is None:
+            self._node.get_logger().error("[PERSIST] no current_joints; aborting.")
+            return False, []
+
+        # --- build ONE strictly-increasing, boundary-deduped waypoint stream ---
+        stream = []                      # (pos, vel, time, seg_idx)
+        running_end = 0.0
+        prev_last_pos = None
+        for si, (traj, vel, ts, final_joint) in enumerate(segments):
+            pos = [list(p) for p in traj.T.tolist()]
+            vels = [list(v) for v in vel.T.tolist()]
+            times = [float(t) for t in ts]
+            if si == 0:
+                pos[0] = list(self.current_joints)        # queue-init match
+                start_idx, offset = 0, 0.0
+            else:
+                offset = running_end
+                if _max_abs_diff(pos[0], prev_last_pos) <= join_tol:
+                    start_idx = 1                          # drop shared boundary point
+                else:                                      # discontinuous: connect, keep monotonic
+                    start_idx = 0
+                    step = (times[1] - times[0]) if len(times) > 1 else 0.05
+                    offset = running_end + step
+                    self._node.get_logger().warn(
+                        f"[PERSIST] seg {si} boundary gap "
+                        f"{_max_abs_diff(pos[0], prev_last_pos):.3f} rad; inserting connector.")
+            for i in range(start_idx, len(times)):
+                stream.append((pos[i], vels[i], times[i] + offset, si))
+            running_end = times[-1] + offset
+            prev_last_pos = pos[-1]
+        # single full-stop settle point at the very end
+        last_final = segments[-1][3]
+        fj = list(last_final) if last_final is not None else list(prev_last_pos)
+        running_end += 0.05
+        stream.append((fj, [0.0] * 6, running_end, n_seg - 1))
+
+        # defensive: times must be strictly increasing for the MotoROS2 queue
+        for a, b in zip(stream, stream[1:]):
+            if b[2] <= a[2]:
+                self._node.get_logger().error(
+                    f"[PERSIST] non-monotonic time {a[2]:.3f}->{b[2]:.3f}; aborting.")
+                return False, [[] for _ in range(n_seg)]
+
+        # --- push with ABORT-ON-REJECT (queue keeps only a continuous prefix) ---
+        seg_codes = [[] for _ in range(n_seg)]
+        if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
+            self._node.get_logger().error("[PERSIST] queue_traj_point unavailable.")
+            return False, seg_codes
+        t_start = time.time()
+        ok = True
+        pushed_end = 0.0
+        for pos, v, t, si in stream:
+            code = self._push_one_point(pos, v, t)
+            seg_codes[si].append(code)
+            if code != 1:
+                ok = False
+                self._node.get_logger().warn(
+                    f"[PERSIST] seg {si}: rejected (code={code}); stopping push — "
+                    "queue holds continuous prefix, caller must recover.")
+                break
+            pushed_end = t
+        if wait:
+            # wait only for what was actually queued (the continuous prefix)
+            self._wait_trajectory_end(pushed_end, t_start=t_start, tail_buffer=tail_buffer)
+        return ok, seg_codes
 
     def _wait_trajectory_end(
         self,
