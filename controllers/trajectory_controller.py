@@ -721,6 +721,15 @@ class TrajectoryController:
                 f"(avg {avg:.0f}, max {mx:.0f} ms/pt; busy={busy_total}); "
                 f"arm motion start = {move_s}"
             )
+            # Persist the same breakdown onto the open command row so err_s can be
+            # decomposed (re-entry / push / arm-start) per dispatch in the CSV.
+            self._motion_logger.on_dispatch(
+                n_pts=len(waypoints),
+                push_ms=(time.time() - _t0) * 1000.0,
+                perpt_avg=avg, perpt_max=mx, busy=busy_total,
+                motion_start_ms=(_t_move * 1000.0) if _t_move is not None else None,
+                qmode_ms=self.last_qmode_ms,
+            )
         return True
 
     def _wait_trajectory_end(

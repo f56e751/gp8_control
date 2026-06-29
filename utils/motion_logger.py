@@ -42,7 +42,14 @@ _CMD_HEADER = [
     "actual_dur_s", "actual_end_t", "err_s", "reached",
     *[f"start_j{i + 1}" for i in range(6)],
     *[f"target_j{i + 1}" for i in range(6)],
+    # Queue-dispatch breakdown (filled by on_dispatch from _push_waypoints) — splits
+    # the opaque err_s into its components so re-entry vs push vs buffer-fill can be
+    # told apart across before/after runs. Empty for non-queue commands.
+    "n_pts", "push_ms", "perpt_ms_avg", "perpt_ms_max", "busy",
+    "motion_start_ms", "qmode_ms",
 ]
+_DIAG_KEYS = ("n_pts", "push_ms", "perpt_ms_avg", "perpt_ms_max", "busy",
+              "motion_start_ms", "qmode_ms")
 _SAMPLE_HEADER = ["t", "cmd_id", "dist_to_target", *[f"j{i + 1}" for i in range(6)]]
 
 
@@ -135,7 +142,44 @@ class MotionLogger:
                     "start": [float(x) for x in start_joint][:6],
                     "target": [float(x) for x in target_joint][:6],
                     "arrived": False,
+                    **{k: "" for k in _DIAG_KEYS},  # diag cols (filled by on_dispatch)
                 }
+        except Exception:
+            pass  # diagnostics must never disturb control
+
+    def on_dispatch(self, *, n_pts=None, push_ms=None, perpt_avg=None,
+                    perpt_max=None, busy=None, motion_start_ms=None,
+                    qmode_ms=None) -> None:
+        """Attach queue-dispatch diagnostics to the still-OPEN command row.
+
+        Called once by ``_push_waypoints`` right after the points are pushed (the
+        row finalizes later, on arrival). These values are what the console
+        ``[PUSH-DIAG]`` line already computes; recording them per row lets the
+        otherwise-opaque ``err_s`` be split into queue-mode re-entry (``qmode_ms``),
+        synchronous push (``push_ms`` over ``n_pts``, ``busy`` retries) and the
+        arm-start delay (``motion_start_ms``). All no-op unless logging is on.
+        """
+        if not self._enabled:
+            return
+        try:
+            with self._lock:
+                p = self._pending
+                if p is None:
+                    return
+                if n_pts is not None:
+                    p["n_pts"] = int(n_pts)
+                if push_ms is not None:
+                    p["push_ms"] = f"{push_ms:.1f}"
+                if perpt_avg is not None:
+                    p["perpt_ms_avg"] = f"{perpt_avg:.1f}"
+                if perpt_max is not None:
+                    p["perpt_ms_max"] = f"{perpt_max:.1f}"
+                if busy is not None:
+                    p["busy"] = int(busy)
+                if motion_start_ms is not None:
+                    p["motion_start_ms"] = f"{motion_start_ms:.0f}"
+                if qmode_ms is not None:
+                    p["qmode_ms"] = f"{qmode_ms:.0f}"
         except Exception:
             pass  # diagnostics must never disturb control
 
@@ -193,5 +237,6 @@ class MotionLogger:
             int(bool(reached)),
             *[f"{x:.5f}" for x in p["start"]],
             *[f"{x:.5f}" for x in p["target"]],
+            *[p.get(k, "") for k in _DIAG_KEYS],
         ])
         self._cmd_f.flush()
