@@ -67,6 +67,17 @@ class TrajectoryController:
         self.last_qmode_ms: float | None = None
         self.qmode_ms_avg: float = 400.0
 
+        # Persistent-queue session state (Stage C). One queue session spans pick +
+        # ambush hold + throw with NO per-segment re-entry (~0.41s each). _pq_t is
+        # the running time_from_start of the last queued point (the monotonic
+        # session timeline); _pq_last_pos the last queued joint pose; _pq_start the
+        # wall clock when the session began (for completion waits). See pq_begin/
+        # pq_segment/pq_hold_until/pq_finish.
+        self._pq_active: bool = False
+        self._pq_t: float = 0.0
+        self._pq_last_pos: list | None = None
+        self._pq_start: float = 0.0
+
         # Opt-in diagnostic logger: predicted (planned trajectory duration) vs
         # ACTUAL move time + actual joint trace, to chase per-cycle timing drift.
         # No-op unless GP8_MOTION_LOG_DIR is set; never affects control. See
@@ -879,6 +890,152 @@ class TrajectoryController:
             # wait only for what was actually queued (the continuous prefix)
             self._wait_trajectory_end(pushed_end, t_start=t_start, tail_buffer=tail_buffer)
         return ok, seg_codes
+
+    # ------------------------------------------------------------------
+    # Persistent-queue SESSION (stateful): pick + ambush hold + throw in ONE
+    # queue, with NO per-segment re-entry. push_segments_persistent handles the
+    # all-known-upfront case; this session adds a dynamic HOLD (feed points at
+    # grasp during the ambush wait so the queue never drains) between segments.
+    # ------------------------------------------------------------------
+    def pq_begin(self) -> None:
+        """Open a persistent-queue session on the CURRENT (already-entered) queue.
+
+        Caller must have a fresh ``enter_queue_mode()`` succeed first. Resets the
+        monotonic session timeline; the next ``pq_segment`` snaps its first point
+        to the measured current position (queue-init / code 204)."""
+        if self._pq_active:
+            self._node.get_logger().warn(
+                "[PQ] pq_begin while a session is active; resetting timeline — "
+                "ensure a fresh enter_queue_mode() preceded this.")
+        self._pq_active = True
+        self._pq_t = 0.0
+        self._pq_last_pos = None
+        self._pq_start = time.time()
+
+    def _pq_push_stream(self, wp) -> tuple:
+        """Push (pos, vel, time) points with ABORT-ON-REJECT; advance the session
+        timeline to the last SUCCESS point. Returns (ok, codes)."""
+        codes = []
+        ok = True
+        for pos, v, t in wp:
+            if self._pq_last_pos is not None and t <= self._pq_t:
+                self._node.get_logger().error(
+                    f"[PQ] non-monotonic time {self._pq_t:.3f}->{t:.3f}; aborting.")
+                ok = False
+                break
+            code = self._push_one_point(pos, v, t)
+            codes.append(code)
+            if code != 1:
+                ok = False
+                self._node.get_logger().warn(
+                    f"[PQ] point rejected code={code}; stopping (continuous prefix kept).")
+                break
+            self._pq_t = t
+            self._pq_last_pos = list(pos)
+        return ok, codes
+
+    def pq_segment(self, traj, vel, ts, final_joint, *, is_last: bool = False,
+                   join_tol: float = 0.05) -> tuple:
+        """Append one trajectory segment onto the session timeline (no re-entry).
+
+        Session's first segment snaps its first point to current joints; later
+        segments append raw and drop the shared boundary point (seg[0] ≈ last
+        queued pose within ``join_tol``) so times stay strictly increasing. The
+        zero-velocity settle point is added only when ``is_last``. (ok, codes)."""
+        if not self._pq_active:
+            self._node.get_logger().error("[PQ] pq_segment without pq_begin; aborting.")
+            return False, []
+        pos = [list(p) for p in traj.T.tolist()]
+        vels = [list(v) for v in vel.T.tolist()]
+        times = [float(t) for t in ts]
+        if self._pq_last_pos is None:
+            if self.current_joints is None:
+                self._node.get_logger().error("[PQ] no current_joints; aborting.")
+                return False, []
+            pos[0] = list(self.current_joints)
+            start_idx, offset = 0, 0.0
+        else:
+            offset = self._pq_t
+            if _max_abs_diff(pos[0], self._pq_last_pos) <= join_tol:
+                start_idx = 1
+            else:
+                start_idx = 0
+                step = (times[1] - times[0]) if len(times) > 1 else 0.05
+                offset = self._pq_t + step
+                self._node.get_logger().warn(
+                    f"[PQ] segment boundary gap "
+                    f"{_max_abs_diff(pos[0], self._pq_last_pos):.3f} rad; connector.")
+        wp = [(pos[i], vels[i], times[i] + offset) for i in range(start_idx, len(times))]
+        if is_last:
+            base = wp[-1][2] if wp else offset
+            fj = list(final_joint) if final_joint is not None else list(pos[-1])
+            wp.append((fj, [0.0] * 6, base + 0.05))
+        if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
+            self._node.get_logger().error("[PQ] queue_traj_point unavailable.")
+            return False, []
+        return self._pq_push_stream(wp)
+
+    def pq_hold_until(self, hold_joint, deadline_wall: float, *,
+                      dt: float = 0.12, lead: float = 0.35) -> bool:
+        """Keep the queue ALIVE at ``hold_joint`` until wall clock ``deadline_wall``.
+
+        Feeds zero-velocity hold points at ``hold_joint`` so queue mode does not
+        auto-exit during an ambush wait. Paced: push when the session timeline is
+        < ``lead`` ahead of elapsed-wall-since-pq_begin, else spin.
+
+        NOTE the buffer ahead of the ARM is ``lead + startup-dead-time`` (the wall
+        clock is anchored at pq_begin, before motion actually starts) — conservative
+        against draining, but it delays the following segment (the throw) by that
+        much, and if it exceeds the ~10-point queue capacity the hold saturates.
+        When wiring the real throw, anchor pacing to the measured motion-start (the
+        [PUSH-DIAG] _t_move signal) for precise release timing.
+
+        Only WRONG_MODE(2) means the queue genuinely drained (fatal → False).
+        BUSY(4)/timeout leave the queue ALIVE (full/transient) → skip that point
+        and keep going. ``hold_joint`` MUST equal where the arm actually is (the
+        last queued pose); a mismatch would be a position step over dt → velocity
+        spike / alarm 4414, so it is refused."""
+        if not self._pq_active:
+            return False
+        hold = list(hold_joint)[:6]
+        if self._pq_last_pos is not None:
+            d = _max_abs_diff(hold, self._pq_last_pos)
+            if d > 0.02:
+                self._node.get_logger().error(
+                    f"[PQ] hold_joint is {d:.3f} rad from the last queued pose; "
+                    "refusing (would command a jump). Hold at the segment's end pose.")
+                return False
+        zero = [0.0] * 6
+        while time.time() < deadline_wall:
+            if self._pq_t < (time.time() - self._pq_start) + lead:
+                code = self._push_one_point(hold, zero, self._pq_t + dt)
+                if code == 2:  # WRONG_MODE = queue drained/exited -> genuinely lost
+                    self._node.get_logger().warn("[PQ] hold: WRONG_MODE — queue drained.")
+                    return False
+                if code == 1:
+                    self._pq_t += dt
+                    self._pq_last_pos = hold
+                # BUSY(4)/None(timeout): queue still alive (full/transient) -> skip
+            else:
+                rclpy.spin_once(self._node, timeout_sec=0.01)
+        return True
+
+    def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
+                  settle_tol: float = 0.03) -> None:
+        """End the session; optionally wait for the queued motion to complete.
+
+        After the time estimate, CONFIRM arrival at the last queued pose via joint
+        feedback — the pure wall-clock estimate can under-shoot by the startup
+        dead-time or a BUSY-throttled final push, which would otherwise let a
+        caller read a still-moving arm or chop it on the next mode switch."""
+        if wait and self._pq_active:
+            self._wait_trajectory_end(
+                self._pq_t, t_start=self._pq_start, tail_buffer=tail_buffer)
+            if self._pq_last_pos is not None:
+                self._wait_for_position(
+                    np.asarray(self._pq_last_pos, dtype=float),
+                    tolerance=settle_tol, timeout_sec=1.5)
+        self._pq_active = False
 
     def _wait_trajectory_end(
         self,

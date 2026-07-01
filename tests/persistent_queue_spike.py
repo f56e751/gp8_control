@@ -1,29 +1,29 @@
-"""Stage C 게이트 — 영속 큐(persistent queue) HW 스파이크.
+"""Stage-C HW spike — persistent queue with a dynamic HOLD (ambush miniature).
 
-플랜(`hashed-strolling-diffie.md`) Stage C의 **필수 선행 검증**:
-큐모드 재진입(측정 ~0.41s/dispatch = dispatch 오버헤드의 61%)을 제거하려면
-"큐를 안 비우고" 다음 세그먼트 점들을 *실행 중인(비-빈) 큐*에 append할 수 있어야
-한다. 이때 MotoROS2가 "첫 점이 현재 위치와 일치"(code 204류) 검사를 **다시
-하는가?**
+The A→B append feasibility already tested GREEN (MotoROS2 accepts mid-stream
+appends to a non-empty queue). This spike validates the NEXT building block the
+real pick→throw needs: keeping ONE queue alive across a multi-second WAIT by
+feeding hold points (so no re-entry before the throw), then appending the
+continuation — via the controller's session API:
 
-가설: 그 검사는 큐 *초기화*(빈 큐 → 첫 점)에만 적용. 비-빈 큐 중간 append는
-"첫 점"이 아니므로 통과 → 영속 큐 성립. 이 스크립트가 그걸 실측한다.
+    enter_queue_mode()             # once
+    pq_begin()
+    pq_segment(A)                  # "pick": drive to grasp
+    pq_hold_until(grasp, +HOLD_S)  # "ambush wait": feed holds, queue stays ALIVE
+    pq_segment(B, is_last=True)    # "throw": continuation into the SAME queue
+    pq_finish()
 
-이 스파이크는 프로덕션 프리미티브
-``TrajectoryController.push_segments_persistent`` 를 그대로 호출한다(단, 폴백을
-꺼서 append의 raw 코드를 관찰). 세그먼트 A(작고 느린 이동)와 B(= A의 *계획
-끝점*에서 이어지는 추가 이동)를 하나의 큐 세션에 연속 푸시하고, B의 result_code를
-본다:
-  - 전부 SUCCESS(1)  → mid-stream append OK → Stage C GREEN
-  - 2/3/6 등 거부    → 재검사 발생 → wait-until-near-end join 필요(RED)
+Verdict:
+  - all ok + queue survived the hold + arm reaches B target -> GREEN
+    (persistent queue across an ambush wait works; re-entry can be removed)
+  - pq_hold_until returns False (WRONG_MODE mid-hold) -> queue drained: the hold
+    pacing (lead) is too shallow -> RED / needs a larger lead.
 
-⚠️ 실제 로봇이 움직인다. 동작은 작고(기본 +10cm X 총합) 느리다(0.2s 간격).
-   팔 주변 1m 비우고, REMOTE+AUTO·알람 없음 상태에서 실행.
+⚠️ Real robot moves ~10cm slowly, then holds at the grasp pose for HOLD_S, then
+   continues. Clear 1m; REMOTE+AUTO, no alarms.
 
-선행:
-  ros2 launch gp8_control debug_robot.launch.py
-실행(torch 불필요; setup.py 미등록 → -m):
-  PYTHONPATH=$HOME/ros2_ws/src python3 -m gp8_control.tests.persistent_queue_spike
+  ros2 launch gp8_control debug_robot.launch.py    # terminal 1
+  ros2 run gp8_control persistent_queue_spike       # terminal 2
 """
 
 from __future__ import annotations
@@ -37,15 +37,12 @@ from rclpy.node import Node
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.robots.gp8 import GP8
 
-# --- safe, slow probe parameters ---
-SEG_DX = 0.06        # 6 cm forward for segment A
-SEG_B_DX = 0.04      # +4 cm further for segment B (continues from A's end)
-DT = 0.2             # 0.2 s between queued points (well above ~40ms push round-trip)
-NA = 20              # segment A points  -> ~3.8 s of motion (wide injection window)
-NB = 10              # segment B points  -> ~2.0 s
-
-_CODE = {1: "SUCCESS", 2: "WRONG_MODE", 3: "INIT_FAILURE",
-         4: "BUSY", 5: "INVALID_JOINT_LIST", 6: "UNABLE_TO_PROCESS_POINT"}
+SEG_DX = 0.06        # 6 cm forward for segment A ("pick" drive)
+SEG_B_DX = 0.04      # +4 cm further for segment B ("throw" continuation)
+DT = 0.2             # inter-point spacing for the moving segments
+NA = 20              # segment A points
+NB = 10              # segment B points
+HOLD_S = 3.0         # seconds to hold at grasp (simulated ambush wait)
 
 
 def _ik(gp8: GP8, T: np.ndarray) -> "np.ndarray | None":
@@ -58,17 +55,14 @@ def _ik(gp8: GP8, T: np.ndarray) -> "np.ndarray | None":
 
 
 def _lin_segment(q0: np.ndarray, q1: np.ndarray, n: int, dt: float):
-    """Linear joint interpolation -> (traj DOFxn, vel DOFxn, ts) for the
-    controller's queue builder. Times are 0-based (the persistent primitive
-    offsets each segment past the previous one). Velocities: central differences
-    interior, 0 at the ends (slow probe — a near-zero A→B junction is safe)."""
+    """Linear joint interp -> (traj 6xn, vel 6xn, ts) 0-based; ends at zero vel."""
     s = np.linspace(0.0, 1.0, n)
-    pos = np.array([q0 + si * (q1 - q0) for si in s])      # (n, 6)
+    pos = np.array([q0 + si * (q1 - q0) for si in s])
     times = dt * np.arange(n)
     vel = np.zeros_like(pos)
     for i in range(1, n - 1):
         vel[i] = (pos[i + 1] - pos[i - 1]) / (times[i + 1] - times[i - 1])
-    return pos.T, vel.T, times                              # (6,n), (6,n), (n,)
+    return pos.T, vel.T, times
 
 
 def main() -> None:
@@ -99,14 +93,12 @@ def main() -> None:
             return
 
         traj_a, vel_a, ts_a = _lin_segment(cur, qA, NA, DT)
-        traj_b, vel_b, ts_b = _lin_segment(qA, qB, NB, DT)   # B[0]=qA (A's END, not current)
-        segments = [(traj_a, vel_a, ts_a, qA), (traj_b, vel_b, ts_b, qB)]
+        traj_b, vel_b, ts_b = _lin_segment(qA, qB, NB, DT)
 
         print(f"\ncurrent (deg): {[round(float(np.degrees(j)), 1) for j in cur]}")
-        print(f"segment A: {NA} pts over {ts_a[-1]:.1f}s  (+{SEG_DX * 100:.0f}cm X)")
-        print(f"segment B: {NB} pts over {ts_b[-1]:.1f}s (append while A runs; "
-              f"B[0]=A_end NOT current)")
-        print("\n⚠️  Robot WILL move (~10cm total, slow). Clear 1m. Enter 'go' to proceed.")
+        print(f"A: drive +{SEG_DX*100:.0f}cm ({NA} pts) -> HOLD {HOLD_S:.0f}s at grasp "
+              f"-> B: continue +{SEG_B_DX*100:.0f}cm ({NB} pts), ONE queue session")
+        print("\n⚠️  Robot moves ~10cm, holds, continues. Clear 1m. Enter 'go'.")
         if input("> ").strip().lower() != "go":
             print("Aborted by user.")
             return
@@ -116,38 +108,42 @@ def main() -> None:
             print("  Failed to enter queue mode.")
             return
         try:
-            # push_segments_persistent aborts on the first reject, so B's codes
-            # are observed RAW — the timeline is monotonic by construction, so a
-            # B-reject genuinely means a start-position re-check (not a self-
-            # inflicted duplicate timestamp).
-            ok, seg_codes = ctrl.push_segments_persistent(
-                segments, wait=True, tail_buffer=0.3)
-            a_codes, b_codes = seg_codes[0], seg_codes[1]
-            print(f"\n  A codes: {a_codes}")
-            print(f"  B codes: {b_codes}  "
-                  f"({', '.join(_CODE.get(c, str(c)) for c in b_codes)})")
-            dev = max(abs(a - b) for a, b in zip(ctrl.current_joints, list(qB)))
-            print(f"  final joint max-dev from B target = {dev:.4f} rad")
-
-            print("\n===== STAGE C SPIKE VERDICT =====")
-            if not a_codes or not all(c == 1 for c in a_codes):
-                print(f"  INCONCLUSIVE: segment A (queue init) did not fully "
-                      f"succeed: {a_codes}. Check queue mode / current position.")
-            elif not b_codes:
-                print("  INCONCLUSIVE: segment B never pushed (A aborted early).")
-            elif all(c == 1 for c in b_codes):
-                print("  GREEN: mid-stream append into a non-empty queue SUCCEEDED "
-                      "(no start-position re-check).")
-                print("  -> Persistent queue feasible; re-entry (~0.41s/dispatch) "
-                      "can be removed via push_segments_persistent.")
+            ctrl.pq_begin()
+            t0 = time.time()
+            okA, cA = ctrl.pq_segment(traj_a, vel_a, ts_a, qA)
+            print(f"  A ({len(cA)} pts): ok={okA}")
+            okH = okB = False
+            cB = []
+            if okA:
+                okH = ctrl.pq_hold_until(qA, time.time() + HOLD_S)
+                print(f"  HOLD {HOLD_S:.0f}s: queue stayed alive = {okH}")
+                if okH:
+                    okB, cB = ctrl.pq_segment(traj_b, vel_b, ts_b, qB, is_last=True)
+                    print(f"  B ({len(cB)} pts): ok={okB}, codes={cB}")
+                else:
+                    print("  (hold drained — not appending B)")
             else:
-                bad = [(i, _CODE.get(c, c)) for i, c in enumerate(b_codes) if c != 1]
-                print(f"  RED: B rejected at {bad} (see [PERSIST] log for the msg; "
-                      "'204'/init text = start-position re-check).")
-                print("  -> MotoROS2 re-checks the appended point. Persistent queue "
-                      "needs a different join (feed hold points + push throw just "
-                      "before drain, or floating-start plan).")
-            print("=================================")
+                print("  (A aborted — not holding/appending B)")
+            ctrl.pq_finish(wait=True)
+            dev = max(abs(a - b) for a, b in zip(ctrl.current_joints, list(qB)))
+            print(f"  total {time.time()-t0:.1f}s; final max-dev from B = {dev:.4f} rad")
+
+            print("\n===== STAGE C HOLD-SPIKE VERDICT =====")
+            if okA and okH and okB and dev < 0.02:
+                print("  GREEN: one queue survived the pick + HOLD + throw with NO "
+                      "re-entry; arm reached the continuation target.")
+                print("  -> Ready to wire push_segments/hold into throw_skill "
+                      "(feed holds during ambush, append throw).")
+            elif not okA:
+                print(f"  INCONCLUSIVE: segment A (queue init) failed: {cA}. "
+                      "Check queue mode / current position.")
+            elif not okH:
+                print("  RED (hold drained): the queue emptied during the hold — "
+                      "increase pq_hold_until lead (more buffered ahead).")
+            else:
+                print(f"  RED/PARTIAL: okA={okA} okH={okH} okB={okB} dev={dev:.4f}. "
+                      f"B codes={cB}. See [PQ] log.")
+            print("======================================")
         finally:
             print("\nReturning to FJT mode ...")
             ctrl.exit_queue_mode()
