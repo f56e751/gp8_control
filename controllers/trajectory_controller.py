@@ -955,7 +955,8 @@ class TrajectoryController:
         pos = [list(p) for p in traj.T.tolist()]
         vels = [list(v) for v in vel.T.tolist()]
         times = [float(t) for t in ts]
-        if self._pq_last_pos is None:
+        first_seg = self._pq_last_pos is None
+        if first_seg:
             if self.current_joints is None:
                 self._node.get_logger().error("[PQ] no current_joints; aborting.")
                 return False, []
@@ -977,10 +978,28 @@ class TrajectoryController:
             base = wp[-1][2] if wp else offset
             fj = list(final_joint) if final_joint is not None else list(pos[-1])
             wp.append((fj, [0.0] * 6, base + 0.05))
+        if not wp:
+            return True, []          # degenerate (single point deduped away)
         if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
             self._node.get_logger().error("[PQ] queue_traj_point unavailable.")
             return False, []
-        return self._pq_push_stream(wp, between_fn=between_fn)
+        # Diagnostic (no-op unless GP8_MOTION_LOG_DIR): record this segment as a
+        # dispatch so persistent cycles show up in motion_commands.csv comparably
+        # to the non-persistent path. qmode_ms = the queue re-entry cost, but ONLY
+        # for the session's FIRST segment (which followed enter_queue_mode); later
+        # segments (the throw) had NO re-entry -> 0.0, which is exactly the ~0.41s
+        # this path removes — so a persistent throw row reads qmode_ms=0 vs the
+        # non-persistent throw's ~400ms.
+        _log = self._motion_logger.enabled
+        if _log:
+            self._motion_logger.on_command(wp[0][0], wp[-1][0], wp[-1][2] - wp[0][2])
+        _t0 = time.time()
+        ok, codes = self._pq_push_stream(wp, between_fn=between_fn)
+        if _log:
+            self._motion_logger.on_dispatch(
+                n_pts=len(wp), push_ms=(time.time() - _t0) * 1000.0,
+                qmode_ms=(self.last_qmode_ms if first_seg else 0.0))
+        return ok, codes
 
     def pq_hold_until(self, hold_joint, deadline_wall: float, *,
                       dt: float = 0.12, lead: float = 0.35, tick_fn=None) -> bool:
