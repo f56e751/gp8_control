@@ -1073,6 +1073,45 @@ class TrajectoryController:
                 tick_fn()      # e.g. fire suction_on once its wall-clock instant passes
         return True
 
+    def _pq_keepalive_tick(self, *, dt: float = 0.15, lead: float = 0.35) -> str:
+        """ONE keep-alive iteration (the QueueFeeder calls this in a loop between
+        segments). If the buffered timeline ``_pq_t`` is within ``lead`` of the
+        arm's real motion time, push ONE zero-velocity hold point at the last
+        queued pose so the queue never empties (mode never exits). This is the
+        single-tick form of ``pq_hold_until``'s pacing loop.
+
+        Before the first segment ``_pq_last_pos`` is None: seed the queue at the
+        MEASURED current position — that first point equals current joints, which
+        is exactly the code-204 queue-init requirement, and every later hold/segment
+        is a mid-stream append (not re-checked). Returns 'pushed' / 'buffered'
+        (queue deep enough, no push) / 'drained' (WRONG_MODE — the queue genuinely
+        emptied and mode exited; the feeder must stop and hand back to re-entry)."""
+        if not self._pq_active:
+            return "buffered"
+        if self._pq_last_pos is not None:
+            hold = self._pq_last_pos
+            t_push = self._pq_t + dt
+        elif self.current_joints is not None:
+            # Seed the empty queue at the measured current position. The queue's
+            # FIRST point must equal current joints AND (by convention) start at
+            # t=0 — this satisfies code-204 queue-init; every later point is a
+            # mid-stream append.
+            hold = list(self.current_joints)
+            t_push = 0.0 if self._pq_t <= 0.0 else self._pq_t + dt
+        else:
+            return "buffered"
+        anchor = self._pq_motion_start if self._pq_motion_start is not None else self._pq_start
+        if self._pq_t < (time.time() - anchor) + lead:
+            code = self._push_one_point(hold, [0.0] * 6, t_push)
+            if code == 2:  # WRONG_MODE = queue drained/exited
+                self._node.get_logger().warn("[FEEDER] keep-alive WRONG_MODE — queue drained.")
+                return "drained"
+            if code == 1:
+                self._pq_t = t_push
+                self._pq_last_pos = hold
+            return "pushed"
+        return "buffered"
+
     def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
                   settle_tol: float = 0.03) -> None:
         """End the session; optionally wait for the queued motion to complete.

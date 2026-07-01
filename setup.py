@@ -78,6 +78,9 @@ setup(
             "measure_fjt_floor = gp8_control.tests.measure_fjt_floor:main",
             # Same, via the QUEUE path (re-entry + per-point push + startup).
             "measure_queue_floor = gp8_control.tests.measure_queue_floor:main",
+            # Universal background-feeder HW spike (single session across gaps +
+            # submitted segments, one enter_queue_mode). No torch; system python OK.
+            "queue_feeder_spike = gp8_control.tests.queue_feeder_spike:main",
         ],
     },
 )
