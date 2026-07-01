@@ -76,6 +76,8 @@ setup(
             "gp8_control.tests.persistent_queue_spike:main",
             # Measure the pure controller startup floor via FJT (no per-point push).
             "measure_fjt_floor = gp8_control.tests.measure_fjt_floor:main",
+            # Same, via the QUEUE path (re-entry + per-point push + startup).
+            "measure_queue_floor = gp8_control.tests.measure_queue_floor:main",
         ],
     },
 )
