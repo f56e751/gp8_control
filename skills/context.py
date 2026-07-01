@@ -436,8 +436,14 @@ class SkillContext:
                     current_joint, zero, grasp_joint, zero,
                     self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
                 )
+                # is_last=True appends grasp_joint (final_joint) as the exact last
+                # point at rest. WITHOUT it the trajectory()'s discretized last point
+                # can land ~0.05 rad short of grasp (L=int(T*hz) truncation), and the
+                # following pq_hold_until(grasp) then trips its >0.02 rad jump-guard
+                # and refuses — the pick fails intermittently. The settle-at-grasp is
+                # also correct: the arm stops at grasp to wait for the object.
                 ok_drive, _ = self.traj_ctrl.pq_segment(
-                    traj, vel, ts, grasp_joint, between_fn=_prime)
+                    traj, vel, ts, grasp_joint, is_last=True, between_fn=_prime)
                 if not ok_drive:
                     self.log.error("[PQ] pick drive push rejected; aborting pick.")
                     return False

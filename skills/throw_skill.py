@@ -171,7 +171,10 @@ class ThrowSkill(ManipulationSkill):
             # re-selects from a fresh, re-entered session.
             ctx.log.error("Persistent pick failed (queue drained/rejected); aborting.")
             ctx.traj_ctrl.suction_off()
-            ctx.traj_ctrl.pq_finish(wait=False)
+            # wait=True: let the queued prefix finish so the arm is STOPPED before
+            # the next cycle's enter_queue_mode — a mode switch on a moving arm
+            # faults the controller (active Alarm) and cascades WRONG_MODE rejects.
+            ctx.traj_ctrl.pq_finish(wait=True)
             ctx.committed_next = None
             ctx.committed_intercept = None
             ctx.set_active_target(None)
@@ -250,7 +253,10 @@ class ThrowSkill(ManipulationSkill):
             # would grab air at a pose the arm never reached.
             ctx.log.error("Persistent throw push failed; dropping object + aborting.")
             ctx.traj_ctrl.suction_off()
-            ctx.traj_ctrl.pq_finish(wait=False)
+            # wait=True: let the queued prefix finish so the arm is STOPPED before
+            # the next cycle's enter_queue_mode — a mode switch on a moving arm
+            # faults the controller (active Alarm) and cascades WRONG_MODE rejects.
+            ctx.traj_ctrl.pq_finish(wait=True)
             ctx.committed_next = None
             ctx.committed_intercept = None
             ctx.set_active_target(None)
