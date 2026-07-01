@@ -124,10 +124,25 @@ class ThrowSkill(ManipulationSkill):
         # identity upstream (PickRequest.prepositioned), not a distance guess.
         prepositioned = request.prepositioned
         # Stage-C persistent path: stream pick + ambush-hold + throw through ONE
-        # queue so the throw needs no re-entry. Only for a non-prepositioned pick
-        # (there is a real drive to establish the queue); default OFF via config.
-        persistent = ctx.cfg.PERSISTENT_QUEUE and not prepositioned
+        # queue so the throw needs no re-entry. A non-prepositioned pick opens a
+        # fresh session (real drive). CROSS-CYCLE: a prepositioned cycle can RESUME
+        # a still-live session (the prior throw's committed chain kept it open,
+        # feeding the arm to this grasp) — skipping enter_queue_mode + pq_begin, so
+        # the PICK re-entry (~0.4s) is removed too. pq_active is OPTIMISTIC (may read
+        # live while the queue actually drained); a real drain surfaces as WRONG_MODE
+        # on the resumed hold and falls back cleanly. Both gated OFF by default.
+        session_live = ctx.traj_ctrl.pq_active
+        reuse_session = (ctx.cfg.PERSISTENT_QUEUE and ctx.cfg.PERSISTENT_QUEUE_CROSS_CYCLE
+                         and prepositioned and session_live)
+        persistent = (ctx.cfg.PERSISTENT_QUEUE and not prepositioned) or reuse_session
         if not prepositioned:
+            # A cross-cycle session should never be open on a non-prepositioned
+            # cycle (keep_alive implies the next cycle is prepositioned). If one
+            # leaked open (e.g. its committed object vanished mid-chain), CLOSE it
+            # first — pq_finish(wait=True) settles the arm — so the mode switch
+            # below never chops a still-moving arm.
+            if ctx.traj_ctrl.pq_active:
+                ctx.traj_ctrl.pq_finish(wait=True)
             # MotoROS2 leaves queue mode once the previous trajectory's queue
             # drains; re-enter so the positioning push isn't rejected.
             if not ctx.traj_ctrl.enter_queue_mode():
@@ -135,6 +150,8 @@ class ThrowSkill(ManipulationSkill):
                 return SkillResult(False, "enter_queue_mode (pick) failed")
             if persistent:
                 ctx.traj_ctrl.pq_begin()   # one session: pick + hold + throw
+        # reuse_session (prepositioned): NO enter_queue_mode / pq_begin — resume the
+        # live session; the arm is already chaining to this grasp on it.
 
         # WAIT_AT_GRASP: drive to the grasp pose (unless already there) and prime
         # suction SUCTION_LEAD before the object's arrival. Returns once the
@@ -147,12 +164,16 @@ class ThrowSkill(ManipulationSkill):
             persistent=persistent,
         )
         if persistent and not pick_ok:
-            # A queue push was rejected / the queue drained during the wait — the
-            # arm is not reliably at grasp. Abort cleanly (committed_next not set
-            # yet). The next cycle re-enters queue mode and re-drives.
+            # A queue push was rejected / the queue drained during the wait (or,
+            # cross-cycle, the resumed session had already died) — the arm is not
+            # reliably at grasp. Abort cleanly; also drop any committed next pick
+            # (cross-cycle: it was committed by the PRIOR throw) so the next epoch
+            # re-selects from a fresh, re-entered session.
             ctx.log.error("Persistent pick failed (queue drained/rejected); aborting.")
             ctx.traj_ctrl.suction_off()
             ctx.traj_ctrl.pq_finish(wait=False)
+            ctx.committed_next = None
+            ctx.committed_intercept = None
             ctx.set_active_target(None)
             ctx.set_status("IDLE", "")
             return SkillResult(False, "persistent pick failed")
@@ -235,7 +256,14 @@ class ThrowSkill(ManipulationSkill):
             ctx.set_active_target(None)
             ctx.set_status("IDLE", "")
             return SkillResult(False, "persistent throw push failed")
-        if persistent:
+        # CROSS-CYCLE: when a next object is committed (the chain is streaming the
+        # arm to its grasp on this live session), do NOT close the session — leave
+        # it open so the next prepositioned cycle resumes it with NO pick re-entry.
+        # The buffered chain (~0.5s) covers the fast committed re-select before the
+        # next cycle's hold takes over feeding. Otherwise close as usual.
+        keep_alive = (persistent and ctx.cfg.PERSISTENT_QUEUE_CROSS_CYCLE
+                      and next_intercept_joint is not None)
+        if persistent and not keep_alive:
             # Close the session: wait for the throw + chain to finish and settle
             # before the next cycle re-enters queue mode (which would else chop a
             # still-moving arm). This blocks out the chain/next-epoch overlap the

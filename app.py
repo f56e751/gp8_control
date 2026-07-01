@@ -201,6 +201,16 @@ class Config:
         default_factory=lambda: os.environ.get("GP8_PERSISTENT_QUEUE", "0")
         not in ("0", "", "false", "False", "no")
     )
+    # Cross-cycle: keep ONE queue session alive ACROSS cycles too — when a throw
+    # commits the next object (chain to next grasp), don't pq_finish; the next
+    # prepositioned cycle RESUMES the live session (skip enter_queue_mode + pq_begin),
+    # removing the per-cycle PICK re-entry (~0.4s) as well. Layered on top of
+    # PERSISTENT_QUEUE (needs it ON). Default OFF; committed back-to-back only, else
+    # falls back to the per-cycle path. env GP8_PERSISTENT_QUEUE_CROSS_CYCLE=1.
+    PERSISTENT_QUEUE_CROSS_CYCLE: bool = field(
+        default_factory=lambda: os.environ.get("GP8_PERSISTENT_QUEUE_CROSS_CYCLE", "0")
+        not in ("0", "", "false", "False", "no")
+    )
 
 
     # Throw NN post-processing (main_sam7)
@@ -725,6 +735,15 @@ class GP8App:
         if not self.queue:
             self.frame_gate.reset()
             self._release_orphan_suction()
+            # Cross-cycle: a queue gap means the committed chain target vanished
+            # (belt advanced it past reach). Close the now-orphaned live session and
+            # drop the stale commitment so a later epoch re-enters fresh instead of
+            # resuming a drained session against an object that is no longer here.
+            if self.cfg.PERSISTENT_QUEUE_CROSS_CYCLE and self.traj_ctrl.pq_active:
+                self.traj_ctrl.pq_finish(wait=False)
+                if self.ctx is not None:
+                    self.ctx.committed_next = None
+                    self.ctx.committed_intercept = None
             time.sleep(self.cfg.TIME_STEP)
             return
 

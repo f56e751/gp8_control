@@ -418,16 +418,12 @@ class SkillContext:
 
         zero = np.zeros_like(self.M1)
         if persistent:
-            # Stage-C persistent path: ONE queue session — drive to grasp, then
-            # feed hold points so the queue stays alive during the ambush wait,
-            # so the throw needs NO queue-mode re-entry. Suction primes when
-            # t_suction passes (during the drive or the hold). Only reached for a
-            # non-prepositioned pick (there is a real drive). The caller keeps the
-            # session open (pq_begin already called) and appends the throw next.
-            traj, vel, ts = trajectory(
-                current_joint, zero, grasp_joint, zero,
-                self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
-            )
+            # Stage-C persistent path: ONE queue session stays alive from the pick
+            # drive through the ambush hold so the throw needs NO re-entry.
+            # ``skip_move`` = a CROSS-CYCLE prepositioned reuse: the prior throw's
+            # chain already flew the arm to this grasp on the SAME live session, so
+            # there is no drive to push — go straight to the keep-alive hold (which
+            # continues the still-streaming chain into holds at grasp).
             st = {"fired": already_primed}
 
             def _prime() -> None:
@@ -435,17 +431,31 @@ class SkillContext:
                     self.traj_ctrl.suction_on()
                     st["fired"] = True
 
-            ok_drive, _ = self.traj_ctrl.pq_segment(
-                traj, vel, ts, grasp_joint, between_fn=_prime)
-            if not ok_drive:
-                self.log.error("[PQ] pick drive push rejected; aborting pick.")
-                return False
+            if not skip_move:
+                traj, vel, ts = trajectory(
+                    current_joint, zero, grasp_joint, zero,
+                    self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+                )
+                ok_drive, _ = self.traj_ctrl.pq_segment(
+                    traj, vel, ts, grasp_joint, between_fn=_prime)
+                if not ok_drive:
+                    self.log.error("[PQ] pick drive push rejected; aborting pick.")
+                    return False
             self.set_status("WAITING", getattr(target, "class_name", ""))
             if start_lead is None:
                 start_lead = self.cfg.ACTION_START_LEAD
-            # pq_hold_until returns False iff the queue drained during the wait.
-            return self.traj_ctrl.pq_hold_until(
+            # pq_hold_until returns False iff the queue drained during the wait
+            # (cross-cycle: iff the session died before this cycle resumed it).
+            ok_hold = self.traj_ctrl.pq_hold_until(
                 grasp_joint, t_arrival - start_lead, tick_fn=_prime)
+            # GUARANTEE the suction prime: on a reuse cycle (skip_move) the hold is
+            # the ONLY priming hook, and if the object is already within start_lead
+            # of arrival the hold loop never iterates -> _prime never fires -> empty
+            # gripper. Mirror the non-persistent skip_move path's unconditional prime.
+            if not st["fired"] and time.time() >= t_suction:
+                self.traj_ctrl.suction_on()
+                st["fired"] = True
+            return ok_hold
         if skip_move:
             # Arm already AT the grasp pose (the return swing parked it here) — no
             # drive, no mode switch. Just prime (if not already on) and wait, so

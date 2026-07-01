@@ -902,6 +902,13 @@ class TrajectoryController:
     # all-known-upfront case; this session adds a dynamic HOLD (feed points at
     # grasp during the ambush wait so the queue never drains) between segments.
     # ------------------------------------------------------------------
+    @property
+    def pq_active(self) -> bool:
+        """True while a persistent-queue session is live (queue mode held, not yet
+        pq_finish'd). A skill checks this at cycle start to decide whether it can
+        RESUME the session cross-cycle instead of re-entering queue mode."""
+        return self._pq_active
+
     def pq_begin(self) -> None:
         """Open a persistent-queue session on the CURRENT (already-entered) queue.
 
