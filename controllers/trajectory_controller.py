@@ -8,10 +8,34 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 
 import numpy as np
 import rclpy
+
+
+def _wait_future(fut, timeout_sec=None):
+    """Block the CALLING thread until ``fut`` completes, WITHOUT spinning — the
+    process-wide MultiThreadedExecutor (background-spun in GP8App.setup) is the
+    sole spinner and completes the future. Replaces
+    ``rclpy.spin_until_future_complete(node, fut)`` so the main thread AND the
+    feeder thread can both issue service/action calls with no wait-set race.
+    add_done_callback fires immediately if the future is already done. Returns the
+    result (or None on timeout — matching the prior ``fut.result() is None``
+    timeout semantics callers already check)."""
+    ev = threading.Event()
+    fut.add_done_callback(lambda _f: ev.set())
+    if timeout_sec is None:
+        # Poll so a SIGINT / context shutdown (which stops the sole MTE spinner,
+        # after which the future can never complete) breaks the wait instead of
+        # hanging forever — matching spin_until_future_complete's ok() loop.
+        while not ev.wait(0.2):
+            if not rclpy.ok():
+                break
+    else:
+        ev.wait(timeout_sec)
+    return fut.result() if fut.done() else None
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -193,7 +217,7 @@ class TrajectoryController:
         """Send trajectory via FollowJointTrajectory action and wait for completion."""
         goal_msg = self._build_goal(traj, vel, timestep, final_joint=final_joint)
         future = self._fjt_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self._node, future)
+        _wait_future(future)
 
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -201,7 +225,7 @@ class TrajectoryController:
             return False
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self._node, result_future)
+        _wait_future(result_future)
         return True
 
     def send_trajectory_with_release(
@@ -221,7 +245,7 @@ class TrajectoryController:
 
         # Send goal (non-blocking)
         future = self._fjt_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self._node, future)
+        _wait_future(future)
 
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -249,7 +273,7 @@ class TrajectoryController:
 
         # Wait for trajectory completion
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self._node, result_future)
+        _wait_future(result_future)
         return True
 
     # ------------------------------------------------------------------
@@ -308,7 +332,7 @@ class TrajectoryController:
             self._jmon = None
             return None
         fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
-        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        _wait_future(fut, 10.0)
         res = fut.result()
         # Record the measured switch cost so the timeline model's T_setup tracks the
         # real controller latency. last_qmode_ms keeps the raw value (diagnostic);
@@ -340,7 +364,7 @@ class TrajectoryController:
             self._node.get_logger().error("/reset_error unavailable.")
             return False
         fut = self._reset_error_client.call_async(ResetError.Request())
-        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=5.0)
+        _wait_future(fut, 5.0)
         res = fut.result()
         ok = bool(res and res.result_code.value == 1)
         if ok:
@@ -359,7 +383,7 @@ class TrajectoryController:
         if not self._start_traj_client.wait_for_service(timeout_sec=5.0):
             return False
         fut = self._start_traj_client.call_async(StartTrajMode.Request())
-        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=10.0)
+        _wait_future(fut, 10.0)
         res = fut.result()
         if res is None or res.result_code.value != 1:
             return False
@@ -371,7 +395,7 @@ class TrajectoryController:
         if not self._stop_traj_client.wait_for_service(timeout_sec=2.0):
             return False
         fut = self._stop_traj_client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self._node, fut, timeout_sec=5.0)
+        _wait_future(fut, 5.0)
         res = fut.result()
         return bool(res and res.success)
 
@@ -551,7 +575,7 @@ class TrajectoryController:
         # Finish the move, still watching the next-pick suction deadline.
         t_end = t_start + total_duration + 0.1
         while time.time() < t_end:
-            rclpy.spin_once(self._node, timeout_sec=0.05)
+            time.sleep(0.05)
             _prime_next()
         _prime_next()
         # Settle: wait for the arm to ACTUALLY reach the final pose, not just the
@@ -594,7 +618,7 @@ class TrajectoryController:
         # Finish the move, still watching the suction deadline.
         t_end = t_start + total_duration + 0.1
         while time.time() < t_end:
-            rclpy.spin_once(self._node, timeout_sec=0.02)
+            time.sleep(0.02)
             _fire()
         _fire()
         return state["fired"]
@@ -663,8 +687,8 @@ class TrajectoryController:
         # [PUSH-DIAG] (only when motion logging is on) measure per-point queue
         # round-trip + WHEN the arm actually starts moving, on ONE clock, to verify
         # whether the startup dead-time is the per-point push round-trips (H1) or
-        # MotoROS2-side startup AFTER queueing (H2). current_joints updates during
-        # spin_until_future_complete, so we can spot motion-start mid-push.
+        # MotoROS2-side startup AFTER queueing (H2). current_joints is kept fresh
+        # by the background MTE spinner, so we can spot motion-start mid-push.
         _diag = self._motion_logger.enabled
         _t0 = time.time()
         _start_pos = list(waypoints[0][0]) if waypoints else None
@@ -683,7 +707,7 @@ class TrajectoryController:
             _t_pt = time.time()
             for _ in range(busy_max_retry + 1):
                 fut = self._queue_point_client.call_async(req)
-                rclpy.spin_until_future_complete(self._node, fut, timeout_sec=2.0)
+                _wait_future(fut, 2.0)
                 res = fut.result()
                 if res is None:
                     self._node.get_logger().error(f"pt {i}: service timeout")
@@ -779,7 +803,7 @@ class TrajectoryController:
         busy_waited = 0.0
         while True:
             fut = self._queue_point_client.call_async(req)
-            rclpy.spin_until_future_complete(self._node, fut, timeout_sec=2.0)
+            _wait_future(fut, 2.0)
             res = fut.result()
             if res is None:
                 self._node.get_logger().error("[PERSIST] queue point: service timeout")
@@ -930,7 +954,7 @@ class TrajectoryController:
         """Push (pos, vel, time) points with ABORT-ON-REJECT; advance the session
         timeline to the last SUCCESS point. ``between_fn`` (if given) is called
         after each successful push — used to fire a POSITION-BASED suction event
-        while the queue drains (current_joints refreshes during each push spin).
+        while the queue drains (current_joints kept fresh by the MTE spinner).
         Returns (ok, codes)."""
         codes = []
         ok = True
@@ -949,8 +973,8 @@ class TrajectoryController:
                 break
             self._pq_t = t
             self._pq_last_pos = list(pos)
-            # Record when the arm ACTUALLY first moves (current_joints refreshes in
-            # the push spin) — pq_hold_until anchors its pacing to this, not pq_begin.
+            # Record when the arm ACTUALLY first moves (current_joints kept fresh by
+            # the MTE spinner) — pq_hold_until anchors its pacing to this, not pq_begin.
             if (self._pq_motion_start is None and self._pq_start_pose is not None
                     and self.current_joints is not None
                     and _max_abs_diff(self.current_joints, self._pq_start_pose) > 0.01):
@@ -1068,7 +1092,7 @@ class TrajectoryController:
                     self._pq_last_pos = hold
                 # BUSY(4)/None(timeout): queue still alive (full/transient) -> skip
             else:
-                rclpy.spin_once(self._node, timeout_sec=0.01)
+                time.sleep(0.01)
             if tick_fn is not None:
                 tick_fn()      # e.g. fire suction_on once its wall-clock instant passes
         return True
@@ -1193,7 +1217,7 @@ class TrajectoryController:
         # (bounded — never carry the object into the chain) and the prime deadline.
         t_end = time.time() + 1.0
         while (not state["fired"] or not state["primed_next"]) and time.time() < t_end:
-            rclpy.spin_once(self._node, timeout_sec=0.02)
+            time.sleep(0.02)
             _tick()
         if not state["fired"]:
             _do_release("post-push last resort")
@@ -1211,15 +1235,15 @@ class TrajectoryController:
             t_start = time.time()
         remaining = total_duration - (time.time() - t_start) + tail_buffer
         if remaining > 0:
-            # spin도 같이 돌려 joint_state 캐시 최신화
+            # joint_state 캐시는 백그라운드 MTE가 최신화 (여기선 sleep만)
             t_end = time.time() + remaining
             while time.time() < t_end:
-                rclpy.spin_once(self._node, timeout_sec=0.05)
+                time.sleep(0.05)
 
     def _wait_for_target(self, target_joint, tolerance: float = 1e-4) -> None:
         """Spin until robot reaches target joint position."""
         while rclpy.ok():
-            rclpy.spin_once(self._node, timeout_sec=0.01)
+            time.sleep(0.01)
             if self.current_joints is not None:
                 diff = math.sqrt(sum(
                     (a - b) ** 2 for a, b in zip(self.current_joints, target_joint)
@@ -1251,7 +1275,7 @@ class TrajectoryController:
         min_diff = float("inf")
 
         while rclpy.ok():
-            rclpy.spin_once(self._node, timeout_sec=0.01)
+            time.sleep(0.01)
             if self.current_joints is not None:
                 diff = math.sqrt(sum(
                     (a - b) ** 2 for a, b in zip(self.current_joints, target_list)
@@ -1284,7 +1308,7 @@ class TrajectoryController:
         req.address = address
         req.value = value
         future = self._io_client.call_async(req)
-        rclpy.spin_until_future_complete(self._node, future)
+        _wait_future(future)
         result = future.result()
         if not result.success:
             self._node.get_logger().error(f"IO write failed: {result.message}")

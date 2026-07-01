@@ -301,15 +301,13 @@ class SkillContext:
     def sleep_until(self, deadline: float) -> None:
         """Block until ``deadline`` (wall clock), staying responsive to shutdown.
 
-        During the long ambush wait we still pump ROS callbacks (so belt
-        speed and detection snapshots stay fresh), publish viz state, and
-        — importantly — keep ingesting new detections into the queue and
-        updating its order. Otherwise objects that arrive on the belt
-        during the wait are invisible to app.py until the current cycle's
-        throw completes (~10 s later), often too late to catch.
+        The background MTE keeps belt speed and detection snapshots fresh; this
+        loop publishes viz state and — importantly — keeps ingesting new
+        detections into the queue and updating its order. Otherwise objects that
+        arrive on the belt during the wait are invisible to app.py until the
+        current cycle's throw completes (~10 s later), often too late to catch.
         """
         while rclpy.ok() and time.time() < deadline:
-            rclpy.spin_once(self.node, timeout_sec=0.0)
             self.publish_state()
             now = time.time()
             self.intake(now)

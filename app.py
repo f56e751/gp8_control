@@ -11,6 +11,7 @@ itself stays small — domain logic lives in ``perception/``,
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import json
 import os
@@ -268,6 +269,8 @@ class GP8App:
 
         self._node: Node | None = None
         self._executor: MultiThreadedExecutor | None = None
+        self._spin_thread: threading.Thread | None = None
+        self._spinner_dead = False
         self.traj_ctrl: TrajectoryController | None = None
         self.moveit_ctrl: MoveItController | None = None
         self.conveyor: ConveyorSpeedTracker | None = None
@@ -326,6 +329,17 @@ class GP8App:
         )
 
         self.traj_ctrl.wait_for_servers()
+        # Now that every subscription + service/action client exists and servers
+        # are up, background-spin the executor: from here it is the SOLE spinner.
+        # It pumps every subscription (joint_states, detections, conveyor) AND
+        # completes every service/action future, so the main loop (and later the
+        # feeder thread) only ISSUE call_async + block on _wait_future — no thread
+        # calls rclpy.spin_* directly, eliminating the wait-set race. Started AFTER
+        # entity creation (cf. gui/server.py) so it never races wait-set builds; the
+        # ROS work below (_enable_robot / suction / initial pose) needs it live.
+        self._spin_thread = threading.Thread(
+            target=self._spin_executor, name="gp8_mte_spin", daemon=True)
+        self._spin_thread.start()
         self._load_predictor()
         self._setup_joint_limits()
         self._build_planner()
@@ -340,6 +354,24 @@ class GP8App:
         self._node.get_logger().info(
             "Using hardcoded T_base2cam (no AprilTag handshake)."
         )
+
+    def _spin_executor(self) -> None:
+        """Background MTE spin target, GUARDED: it is the SOLE spinner, so if an
+        unhandled callback exception killed it silently, every _wait_future would
+        hang. On death, flag it and shut the context down so no-timeout waits
+        (which poll rclpy.ok()) unblock and the main loop exits into its finally."""
+        try:
+            self._executor.spin()
+        except Exception as e:  # noqa: BLE001 — sole spinner must not die silently
+            self._spinner_dead = True
+            try:
+                self._node.get_logger().fatal(f"MTE spinner died: {e}; shutting down.")
+            except Exception:
+                pass
+            try:
+                rclpy.try_shutdown()
+            except Exception:
+                pass
 
     def _load_predictor(self) -> None:
         self.predictor = TrajectoryPredictor()
@@ -460,10 +492,10 @@ class GP8App:
         if initial_joint is None:
             raise RuntimeError("IK failed for initial pose.")
 
-        # `time.sleep` alone does not let ROS 2 callbacks fire — must spin.
+        # The background MTE fills current_joints; just poll it (no spin here).
         last_log = 0.0
         while (self.traj_ctrl.current_joints is None) and rclpy.ok():
-            rclpy.spin_once(self._node, timeout_sec=0.1)
+            time.sleep(0.1)
             now = time.time()
             if now - last_log > 1.0:
                 self._node.get_logger().info("Waiting for joint states...")
@@ -713,11 +745,10 @@ class GP8App:
             self.ctx.suction_primed_for_pick = False
 
     def run_epoch(self, epoch: int) -> None:
-        # Pump ROS callbacks so joint_states and conveyor speed stay fresh.
-        # Previously DetectionIntake.poll() spun every epoch; with the HTTP
-        # stream source it no longer does, so this is now the only spin on
-        # idle epochs (trajectory execution still spins during pick/throw).
-        rclpy.spin_once(self._node, timeout_sec=0.0)
+        # The background MTE keeps joint_states / detections / conveyor fresh
+        # continuously now (no per-epoch spin). Yield briefly so idle epochs
+        # don't hot-loop the main thread.
+        time.sleep(0.001)
 
         current_joint_list = self.traj_ctrl.current_joints
         if current_joint_list is None:
@@ -771,7 +802,7 @@ class GP8App:
         self.setup()
         epoch = 0
         try:
-            while rclpy.ok():
+            while rclpy.ok() and not self._spinner_dead:
                 epoch += 1
                 try:
                     self.run_epoch(epoch)
@@ -784,6 +815,10 @@ class GP8App:
                 self.traj_ctrl.exit_queue_mode()
             except Exception as e:
                 self._node.get_logger().warn(f"exit_queue_mode failed: {e}")
+            # Stop the background spinner before tearing down the node so spin()
+            # returns and its daemon thread exits cleanly.
+            if self._executor is not None:
+                self._executor.shutdown()
             self._node.destroy_node()
             rclpy.shutdown()
 
