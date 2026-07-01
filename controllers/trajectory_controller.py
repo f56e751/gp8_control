@@ -77,6 +77,11 @@ class TrajectoryController:
         self._pq_t: float = 0.0
         self._pq_last_pos: list | None = None
         self._pq_start: float = 0.0
+        # Session start pose + the wall time the arm ACTUALLY first moved (detected
+        # during the first pushed segment). pq_hold_until paces against motion-start
+        # (not pq_begin) so the hold buffer is ~lead, not lead + startup-dead-time.
+        self._pq_start_pose: list | None = None
+        self._pq_motion_start: float | None = None
 
         # Opt-in diagnostic logger: predicted (planned trajectory duration) vs
         # ACTUAL move time + actual joint trace, to chase per-cycle timing drift.
@@ -911,6 +916,8 @@ class TrajectoryController:
         self._pq_t = 0.0
         self._pq_last_pos = None
         self._pq_start = time.time()
+        self._pq_start_pose = list(self.current_joints) if self.current_joints else None
+        self._pq_motion_start = None
 
     def _pq_push_stream(self, wp, *, between_fn=None) -> tuple:
         """Push (pos, vel, time) points with ABORT-ON-REJECT; advance the session
@@ -935,6 +942,12 @@ class TrajectoryController:
                 break
             self._pq_t = t
             self._pq_last_pos = list(pos)
+            # Record when the arm ACTUALLY first moves (current_joints refreshes in
+            # the push spin) — pq_hold_until anchors its pacing to this, not pq_begin.
+            if (self._pq_motion_start is None and self._pq_start_pose is not None
+                    and self.current_joints is not None
+                    and _max_abs_diff(self.current_joints, self._pq_start_pose) > 0.01):
+                self._pq_motion_start = time.time()
             if between_fn is not None:
                 between_fn()
         return ok, codes
@@ -1007,14 +1020,16 @@ class TrajectoryController:
 
         Feeds zero-velocity hold points at ``hold_joint`` so queue mode does not
         auto-exit during an ambush wait. Paced: push when the session timeline is
-        < ``lead`` ahead of elapsed-wall-since-pq_begin, else spin.
+        < ``lead`` ahead of elapsed real MOTION time (anchored to the measured
+        motion-start ``_pq_motion_start``, NOT pq_begin), so the buffer ahead of
+        the arm is ~``lead`` — no longer ``lead + startup-dead-time``. This is the
+        buffer the NEXT segment (the throw) waits behind, so keeping it near the
+        keep-alive floor (~1 point) directly cuts the throw's onset delay.
 
-        NOTE the buffer ahead of the ARM is ``lead + startup-dead-time`` (the wall
-        clock is anchored at pq_begin, before motion actually starts) — conservative
-        against draining, but it delays the following segment (the throw) by that
-        much, and if it exceeds the ~10-point queue capacity the hold saturates.
-        When wiring the real throw, anchor pacing to the measured motion-start (the
-        [PUSH-DIAG] _t_move signal) for precise release timing.
+        WARNING: with a small lead the queue is only ~1 hold point deep, so an
+        unfed gap AFTER the hold (e.g. a slow NN/IK throw plan) can drain it →
+        WRONG_MODE. The caller must PRECOMPUTE the throw during the hold (no unfed
+        planning gap after) before shrinking lead, else the throw append aborts.
 
         Only WRONG_MODE(2) means the queue genuinely drained (fatal → False).
         BUSY(4)/timeout leave the queue ALIVE (full/transient) → skip that point
@@ -1032,8 +1047,11 @@ class TrajectoryController:
                     "refusing (would command a jump). Hold at the segment's end pose.")
                 return False
         zero = [0.0] * 6
+        # Anchor to when the arm actually started moving (falls back to pq_begin if
+        # motion-start was never detected, e.g. a prepositioned pick with no drive).
+        anchor = self._pq_motion_start if self._pq_motion_start is not None else self._pq_start
         while time.time() < deadline_wall:
-            if self._pq_t < (time.time() - self._pq_start) + lead:
+            if self._pq_t < (time.time() - anchor) + lead:
                 code = self._push_one_point(hold, zero, self._pq_t + dt)
                 if code == 2:  # WRONG_MODE = queue drained/exited -> genuinely lost
                     self._node.get_logger().warn("[PQ] hold: WRONG_MODE — queue drained.")
