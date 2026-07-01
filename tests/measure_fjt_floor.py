@@ -76,15 +76,15 @@ class FloorMeter(Node):
         fut = self._start_traj.call_async(StartTrajMode.Request())
         rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
 
-    def one_trial(self, sign: int):
+    def one_trial(self, sign: int, delta: float, duration: float):
         """Send one FJT goal; return (accept_ms, floor_ms|None)."""
         start = np.array(self.cur, dtype=float)
         target = start.copy()
-        target[MOVE_JOINT] += DELTA * sign
+        target[MOVE_JOINT] += delta * sign
 
         jt = JointTrajectory()
         jt.joint_names = JOINT_NAMES
-        for pos, t in ((start, 0.0), (target, DURATION)):
+        for pos, t in ((start, 0.0), (target, duration)):
             pt = JointTrajectoryPoint()
             pt.positions = [float(x) for x in pos]
             pt.velocities = [0.0] * 6
@@ -131,8 +131,14 @@ def main() -> None:
             print("No /joint_states_urdf.")
             return
         print(f"current (deg): {[round(float(np.degrees(j)), 1) for j in node.cur]}")
-        print(f"\n{N_TRIALS} FJT goals, joint_{MOVE_JOINT+1} +/-{np.degrees(DELTA):.1f} deg, "
-              f"{DURATION}s each. Arm oscillates ~3 deg. Clear the arm.")
+        # Two profiles: GENTLE (slow ramp -> reaching the 0.01 rad detect threshold
+        # takes long) vs FAST (steep ramp -> reaches threshold almost immediately).
+        # accept->motion = startup + ramp-to-0.01rad; the ramp term differs between
+        # profiles, so (gentle - fast) isolates the ramp and FAST ~= pure startup.
+        profiles = [("gentle", 0.05, 0.6), ("fast", 0.20, 0.25)]
+        n_each = 8
+        print(f"\n2 profiles x {n_each} FJT goals on joint_{MOVE_JOINT+1} "
+              f"(gentle +/-2.9deg/0.6s, fast +/-11.5deg/0.25s). Clear the arm.")
         if input("Enter 'go' to proceed > ").strip().lower() != "go":
             print("Aborted.")
             return
@@ -140,31 +146,38 @@ def main() -> None:
         node.start_traj_mode()
         time.sleep(0.3)
 
-        accepts, floors = [], []
-        print(f"\n{'trial':>5} {'accept_ms':>10} {'floor_ms(accept->motion)':>26}")
-        for i in range(N_TRIALS):
-            a, f = node.one_trial(sign=(1 if i % 2 == 0 else -1))
-            if a is not None:
-                accepts.append(a)
-            fs = f"{f:.0f}" if f is not None else "MISS"
-            if f is not None:
-                floors.append(f)
-            print(f"{i:5d} {a:10.0f} {fs:>26}")
-            time.sleep(0.2)
+        results = {}
+        for name, delta, dur in profiles:
+            accepts, floors = [], []
+            print(f"\n--- {name} (+/-{np.degrees(delta):.1f} deg, {dur}s) ---")
+            print(f"{'trial':>5} {'accept_ms':>10} {'floor_ms(accept->motion)':>26}")
+            for i in range(n_each):
+                a, f = node.one_trial((1 if i % 2 == 0 else -1), delta, dur)
+                if a is not None:
+                    accepts.append(a)
+                if f is not None:
+                    floors.append(f)
+                print(f"{i:5d} {a if a is None else round(a):>10} "
+                      f"{(round(f) if f is not None else 'MISS'):>26}")
+                time.sleep(0.2)
+            results[name] = (accepts, floors)
 
-        print("\n===== FJT FLOOR (no per-point push) =====")
-        if accepts:
-            print(f"  action handshake   : mean {st.mean(accepts):5.0f} ms  "
-                  f"(sd {st.pstdev(accepts):.0f})")
-        if floors:
-            print(f"  accept -> motion    : mean {st.mean(floors):5.0f} ms  "
-                  f"(sd {st.pstdev(floors):.0f}, min {min(floors):.0f}, max {max(floors):.0f})")
-            print(f"  => pure controller+transport FLOOR ~= {st.mean(floors):.0f} ms "
-                  f"(+/-~20ms detection). This is what FJT/queue both pay; the queue "
-                  f"path ADDS ~44ms/point on top.")
-        else:
-            print("  no motion detected — check thresholds / that the arm actually moved.")
-        print("=========================================")
+        print("\n===== FJT STARTUP (no per-point push) =====")
+        fmeans = {}
+        for name, _, _ in profiles:
+            accepts, floors = results[name]
+            if floors:
+                fmeans[name] = st.mean(floors)
+                print(f"  {name:7s} accept->motion: mean {st.mean(floors):5.0f} ms "
+                      f"(sd {st.pstdev(floors):.0f}); handshake {st.mean(accepts):.0f} ms")
+        if "gentle" in fmeans and "fast" in fmeans:
+            ramp = fmeans["gentle"] - fmeans["fast"]
+            print(f"\n  ramp difference (gentle-fast) ~= {ramp:.0f} ms (the slow-ramp "
+                  f"artifact, NOT startup).")
+            print(f"  => pure controller startup ~= FAST floor minus its small ramp "
+                  f"~= {fmeans['fast']:.0f} ms (upper bound). The rest of the 'gentle "
+                  f"~378ms' was the trajectory ramping to the 0.01 rad threshold.")
+        print("===========================================")
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
