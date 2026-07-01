@@ -191,6 +191,17 @@ class Config:
         default_factory=lambda: float(os.environ.get("GP8_OPT_TIME_TO_REAL", "1.0"))
     )
 
+    # Persistent-queue path (Stage C): stream pick + ambush-hold + throw through
+    # ONE queue session so the throw needs NO queue-mode re-entry (~0.41s saved
+    # per cycle). Default OFF — the current per-segment path is unchanged. When
+    # ON, ThrowSkill uses the pq_* session + a POSITION-based throw release; the
+    # first HW run must verify release timing. Only applies to non-prepositioned
+    # picks for now. env GP8_PERSISTENT_QUEUE=1.
+    PERSISTENT_QUEUE: bool = field(
+        default_factory=lambda: os.environ.get("GP8_PERSISTENT_QUEUE", "0")
+        not in ("0", "", "false", "False", "no")
+    )
+
 
     # Throw NN post-processing (main_sam7)
     THROW_TIME_SCALE: float = 0.85

@@ -383,8 +383,12 @@ class SkillContext:
         intercept_y: float,
         skip_move: bool = False,
         start_lead: "Optional[float]" = None,
-    ) -> None:
+        persistent: bool = False,
+    ) -> bool:
         """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
+
+        Returns True on success; False (persistent path only) if a queue push was
+        rejected / the queue drained during the wait, so the caller aborts cleanly.
 
         Unlike the old "position (blocking) THEN wait+suction" split (which fired
         suction only after positioning finished, so a slow positioning ate into
@@ -413,6 +417,35 @@ class SkillContext:
         )
 
         zero = np.zeros_like(self.M1)
+        if persistent:
+            # Stage-C persistent path: ONE queue session — drive to grasp, then
+            # feed hold points so the queue stays alive during the ambush wait,
+            # so the throw needs NO queue-mode re-entry. Suction primes when
+            # t_suction passes (during the drive or the hold). Only reached for a
+            # non-prepositioned pick (there is a real drive). The caller keeps the
+            # session open (pq_begin already called) and appends the throw next.
+            traj, vel, ts = trajectory(
+                current_joint, zero, grasp_joint, zero,
+                self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+            )
+            st = {"fired": already_primed}
+
+            def _prime() -> None:
+                if not st["fired"] and time.time() >= t_suction:
+                    self.traj_ctrl.suction_on()
+                    st["fired"] = True
+
+            ok_drive, _ = self.traj_ctrl.pq_segment(
+                traj, vel, ts, grasp_joint, between_fn=_prime)
+            if not ok_drive:
+                self.log.error("[PQ] pick drive push rejected; aborting pick.")
+                return False
+            self.set_status("WAITING", getattr(target, "class_name", ""))
+            if start_lead is None:
+                start_lead = self.cfg.ACTION_START_LEAD
+            # pq_hold_until returns False iff the queue drained during the wait.
+            return self.traj_ctrl.pq_hold_until(
+                grasp_joint, t_arrival - start_lead, tick_fn=_prime)
         if skip_move:
             # Arm already AT the grasp pose (the return swing parked it here) — no
             # drive, no mode switch. Just prime (if not already on) and wait, so
@@ -446,6 +479,7 @@ class SkillContext:
         if start_lead is None:
             start_lead = self.cfg.ACTION_START_LEAD
         self.sleep_until(t_arrival - start_lead)
+        return True
 
     def lifted_standby_joint(self, end_joint: np.ndarray) -> np.ndarray:
         """Park pose for when a next object EXISTS but wasn't committed for

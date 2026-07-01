@@ -912,9 +912,12 @@ class TrajectoryController:
         self._pq_last_pos = None
         self._pq_start = time.time()
 
-    def _pq_push_stream(self, wp) -> tuple:
+    def _pq_push_stream(self, wp, *, between_fn=None) -> tuple:
         """Push (pos, vel, time) points with ABORT-ON-REJECT; advance the session
-        timeline to the last SUCCESS point. Returns (ok, codes)."""
+        timeline to the last SUCCESS point. ``between_fn`` (if given) is called
+        after each successful push — used to fire a POSITION-BASED suction event
+        while the queue drains (current_joints refreshes during each push spin).
+        Returns (ok, codes)."""
         codes = []
         ok = True
         for pos, v, t in wp:
@@ -932,16 +935,20 @@ class TrajectoryController:
                 break
             self._pq_t = t
             self._pq_last_pos = list(pos)
+            if between_fn is not None:
+                between_fn()
         return ok, codes
 
     def pq_segment(self, traj, vel, ts, final_joint, *, is_last: bool = False,
-                   join_tol: float = 0.05) -> tuple:
+                   join_tol: float = 0.05, between_fn=None) -> tuple:
         """Append one trajectory segment onto the session timeline (no re-entry).
 
         Session's first segment snaps its first point to current joints; later
         segments append raw and drop the shared boundary point (seg[0] ≈ last
         queued pose within ``join_tol``) so times stay strictly increasing. The
-        zero-velocity settle point is added only when ``is_last``. (ok, codes)."""
+        zero-velocity settle point is added only when ``is_last``. ``between_fn``
+        is called after each successful push (position-based IO hook, e.g. throw
+        release). (ok, codes)."""
         if not self._pq_active:
             self._node.get_logger().error("[PQ] pq_segment without pq_begin; aborting.")
             return False, []
@@ -973,10 +980,10 @@ class TrajectoryController:
         if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
             self._node.get_logger().error("[PQ] queue_traj_point unavailable.")
             return False, []
-        return self._pq_push_stream(wp)
+        return self._pq_push_stream(wp, between_fn=between_fn)
 
     def pq_hold_until(self, hold_joint, deadline_wall: float, *,
-                      dt: float = 0.12, lead: float = 0.35) -> bool:
+                      dt: float = 0.12, lead: float = 0.35, tick_fn=None) -> bool:
         """Keep the queue ALIVE at ``hold_joint`` until wall clock ``deadline_wall``.
 
         Feeds zero-velocity hold points at ``hold_joint`` so queue mode does not
@@ -1018,6 +1025,8 @@ class TrajectoryController:
                 # BUSY(4)/None(timeout): queue still alive (full/transient) -> skip
             else:
                 rclpy.spin_once(self._node, timeout_sec=0.01)
+            if tick_fn is not None:
+                tick_fn()      # e.g. fire suction_on once its wall-clock instant passes
         return True
 
     def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
@@ -1036,6 +1045,77 @@ class TrajectoryController:
                     np.asarray(self._pq_last_pos, dtype=float),
                     tolerance=settle_tol, timeout_sec=1.5)
         self._pq_active = False
+
+    def pq_throw_segment(self, traj, vel, timestep, final_joint, *,
+                         release_index, suction_on_at=None,
+                         release_tol: float = 0.05) -> tuple:
+        """Append the THROW onto the live session with a POSITION-BASED suction
+        release. Returns ``(ok, primed_next)``: ok is False if the append was
+        REJECTED (e.g. the queue drained during throw planning) so the caller can
+        salvage/abort instead of silently dropping the object — no bogus release
+        is fired in that case.
+
+        Release uses a LAYERED detector (fire on entering the release band OR on
+        the first receding sample after the closest approach) so a fast swing
+        that crosses the band between ~50 ms polls still fires within one sample,
+        not chain-late. In the persistent path the throw is queued ~the hold
+        buffer AHEAD of execution, so the index/queue-time release of
+        ``send_trajectory_queue_with_timed_release`` would fire early — hence
+        position-based here.
+
+        WARNING: release timing is throw-critical; verify on HW where the object
+        lands and tune release_tol / RELEASE_LEAD before enabling the flag."""
+        arr = np.asarray(traj)
+        rel = int(max(0, min(release_index, arr.shape[1] - 1)))
+        release_pose = [float(x) for x in arr[:, rel]]
+        state = {"fired": False, "primed_next": False, "min_diff": float("inf")}
+        self.last_throw = {
+            "throw_start": time.time(), "release_wall": None, "io_ms": None,
+            "release_index": rel, "n_waypoints": int(arr.shape[1]),
+        }
+
+        def _do_release(note: str) -> None:
+            t_io = time.time()
+            self.suction_off()
+            state["fired"] = True
+            self.last_throw["release_wall"] = getattr(self, "last_suction_off_t", None)
+            self.last_throw["io_ms"] = (time.time() - t_io) * 1000.0
+            self._node.get_logger().info(f"[PQ] release: suction_off ({note}, idx {rel}).")
+
+        def _tick() -> None:
+            if not state["fired"]:
+                if self.current_joints is not None:
+                    d = _max_abs_diff(self.current_joints, release_pose)
+                    receding = (state["min_diff"] <= release_tol * 1.5
+                                and d > state["min_diff"] + release_tol / 2)
+                    if d <= release_tol or receding:
+                        _do_release("at pose" if d <= release_tol else "past closest")
+                    else:
+                        state["min_diff"] = min(state["min_diff"], d)
+            elif (suction_on_at is not None and not state["primed_next"]
+                  and time.time() >= suction_on_at):
+                self.suction_on()
+                state["primed_next"] = True
+                self._node.get_logger().info("[PQ] return-prime: suction_on for next pick.")
+
+        ok, _ = self.pq_segment(traj, vel, timestep, final_joint, is_last=True,
+                                between_fn=_tick)
+        if not ok:
+            # Append rejected (queue drained during planning, or a reject). Do NOT
+            # fire a release — the throw never queued; the caller salvages/aborts.
+            self._node.get_logger().error(
+                "[PQ] throw append REJECTED — not queued; caller must recover.")
+            return False, state["primed_next"]
+        # Post-push: the throw is still draining. Keep catching the release
+        # (bounded — never carry the object into the chain) and the prime deadline.
+        t_end = time.time() + 1.0
+        while (not state["fired"] or not state["primed_next"]) and time.time() < t_end:
+            rclpy.spin_once(self._node, timeout_sec=0.02)
+            _tick()
+        if not state["fired"]:
+            _do_release("post-push last resort")
+        return True, state["primed_next"]
+        return state["primed_next"]
 
     def _wait_trajectory_end(
         self,

@@ -123,22 +123,39 @@ class ThrowSkill(ManipulationSkill):
         # to move there (first pick, a different object, etc.). Decided by object
         # identity upstream (PickRequest.prepositioned), not a distance guess.
         prepositioned = request.prepositioned
+        # Stage-C persistent path: stream pick + ambush-hold + throw through ONE
+        # queue so the throw needs no re-entry. Only for a non-prepositioned pick
+        # (there is a real drive to establish the queue); default OFF via config.
+        persistent = ctx.cfg.PERSISTENT_QUEUE and not prepositioned
         if not prepositioned:
             # MotoROS2 leaves queue mode once the previous trajectory's queue
             # drains; re-enter so the positioning push isn't rejected.
             if not ctx.traj_ctrl.enter_queue_mode():
                 ctx.log.error("Failed to (re)enter queue mode; skipping this pick")
                 return SkillResult(False, "enter_queue_mode (pick) failed")
+            if persistent:
+                ctx.traj_ctrl.pq_begin()   # one session: pick + hold + throw
 
         # WAIT_AT_GRASP: drive to the grasp pose (unless already there) and prime
         # suction SUCTION_LEAD before the object's arrival. Returns once the
         # object has reached the intercept.
         ctx.set_status("POSITIONING", target.class_name)
-        ctx.position_and_prime(
+        pick_ok = ctx.position_and_prime(
             current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
             skip_move=prepositioned,
             start_lead=self.arrival_lead(),
+            persistent=persistent,
         )
+        if persistent and not pick_ok:
+            # A queue push was rejected / the queue drained during the wait — the
+            # arm is not reliably at grasp. Abort cleanly (committed_next not set
+            # yet). The next cycle re-enters queue mode and re-drives.
+            ctx.log.error("Persistent pick failed (queue drained/rejected); aborting.")
+            ctx.traj_ctrl.suction_off()
+            ctx.traj_ctrl.pq_finish(wait=False)
+            ctx.set_active_target(None)
+            ctx.set_status("IDLE", "")
+            return SkillResult(False, "persistent pick failed")
 
         # Lift + throw — same path as the moving strategy.
         # MotoROS2 leaves point-queue mode once the pick trajectory's queue
@@ -146,7 +163,9 @@ class ThrowSkill(ManipulationSkill):
         # the throw push would be rejected with "Must call
         # start_point_queue_mode" — re-enter queue mode here too.
         ctx.set_status("THROWING", target.class_name)
-        if not ctx.traj_ctrl.enter_queue_mode():
+        # Persistent: the session queue is still alive (holds kept it non-empty),
+        # so NO throw re-entry — that is the ~0.41s this path removes.
+        if not persistent and not ctx.traj_ctrl.enter_queue_mode():
             ctx.log.error("Failed to (re)enter queue mode for throw; dropping object")
             ctx.traj_ctrl.suction_off()
             ctx.set_active_target(None)
@@ -196,11 +215,32 @@ class ThrowSkill(ManipulationSkill):
         next_intercept_joint, next_suction_at = ctx.scan_next_intercept(
             grasp_joint, float(params.T),
         )
+        self._throw_push_failed = False
         primed_next = self.build_throw_trajectory(
             grasp_joint, aim_joint2, params,
             next_intercept_joint=next_intercept_joint,
             next_suction_at=next_suction_at,
+            persistent=persistent,
         )
+        if persistent and self._throw_push_failed:
+            # The throw never queued (queue drained during planning). The arm is
+            # stopped at grasp still holding the object; the chain never flew to
+            # committed_next, so roll it back or the next (prepositioned) cycle
+            # would grab air at a pose the arm never reached.
+            ctx.log.error("Persistent throw push failed; dropping object + aborting.")
+            ctx.traj_ctrl.suction_off()
+            ctx.traj_ctrl.pq_finish(wait=False)
+            ctx.committed_next = None
+            ctx.committed_intercept = None
+            ctx.set_active_target(None)
+            ctx.set_status("IDLE", "")
+            return SkillResult(False, "persistent throw push failed")
+        if persistent:
+            # Close the session: wait for the throw + chain to finish and settle
+            # before the next cycle re-enters queue mode (which would else chop a
+            # still-moving arm). This blocks out the chain/next-epoch overlap the
+            # non-persistent path keeps — an accepted cost of the first cut.
+            ctx.traj_ctrl.pq_finish(wait=True)
         # If the return chain primed the next pick's suction (vacuum ON), hand
         # that off to the next cycle instead of clearing it. Otherwise it's a
         # safety release in case the throw push failed with suction still on.
@@ -284,6 +324,7 @@ class ThrowSkill(ManipulationSkill):
         params,
         next_intercept_joint: "Optional[np.ndarray]" = None,
         next_suction_at: "Optional[float]" = None,
+        persistent: bool = False,
     ) -> bool:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
@@ -433,12 +474,26 @@ class ThrowSkill(ManipulationSkill):
             f"{'cut@release' if chained_to_next else 'full arc'}->{chain_dest})"
         )
 
-        primed_next = ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
-            traj_throw, vel_throw, timestep_throw,
-            final_joint=final_joint,
-            release_index=release_idx,
-            suction_on_at=next_suction_at,
-        )
+        if persistent:
+            # Append the throw onto the LIVE session (no re-entry); position-based
+            # release (the throw is queued ~the hold buffer ahead of execution).
+            ok_throw, primed_next = ctx.traj_ctrl.pq_throw_segment(
+                traj_throw, vel_throw, timestep_throw,
+                final_joint=final_joint,
+                release_index=release_idx,
+                suction_on_at=next_suction_at,
+            )
+            if not ok_throw:
+                # Queue drained (planning gap) / append rejected — the throw never
+                # queued. Signal execute() to abort cleanly (no silent success).
+                self._throw_push_failed = True
+        else:
+            primed_next = ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
+                traj_throw, vel_throw, timestep_throw,
+                final_joint=final_joint,
+                release_index=release_idx,
+                suction_on_at=next_suction_at,
+            )
         self._last_throw_meta = {
             "T": params.T, "eta": params.eta,
             "release_idx": release_idx, "n_steps": n_steps,
