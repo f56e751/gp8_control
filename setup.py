@@ -74,6 +74,8 @@ setup(
             # Stage-C persistent-queue HW gate (no torch; system python OK).
             "persistent_queue_spike = "
             "gp8_control.tests.persistent_queue_spike:main",
+            # Measure the pure controller startup floor via FJT (no per-point push).
+            "measure_fjt_floor = gp8_control.tests.measure_fjt_floor:main",
         ],
     },
 )
