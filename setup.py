@@ -71,6 +71,9 @@ setup(
             "belt_viz = gp8_control.belt_viz:main",
             "camera_debug = gp8_control.camera_debug:main",
             "queue_test = gp8_control.tests.queue_test:main",
+            # Stage-C persistent-queue HW gate (no torch; system python OK).
+            "persistent_queue_spike = "
+            "gp8_control.tests.persistent_queue_spike:main",
         ],
     },
 )
