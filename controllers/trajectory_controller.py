@@ -739,22 +739,29 @@ class TrajectoryController:
         return True
 
     def _push_one_point(
-        self, pos, vel, t, *, busy_retry_delay: float = 0.015, busy_max_retry: int = 5,
+        self, pos, vel, t, *, busy_retry_delay: float = 0.02,
+        busy_max_wait_s: float = 2.0,
     ) -> "int | None":
-        """Push ONE queue point; return its result_code (BUSY retried in place).
+        """Push ONE queue point; return its result_code.
 
-        SUCCESS=1, WRONG_MODE=2, INIT_FAILURE=3, BUSY=4, INVALID_JOINT_LIST=5,
-        UNABLE_TO_PROCESS_POINT=6; ``None`` = service timeout. BUSY exhaustion
-        returns 4 (a reject) rather than silently dropping the point, so the
-        caller can abort instead of leaving a gap. The human-readable message
-        (carries the '204'/init text on a re-checked start position) is logged.
+        BUSY(4) = the bounded MotoROS2 queue is momentarily FULL — normal
+        backpressure when streaming faster than the robot consumes (measured
+        queue depth ~10 points). We WAIT for a slot, retrying for up to
+        ``busy_max_wait_s`` (the robot frees one slot per consumed point,
+        ~0.2s), instead of giving up after a few ms — which would abort a long
+        continuous stream mid-way. SUCCESS=1, WRONG_MODE=2, INIT_FAILURE=3,
+        INVALID_JOINT_LIST=5, UNABLE_TO_PROCESS_POINT=6; ``None`` = service
+        timeout. Sustained BUSY past the budget returns 4 (a reject, not a
+        silent drop). The message (carries the '204'/init text on a re-checked
+        start position) is logged on a hard reject.
         """
         req = QueueTrajPoint.Request()
         req.joint_names = JOINT_NAMES
         req.point.positions = [float(x) for x in pos]
         req.point.velocities = [float(x) for x in vel]
         req.point.time_from_start = _seconds_to_duration(float(t))
-        for _ in range(busy_max_retry + 1):
+        busy_waited = 0.0
+        while True:
             fut = self._queue_point_client.call_async(req)
             rclpy.spin_until_future_complete(self._node, fut, timeout_sec=2.0)
             res = fut.result()
@@ -762,14 +769,18 @@ class TrajectoryController:
                 self._node.get_logger().error("[PERSIST] queue point: service timeout")
                 return None
             code = int(res.result_code.value)
-            if code == 4:  # BUSY -> brief wait, retry same point
+            if code == 4:  # queue full -> honor backpressure, wait for a slot
+                if busy_waited >= busy_max_wait_s:
+                    self._node.get_logger().warn(
+                        f"[PERSIST] queue BUSY for {busy_waited:.1f}s; giving up")
+                    return 4
                 time.sleep(busy_retry_delay)
+                busy_waited += busy_retry_delay
                 continue
             if code != 1:
                 self._node.get_logger().warn(
                     f"[PERSIST] queue reject code={code} msg='{res.message}'")
             return code
-        return 4  # BUSY exhausted -> treat as reject (do NOT drop silently)
 
     def push_segments_persistent(
         self, segments, *, wait: bool = True, tail_buffer: float = 0.3,
