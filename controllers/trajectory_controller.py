@@ -1,56 +1,59 @@
-"""Low-level trajectory execution and suction I/O control (ROS 2).
+"""Low-level trajectory execution + suction I/O — **adv4ncr ros2_control port**.
 
-Uses FollowJointTrajectory action for trajectory execution and
-WriteSingleIO service for suction gripper control via MotoROS2.
+⚠️ UNTESTED SCAFFOLDING. This is a re-implementation of the MotoROS2 TrajectoryController
+for the **adv4ncr/motoman_ROS2** backend (ros2_control + JointTrajectoryController), on
+branch ``feat/adv4ncr-ros2control-port``. It has NOT run on hardware; the adv4ncr `.out`
+must be loaded + low-speed-validated first (see the safety-review workspace's DEPLOYMENT.md).
+
+What changed vs the MotoROS2 version (and why it is much smaller):
+  * **No Point Queue Mode.** ros2_control's JointTrajectoryController (JTC) accepts a whole
+    trajectory via a FollowJointTrajectory action and executes it. So the entire queue-mode
+    machinery (enter/exit_queue_mode, per-point queue_traj_point push, code-204 first-point
+    snapping, pq_* re-entry avoidance) is GONE. ``enter_queue_mode``/``exit_queue_mode`` are
+    kept as no-op shims (JTC is always ready) so callers don't change; ``pq_*`` are kept as
+    thin JTC-backed shims (persistent-queue existed only to avoid re-entry, which JTC removes).
+  * **Joint states** come from ``/joint_states`` (adv4ncr ``joint_state_broadcaster``), not the
+    MotoROS2 bridge's ``/joint_states_urdf``. Reordered to JOINT_NAMES by name.
+  * **Two motion backends** (env ``GP8_ADV4NCR_BACKEND``, default ``stream``):
+      - ``stream`` — gp8_control resamples each trajectory to a 4 ms grid and **publishes joint
+        targets to the ``JointGroupPositionController`` at ~250 Hz** (FCI-style servo streaming;
+        soft-RT in Python — see _stream_trajectory). Also feeds hold poses during the ambush wait.
+      - ``jtc`` — hand a whole trajectory to ``/joint_trajectory_controller/follow_joint_trajectory``
+        and let the JTC interpolate at 250 Hz internally.
+    Both drive the robot at the controller's 250 Hz; ``stream`` additionally lets the app change the
+    target every cycle (needed only for real-time re-targeting). **The active ros2_control controller
+    must match the backend** (activate JointGroupPositionController for ``stream``, JTC for ``jtc`` —
+    they can't both command the joints at once).
+  * **Suction / IO** — adv4ncr's ros2_control host exposes NO ``/write_single_io`` service, BUT
+    its controller_driver runs the legacy ros-industrial **Simple Message IoServer on TCP 50242**
+    (Controller.c OpenTcpSocket(TCP_PORT_IO); IoServer.c handles ROS_MSG_MOTO_WRITE_IO_BIT=2005).
+    So ``_call_io`` recovers MotoROS2's suction capability with a small PC-side TCP client — no
+    controller-code or wiring change (Option A). ⚠️ UNVERIFIED ON HW: confirm port 50242 is
+    reachable, address 10017 is writable, the reply resultCode is success, and the ON/OFF value
+    convention (on=0/off=1) matches. On failure it logs loudly and continues (does not raise).
+
+Public API is preserved 1:1 with the surface skills/app.py actually call, so no skill/app
+changes are needed to try this backend.
 """
 
 from __future__ import annotations
 
-import math
 import os
+import socket
+import struct
 import threading
 import time
 
 import numpy as np
 import rclpy
-
-
-def _wait_future(fut, timeout_sec=None):
-    """Block the CALLING thread until ``fut`` completes, WITHOUT spinning — the
-    process-wide MultiThreadedExecutor (background-spun in GP8App.setup) is the
-    sole spinner and completes the future. Replaces
-    ``rclpy.spin_until_future_complete(node, fut)`` so the main thread AND the
-    feeder thread can both issue service/action calls with no wait-set race.
-    add_done_callback fires immediately if the future is already done. Returns the
-    result (or None on timeout — matching the prior ``fut.result() is None``
-    timeout semantics callers already check)."""
-    ev = threading.Event()
-    fut.add_done_callback(lambda _f: ev.set())
-    if timeout_sec is None:
-        # Poll so a SIGINT / context shutdown (which stops the sole MTE spinner,
-        # after which the future can never complete) breaks the wait instead of
-        # hanging forever — matching spin_until_future_complete's ok() loop.
-        while not ev.wait(0.2):
-            if not rclpy.ok():
-                break
-    else:
-        ev.wait(timeout_sec)
-    return fut.result() if fut.done() else None
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
-from builtin_interfaces.msg import Duration
 from rclpy.qos import qos_profile_sensor_data
+from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
-from motoros2_interfaces.srv import (
-    QueueTrajPoint,
-    ResetError,
-    StartPointQueueMode,
-    StartTrajMode,
-    WriteSingleIO,
-)
 from sensor_msgs.msg import JointState
-from std_srvs.srv import Trigger
+from std_msgs.msg import Float64MultiArray
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from gp8_control.utils.motion_logger import MotionLogger
@@ -61,56 +64,67 @@ JOINT_NAMES = [
 ]
 SUCTION_IO_ADDRESS = 10017
 
+# adv4ncr ros2_control names (see motoman_bringup/config/controllers.yaml)
+FJT_ACTION = "/joint_trajectory_controller/follow_joint_trajectory"
+JOINT_STATES_TOPIC = "/joint_states"
+# JointGroupPositionController command topic (position_controllers/JointGroupPositionController)
+# — the 250 Hz streaming path: publish a Float64MultiArray of joint positions per cycle.
+JGPC_COMMAND_TOPIC = "/JointGroupPositionController/commands"
+STREAM_HZ = 250.0
+STREAM_DT = 1.0 / STREAM_HZ   # 4 ms
+
+
+def _wait_future(fut, timeout_sec=None):
+    """Block the calling thread until ``fut`` completes WITHOUT spinning (the
+    process-wide MultiThreadedExecutor is the sole spinner). Returns the result,
+    or None on timeout / shutdown."""
+    ev = threading.Event()
+    fut.add_done_callback(lambda _f: ev.set())
+    if timeout_sec is None:
+        while not ev.wait(0.2):
+            if not rclpy.ok():
+                break
+    else:
+        ev.wait(timeout_sec)
+    return fut.result() if fut.done() else None
+
 
 def _seconds_to_duration(seconds: float) -> Duration:
-    """Convert float seconds to builtin_interfaces Duration."""
     sec = int(seconds)
     nanosec = int((seconds - sec) * 1e9)
     return Duration(sec=sec, nanosec=nanosec)
 
 
 def _max_abs_diff(a, b) -> float:
-    """Max per-element |a_i - b_i| over the shared length (joint-space distance)."""
     n = min(len(a), len(b))
     return max((abs(float(a[i]) - float(b[i])) for i in range(n)), default=0.0)
 
 
 class TrajectoryController:
-    """Executes joint trajectories and controls suction gripper I/O via ROS 2."""
+    """Executes joint trajectories via the adv4ncr JTC action; suction I/O is a
+    single seam (``_call_io``) that is currently a hard blocker (no adv4ncr IO service)."""
 
     def __init__(self, node: Node) -> None:
         self._node = node
         self.current_joints: list | None = None
         self.current_jointvels: list | None = None
-        self._jmon = None   # [QMODE-DBG] (min,max) joint tracker during a mode switch
-        # Measured point-queue-mode re-entry cost (the dominant fixed overhead the
-        # timeline model — SkillContext.earliest_reachable_intercept via the skills'
-        # t_to_contact — must account for). last = most recent attempt; avg = EMA so
-        # a one-off slow switch (e.g. a reset_error retry) doesn't spike the estimate.
-        # Seeded to ~0.4 s so cycle 1 has a sane non-zero T_setup before any measurement.
+
+        # Pick-cycle timing telemetry (kept for the skills' logs).
+        self.last_suction_on_t: float | None = None
+        self.last_suction_off_t: float | None = None
+        self.last_throw: dict | None = None
+
+        # Kept for API compatibility with the skills' timeline model
+        # (push_skill.t_to_contact reads qmode_ms_avg for T_setup). Under JTC there is
+        # NO queue-mode re-entry; the only fixed overhead is the action dispatch + the
+        # controller's ~40 ms dead-time, so seed it small instead of the old ~400 ms.
         self.last_qmode_ms: float | None = None
-        self.qmode_ms_avg: float = 400.0
+        self.qmode_ms_avg: float = 40.0
 
-        # Persistent-queue session state (Stage C). One queue session spans pick +
-        # ambush hold + throw with NO per-segment re-entry (~0.41s each). _pq_t is
-        # the running time_from_start of the last queued point (the monotonic
-        # session timeline); _pq_last_pos the last queued joint pose; _pq_start the
-        # wall clock when the session began (for completion waits). See pq_begin/
-        # pq_segment/pq_hold_until/pq_finish.
+        # Persistent-session state (pq_*). Under JTC there is no queue to keep alive;
+        # these just track "a pick+hold+throw sequence is in progress".
         self._pq_active: bool = False
-        self._pq_t: float = 0.0
-        self._pq_last_pos: list | None = None
-        self._pq_start: float = 0.0
-        # Session start pose + the wall time the arm ACTUALLY first moved (detected
-        # during the first pushed segment). pq_hold_until paces against motion-start
-        # (not pq_begin) so the hold buffer is ~lead, not lead + startup-dead-time.
-        self._pq_start_pose: list | None = None
-        self._pq_motion_start: float | None = None
 
-        # Opt-in diagnostic logger: predicted (planned trajectory duration) vs
-        # ACTUAL move time + actual joint trace, to chase per-cycle timing drift.
-        # No-op unless GP8_MOTION_LOG_DIR is set; never affects control. See
-        # gp8_control.utils.motion_logger.
         self._motion_logger = MotionLogger(
             os.environ.get("GP8_MOTION_LOG_DIR"),
             logger=self._node.get_logger(),
@@ -118,1227 +132,81 @@ class TrajectoryController:
 
         cb_group = ReentrantCallbackGroup()
 
-        # Joint state subscriber — bridge republishes with URDF names
+        # adv4ncr publishes joint states via joint_state_broadcaster on /joint_states.
         self._node.create_subscription(
-            JointState, "/joint_states_urdf",
+            JointState, JOINT_STATES_TOPIC,
             self._joint_state_cb, qos_profile_sensor_data,
             callback_group=cb_group,
         )
 
-        # FollowJointTrajectory action client — bridge proxy
         self._fjt_client = ActionClient(
-            self._node,
-            FollowJointTrajectory,
-            "/motoman_gp8_controller/follow_joint_trajectory",
+            self._node, FollowJointTrajectory, FJT_ACTION,
             callback_group=cb_group,
         )
 
-        # WriteSingleIO service client (MotoROS2)
-        self._io_client = self._node.create_client(
-            WriteSingleIO, "/write_single_io",
-            callback_group=cb_group,
-        )
+        # Motion backend: "stream" = gp8_control publishes joint targets to the
+        # JointGroupPositionController at ~250 Hz (FCI-style servo streaming); "jtc" =
+        # hand a whole trajectory to the JointTrajectoryController action (JTC interpolates
+        # at 250 Hz internally). env GP8_ADV4NCR_BACKEND, default "stream".
+        self._backend = os.environ.get("GP8_ADV4NCR_BACKEND", "stream").lower()
+        self._jgpc_pub = self._node.create_publisher(
+            Float64MultiArray, JGPC_COMMAND_TOPIC, 10)
 
-        # Queue Mode clients ---------------------------------------------
-        self._stop_traj_client = self._node.create_client(
-            Trigger, "/stop_traj_mode",
-            callback_group=cb_group,
-        )
-        self._start_traj_client = self._node.create_client(
-            StartTrajMode, "/start_traj_mode",
-            callback_group=cb_group,
-        )
-        self._start_queue_client = self._node.create_client(
-            StartPointQueueMode, "/start_point_queue_mode",
-            callback_group=cb_group,
-        )
-        # bridge가 URDF→raw 번역해서 MotoROS2 /queue_traj_point로 포워딩
-        self._queue_point_client = self._node.create_client(
-            QueueTrajPoint, "/motoman_gp8_controller/queue_traj_point",
-            callback_group=cb_group,
-        )
-        # MotoROS2 alarm/error reset — used to auto-recover from a controller
-        # alarm (e.g. 4414 excessive segment velocity) that otherwise blocks
-        # all subsequent start_point_queue_mode calls with "active Alarm".
-        self._reset_error_client = self._node.create_client(
-            ResetError, "/reset_error",
-            callback_group=cb_group,
-        )
+        # Suction IO: Simple Message TCP client to the controller's IoServer
+        # (Option A — recovers MotoROS2 /write_single_io without changing the controller).
+        # Persistent socket (MAX_IO_CONNECTIONS=1 on the controller), guarded by a lock
+        # because suction can be toggled from both the main loop and the feeder thread.
+        self._io_ip = os.environ.get("GP8_ROBOT_IP", "192.168.255.1")
+        self._io_port = 50242            # TCP_PORT_IO (Controller.h)
+        self._io_sock: socket.socket | None = None
+        self._io_lock = threading.Lock()
 
+    # ------------------------------------------------------------------
+    # Setup / state
+    # ------------------------------------------------------------------
     def wait_for_servers(self, timeout_sec: float = 10.0) -> bool:
-        """Wait for action server and I/O service to become available."""
-        self._node.get_logger().info("Waiting for FollowJointTrajectory action server...")
+        """Wait for the JTC action server. (No IO service under adv4ncr — see _call_io.)"""
+        self._node.get_logger().info(f"Waiting for JTC action server {FJT_ACTION} ...")
         if not self._fjt_client.wait_for_server(timeout_sec=timeout_sec):
-            self._node.get_logger().error("FollowJointTrajectory server not available.")
+            self._node.get_logger().error("JointTrajectoryController action server not available.")
             return False
-        self._node.get_logger().info("Waiting for WriteSingleIO service...")
-        if not self._io_client.wait_for_service(timeout_sec=timeout_sec):
-            self._node.get_logger().error("WriteSingleIO service not available.")
-            return False
-        self._node.get_logger().info("All servers ready.")
+        self._node.get_logger().info(
+            f"[IO] suction via Simple Message TCP {self._io_ip}:{self._io_port} "
+            "(UNVERIFIED on HW — see _call_io)."
+        )
+        self._node.get_logger().info("JTC action server ready.")
         return True
 
-    # ------------------------------------------------------------------
-    # Joint state
-    # ------------------------------------------------------------------
-
     def set_motion_op(self, label: str) -> None:
-        """Tag subsequent queued commands with an op label (e.g. skill name) for the
-        diagnostic MotionLogger's CSV. No-op unless GP8_MOTION_LOG_DIR is set."""
         self._motion_logger.set_label(label)
 
     def _joint_state_cb(self, msg: JointState) -> None:
-        self.current_joints = list(msg.position)
-        self.current_jointvels = list(msg.velocity)
-        self._motion_logger.on_sample(self.current_joints)   # diag (no-op if off)
-        # [QMODE-DBG] track joint excursion during a mode switch (catches a
-        # transient up-down bobble even when the net move is ~0).
-        jmon = self._jmon
-        if jmon is not None:
-            lo, hi = jmon
-            for i, p in enumerate(self.current_joints):
-                if i < len(lo):
-                    if p < lo[i]:
-                        lo[i] = p
-                    if p > hi[i]:
-                        hi[i] = p
+        # joint_state_broadcaster may publish joints in any order — reorder by name.
+        name_to_pos = dict(zip(msg.name, msg.position))
+        name_to_vel = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
+        if all(j in name_to_pos for j in JOINT_NAMES):
+            self.current_joints = [float(name_to_pos[j]) for j in JOINT_NAMES]
+            self.current_jointvels = [float(name_to_vel.get(j, 0.0)) for j in JOINT_NAMES]
+            self._motion_logger.on_sample(self.current_joints)
 
     # ------------------------------------------------------------------
-    # Trajectory execution
+    # Goal building + core send (all trajectory methods route here)
     # ------------------------------------------------------------------
+    def _build_goal(self, traj, vel, timestep, final_joint=None, extra_time=0.05):
+        """Build a FollowJointTrajectory goal from (n_joints, n_steps) arrays.
 
-    def send_trajectory(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray | None = None,
-    ) -> bool:
-        """Send trajectory via FollowJointTrajectory action and wait for completion."""
-        goal_msg = self._build_goal(traj, vel, timestep, final_joint=final_joint)
-        future = self._fjt_client.send_goal_async(goal_msg)
-        _wait_future(future)
-
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self._node.get_logger().warn("Trajectory goal rejected.")
-            return False
-
-        result_future = goal_handle.get_result_async()
-        _wait_future(result_future)
-        return True
-
-    def send_trajectory_with_release(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray,
-        release_joint: np.ndarray,
-    ) -> bool:
-        """Send trajectory, release suction at specific joint position, wait for completion.
-
-        Args:
-            release_joint: Joint position at which suction should be turned OFF.
+        NOTE: unlike the MotoROS2 queue path, we do NOT overwrite positions[0] with
+        the measured current joints — the JTC handles the start-state itself (its
+        configured start tolerance). If the JTC rejects on start tolerance, widen it
+        in controllers.yaml rather than snapping here.
         """
-        goal_msg = self._build_goal(traj, vel, timestep, final_joint=final_joint)
-
-        # Send goal (non-blocking)
-        future = self._fjt_client.send_goal_async(goal_msg)
-        _wait_future(future)
-
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self._node.get_logger().warn("Trajectory goal rejected.")
-            return False
-
-        # Throw trajectory assumes the object is already grasped — do not
-        # toggle suction on here. Only release it mid-flight at release_joint.
-        #
-        # A hard timeout (full trajectory duration) guarantees that suction
-        # is turned off even if joint-based detection misses the release
-        # point (fast throws can zip through the 0.05 rad tolerance zone
-        # between two joint_states samples). Better to release a little
-        # early than to keep the suction on indefinitely.
-        timeout_sec = float(np.sum(timestep)) + 0.1
-        reached = self._wait_for_position(
-            release_joint, tolerance=0.05, timeout_sec=timeout_sec
-        )
-        self.suction_off()
-        if not reached:
-            self._node.get_logger().warn(
-                f"Release joint not detected within {timeout_sec:.2f}s; "
-                "suction_off fired on timeout fallback."
-            )
-
-        # Wait for trajectory completion
-        result_future = goal_handle.get_result_async()
-        _wait_future(result_future)
-        return True
-
-    # ------------------------------------------------------------------
-    # Queue Mode (streaming)
-    # ------------------------------------------------------------------
-
-    def enter_queue_mode(self) -> bool:
-        """Trajectory mode 해제 후 Point Queue mode 진입.
-
-        컨트롤러 알람/에러(예: 4414 excessive segment velocity)로 진입 실패 시
-        ``/reset_error``를 1회 호출하고 재시도한다 — 자동 복구가 없으면 한 번
-        알람이 뜬 뒤 이후 모든 진입이 "active Alarm"으로 연쇄 실패한다.
-        """
-        res = self._try_start_queue_mode()
-        if res is not None and res.result_code.value == 1:
-            self._node.get_logger().info(f"Queue mode entered: {res.message or 'READY'}")
-            return True
-
-        # MotionReadyEnum: 101=Alarm, 102=Error, 112=Inc-move error — all
-        # clearable remotely via reset_error. E-Stop/HOLD/TEACH/not-REMOTE need
-        # physical action, so don't auto-retry those (it would just loop).
-        recoverable = res is not None and res.result_code.value in (101, 102, 112)
-        if not recoverable:
-            self._node.get_logger().error(
-                f"start_point_queue_mode failed: {(res and res.message) or 'timeout'}"
-            )
-            return False
-
-        self._node.get_logger().warn(
-            f"Queue mode blocked ('{res.message}'); calling /reset_error and "
-            "retrying once."
-        )
-        self._reset_error()
-        res = self._try_start_queue_mode()
-        if res is not None and res.result_code.value == 1:
-            self._node.get_logger().info(
-                f"Queue mode entered after reset_error: {res.message or 'READY'}"
-            )
-            return True
-        self._node.get_logger().error(
-            "start_point_queue_mode still failing after reset_error: "
-            f"{(res and res.message) or 'timeout'} (major/hardware alarm? "
-            "clear it on the teach pendant)."
-        )
-        return False
-
-    def _try_start_queue_mode(self):
-        """One stop+start attempt; returns the service result (None on timeout)."""
-        # [QMODE-DBG] watch whether the stop+start physically moves the arm.
-        j0 = list(self.current_joints) if self.current_joints else None
-        self._jmon = ([float(x) for x in j0], [float(x) for x in j0]) if j0 else None
-        t0 = time.time()
-        self._stop_current_mode()
-        if not self._start_queue_client.wait_for_service(timeout_sec=5.0):
-            self._node.get_logger().error("/start_point_queue_mode unavailable.")
-            self._jmon = None
-            return None
-        fut = self._start_queue_client.call_async(StartPointQueueMode.Request())
-        _wait_future(fut, 10.0)
-        res = fut.result()
-        # Record the measured switch cost so the timeline model's T_setup tracks the
-        # real controller latency. last_qmode_ms keeps the raw value (diagnostic);
-        # the EMA folds ONLY a SUCCESSFUL switch (result_code 1) so a 10 s service
-        # timeout (res None) or an alarm-blocked attempt can't spike qmode_ms_avg and
-        # transiently over-place / drop catchable pushes for several cycles.
-        dt_ms = (time.time() - t0) * 1000.0
-        self.last_qmode_ms = dt_ms
-        if res is not None and res.result_code.value == 1:
-            self.qmode_ms_avg = 0.3 * dt_ms + 0.7 * self.qmode_ms_avg   # EMA, alpha=0.3
-        if self._jmon is not None and j0 is not None:
-            lo, hi = self._jmon
-            exc = [round(hi[i] - lo[i], 4) for i in range(len(lo))]
-            self._node.get_logger().info(
-                f"[QMODE-DBG] mode switch {dt_ms:.0f}ms; "
-                f"joint excursion (max-min) = {exc} rad"
-            )
-        self._jmon = None
-        return res
-
-    def _reset_error(self) -> bool:
-        """Call MotoROS2 /reset_error to clear an active alarm/error.
-
-        Alarms numbered < 8000 (major / hardware / setting faults) cannot be
-        reset remotely; this returns False and the operator must clear them on
-        the teach pendant.
-        """
-        if not self._reset_error_client.wait_for_service(timeout_sec=2.0):
-            self._node.get_logger().error("/reset_error unavailable.")
-            return False
-        fut = self._reset_error_client.call_async(ResetError.Request())
-        _wait_future(fut, 5.0)
-        res = fut.result()
-        ok = bool(res and res.result_code.value == 1)
-        if ok:
-            self._node.get_logger().info("reset_error: controller alarm/error cleared.")
-        else:
-            self._node.get_logger().error(
-                f"reset_error failed: {(res and res.message) or 'timeout'} "
-                "(major/hardware alarm? clear it on the teach pendant)."
-            )
-        time.sleep(0.2)   # let the controller settle before the retry
-        return ok
-
-    def exit_queue_mode(self) -> bool:
-        """Queue mode → Trajectory mode 복귀 (종료 시 사용)."""
-        self._stop_current_mode()
-        if not self._start_traj_client.wait_for_service(timeout_sec=5.0):
-            return False
-        fut = self._start_traj_client.call_async(StartTrajMode.Request())
-        _wait_future(fut, 10.0)
-        res = fut.result()
-        if res is None or res.result_code.value != 1:
-            return False
-        self._node.get_logger().info("Returned to trajectory mode.")
-        return True
-
-    def _stop_current_mode(self) -> bool:
-        """현재 활성 traj/queue mode 정지. 모드 전환 전 필수."""
-        if not self._stop_traj_client.wait_for_service(timeout_sec=2.0):
-            return False
-        fut = self._stop_traj_client.call_async(Trigger.Request())
-        _wait_future(fut, 5.0)
-        res = fut.result()
-        return bool(res and res.success)
-
-    def send_trajectory_queue(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray | None = None,
-    ) -> bool:
-        """Queue Mode로 trajectory streaming. FJT의 send_trajectory 대체.
-
-        주의: Queue Mode도 새 큐의 첫 점이 로봇 현재(피드백) 위치와 일치해야
-        받아준다(code 204 'first point must match current position').
-        _build_queue_waypoints가 positions[0]을 측정 현재 관절로 치환해 처리한다.
-        """
-        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
-        t_start = time.time()
-        if not self._push_waypoints(waypoints):
-            return False
-        # 마지막 point time_from_start까지 대기 (push_time만큼 이미 진행됨)
-        self._wait_trajectory_end(waypoints[-1][2], t_start=t_start)
-        return True
-
-    def send_trajectory_queue_with_attach(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray,
-        attach_target_joint: np.ndarray,
-        attach_tolerance: float = 0.05,
-    ) -> bool:
-        """Queue Mode + attach_target_joint 근접 시 suction_on. pick 전용.
-
-        ROS1 customcontroller.publish_trajectory(suction_on=True) 와 동일한
-        의도: trajectory 실행 중 grasp pose 직전(diff<tolerance)에 미리
-        suction_on을 발사해 공압 지연(밸브 열림 ~ 진공 형성)을 보정.
-        보통 attach_target_joint 는 final_joint 와 동일 (grasp_joint).
-
-        Push 는 최대한 빠르게 하고 동시에 joint_states 모니터링.
-        """
-        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
-        total_duration = waypoints[-1][2]
-
-        t_start = time.time()
-        if not self._push_waypoints(waypoints):
-            return False
-
-        # 남은 실행 시간 동안 attach_target 근접 감시
-        elapsed = time.time() - t_start
-        remaining = total_duration - elapsed + 0.1
-        if remaining < 0:
-            remaining = 0.1
-        reached = self._wait_for_position(
-            attach_target_joint, tolerance=attach_tolerance, timeout_sec=remaining,
-        )
-        self.suction_on()
-        if not reached:
-            self._node.get_logger().warn(
-                f"Attach target not detected within {remaining:.2f}s; "
-                "suction_on fired on timeout fallback."
-            )
-
-        # trajectory 완료까지 대기
-        self._wait_trajectory_end(total_duration, t_start=t_start)
-        return True
-
-    def send_trajectory_queue_with_release(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray,
-        release_joint: np.ndarray,
-    ) -> bool:
-        """Queue Mode + release_joint 도달 시 suction_off. throw 전용.
-
-        로봇은 첫 point가 큐에 들어가자마자 실행 시작하므로,
-        push 는 최대한 빠르게 하고 동시에 joint_states 모니터링.
-        """
-        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
-        total_duration = waypoints[-1][2]
-
-        t_start = time.time()
-        if not self._push_waypoints(waypoints):
-            return False
-
-        # 남은 실행 시간 동안 release_joint 도달 감시
-        elapsed = time.time() - t_start
-        remaining = total_duration - elapsed + 0.1
-        if remaining < 0:
-            remaining = 0.1
-        reached = self._wait_for_position(
-            release_joint, tolerance=0.05, timeout_sec=remaining,
-        )
-        self.suction_off()
-        if not reached:
-            self._node.get_logger().warn(
-                f"Release joint not detected within {remaining:.2f}s; "
-                "suction_off fired on timeout fallback."
-            )
-
-        # trajectory 완료까지 대기
-        self._wait_trajectory_end(total_duration, t_start=t_start)
-        return True
-
-    def send_trajectory_queue_with_timed_release(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray,
-        release_index: int,
-        suction_on_at: float | None = None,
-    ) -> bool:
-        """Queue Mode + suction_off interleaved into the point-push.
-
-        Fires suction_off right after the ``release_index`` waypoint is queued,
-        instead of after the whole trajectory. The old "push everything then
-        suction_off" path fired late because the BUSY-throttled push takes ~the
-        full swing duration, so suction_off landed at the end. The point-queue
-        and IO are independent services, so inserting the IO command mid-push
-        is safe (no collision/drop).
-
-        ``suction_on_at`` (wall-clock, optional): once the release has fired and
-        this instant passes, fire suction_ON ONCE — to PRIME THE NEXT pick's
-        vacuum during this throw's return (chain) move, so a back-to-back object
-        keeps its full lead. Only fires after the release (never while still
-        holding the thrown object). Returns True iff that next-suction fired.
-        """
-        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
-        total_duration = waypoints[-1][2]
-
-        state = {"fired": False, "primed_next": False}
-        t_start = time.time()
-        self.last_throw = {
-            "throw_start": t_start,
-            "release_wall": None,
-            "io_ms": None,
-            "release_index": release_index,
-            "n_waypoints": len(waypoints),
-        }
-
-        def _release() -> None:
-            t_io = time.time()
-            self.suction_off()                   # synchronous WriteSingleIO round-trip
-            io_ms = (time.time() - t_io) * 1000.0
-            state["fired"] = True
-            self.last_throw["release_wall"] = self.last_suction_off_t
-            self.last_throw["io_ms"] = io_ms
-            self._node.get_logger().info(
-                f"Release: suction_off after waypoint {release_index}/{len(waypoints)} "
-                f"(IO round-trip {io_ms:.0f} ms)"
-            )
-
-        def _prime_next() -> None:
-            # Prime the NEXT pick's vacuum, but only AFTER this object's release
-            # (don't suck while still holding/releasing the thrown object).
-            if (suction_on_at is not None and state["fired"]
-                    and not state["primed_next"] and time.time() >= suction_on_at):
-                self.suction_on()
-                state["primed_next"] = True
-                self._node.get_logger().info(
-                    "Return-prime: suction_on for next pick during chain move."
-                )
-
-        if not self._push_waypoints(
-            waypoints, release_index=release_index, release_fn=_release,
-            between_fn=_prime_next,
-        ):
-            return state["primed_next"]
-        if not state["fired"]:
-            # release_index beyond the pushed points — fire now as a fallback.
-            _release()
-
-        # Finish the move, still watching the next-pick suction deadline.
-        t_end = t_start + total_duration + 0.1
-        while time.time() < t_end:
-            time.sleep(0.05)
-            _prime_next()
-        _prime_next()
-        # Settle: wait for the arm to ACTUALLY reach the final pose, not just the
-        # time estimate. The BUSY-throttled push delays execution, so the loop
-        # above can return while the arm is still finishing the return (chain)
-        # move; the NEXT cycle's mode stop would then chop that still-moving arm
-        # (the observed bobble). Waiting here means the next cycle starts from a
-        # stopped arm.
-        self._wait_for_position(final_joint, tolerance=0.03, timeout_sec=1.5)
-        return state["primed_next"]
-
-    def send_trajectory_queue_timed_suction(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray,
-        suction_on_at: float,
-    ) -> bool:
-        """Queue-mode move that fires suction_on ONCE at wall-clock ``suction_on_at``.
-
-        The deadline is checked during BOTH the point-push and the end-wait, so
-        the vacuum is primed on time even while the arm is still positioning
-        (priming early is harmless for a suction gripper). Used for the ambush
-        pre-position: guarantees the full SUCTION_LEAD before object arrival
-        regardless of how long positioning takes. Returns True iff suction was
-        fired before returning (i.e. ``suction_on_at`` had already passed)."""
-        waypoints = self._build_queue_waypoints(traj, vel, timestep, final_joint)
-        total_duration = waypoints[-1][2]
-        state = {"fired": False}
-
-        def _fire() -> None:
-            if not state["fired"] and time.time() >= suction_on_at:
-                self.suction_on()
-                state["fired"] = True
-
-        t_start = time.time()
-        if not self._push_waypoints(waypoints, between_fn=_fire):
-            return state["fired"]
-        # Finish the move, still watching the suction deadline.
-        t_end = t_start + total_duration + 0.1
-        while time.time() < t_end:
-            time.sleep(0.02)
-            _fire()
-        _fire()
-        return state["fired"]
-
-    def _build_queue_waypoints(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray | None,
-        extra_time: float = 0.05,
-    ) -> list[tuple[list, list, float]]:
-        """FJT _build_goal과 동일 로직 — positions[0]을 측정 현재 관절로 치환.
-
-        MotoROS2 point-queue는 새 큐의 첫 점이 로봇 현재(피드백) 위치와
-        일치해야 받아준다(code 204 'first point must match current position').
-        이전엔 큐 모드가 이 체크에서 면제된다고 가정해 치환을 생략했으나,
-        실제로는 적용되어, 첫 점이 '계획된 grasp_joint'(측정 위치 아님)인
-        던지기 trajectory가 재진입 시 거부됐다. _build_goal과 동일하게
-        positions[0]을 현재 관절로 치환해 회피한다.
-        """
-        positions = traj.T.tolist()
-        if self.current_joints is not None:
-            positions[0] = list(self.current_joints)
-        velocities = vel.T.tolist()
-        times = timestep.tolist()
-
-        if final_joint is None:
-            final_joint_list = positions[-1]
-        else:
-            final_joint_list = list(final_joint)
-
-        positions.append(final_joint_list)
-        velocities.append([0.0] * 6)
-        times.append(times[-1] + extra_time)
-
-        return list(zip(positions, velocities, times))
-
-    def _push_waypoints(
-        self,
-        waypoints: list[tuple[list, list, float]],
-        busy_retry_delay: float = 0.015,
-        busy_max_retry: int = 5,
-        release_index: int | None = None,
-        release_fn=None,
-        between_fn=None,
-    ) -> bool:
-        """waypoint를 /motoman_gp8_controller/queue_traj_point로 순차 push.
-
-        ``release_index``/``release_fn`` 지정 시, 해당 인덱스 waypoint를 큐에
-        넣은 직후 ``release_fn``을 1회 호출 — throw 도중 석션 OFF를 포인트
-        명령들 사이에 끼워넣는 용도.
-        """
-        if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
-            self._node.get_logger().error("queue_traj_point service unavailable.")
-            return False
-
-        # diag (no-op if off): log the queued command — start = snapped current
-        # position (waypoints[0]), target = final point, planned dur = its
-        # time_from_start. The actual reach time is filled from joint samples.
-        if waypoints:
-            self._motion_logger.on_command(
-                waypoints[0][0], waypoints[-1][0], waypoints[-1][2],
-            )
-
-        # [PUSH-DIAG] (only when motion logging is on) measure per-point queue
-        # round-trip + WHEN the arm actually starts moving, on ONE clock, to verify
-        # whether the startup dead-time is the per-point push round-trips (H1) or
-        # MotoROS2-side startup AFTER queueing (H2). current_joints is kept fresh
-        # by the background MTE spinner, so we can spot motion-start mid-push.
-        _diag = self._motion_logger.enabled
-        _t0 = time.time()
-        _start_pos = list(waypoints[0][0]) if waypoints else None
-        _per_pt_ms = []
-        _t_move = None
-
-        busy_total = 0
-        for i, (pos, v, t) in enumerate(waypoints):
-            req = QueueTrajPoint.Request()
-            req.joint_names = JOINT_NAMES
-            req.point.positions = [float(x) for x in pos]
-            req.point.velocities = [float(x) for x in v]
-            req.point.time_from_start = _seconds_to_duration(t)
-
-            ok = False
-            _t_pt = time.time()
-            for _ in range(busy_max_retry + 1):
-                fut = self._queue_point_client.call_async(req)
-                _wait_future(fut, 2.0)
-                res = fut.result()
-                if res is None:
-                    self._node.get_logger().error(f"pt {i}: service timeout")
-                    return False
-                code = res.result_code.value
-                if code == 1:  # SUCCESS
-                    ok = True
-                    break
-                if code == 4:  # BUSY
-                    busy_total += 1
-                    time.sleep(busy_retry_delay)
-                    continue
-                self._node.get_logger().error(
-                    f"pt {i}: queue code={code} msg='{res.message}'"
-                )
-                return False
-            if not ok:
-                self._node.get_logger().warn(
-                    f"pt {i}: dropped after {busy_max_retry} BUSY retries"
-                )
-                return False
-
-            if _diag:
-                _per_pt_ms.append((time.time() - _t_pt) * 1000.0)
-                if (_t_move is None and _start_pos is not None
-                        and self.current_joints is not None):
-                    dev = max(abs(a - b) for a, b in
-                              zip(self.current_joints, _start_pos))
-                    if dev > 0.01:          # arm has physically started moving
-                        _t_move = time.time() - _t0
-
-            # Interleave the release: once the release waypoint is queued,
-            # fire suction_off (the IO command rides between point commands).
-            if release_fn is not None and release_index is not None and i >= release_index:
-                release_fn()
-                release_fn = None  # fire once
-
-            # Generic per-point hook: e.g. fire an early suction_on the instant
-            # its wall-clock deadline passes, mid-push if needed.
-            if between_fn is not None:
-                between_fn()
-
-        if busy_total > 0:
-            # BUSY는 push가 MotoROS2 수신 속도보다 빠를 때 발생하는 정상 신호.
-            # 큐가 깊지 않을 때 흔하며, 재시도로 자연스럽게 흡수됨.
-            self._node.get_logger().debug(
-                f"Queue push: {busy_total} BUSY retries across {len(waypoints)} pts"
-            )
-        if _diag:
-            n = len(_per_pt_ms)
-            avg = sum(_per_pt_ms) / n if n else 0.0
-            mx = max(_per_pt_ms) if _per_pt_ms else 0.0
-            move_s = (f"{_t_move * 1000:.0f}ms (DURING push)"
-                      if _t_move is not None else "NOT until push done (-> H2)")
-            self._node.get_logger().info(
-                f"[PUSH-DIAG] {n} pts queued in {(time.time() - _t0) * 1000:.0f}ms "
-                f"(avg {avg:.0f}, max {mx:.0f} ms/pt; busy={busy_total}); "
-                f"arm motion start = {move_s}"
-            )
-            # Persist the same breakdown onto the open command row so err_s can be
-            # decomposed (re-entry / push / arm-start) per dispatch in the CSV.
-            self._motion_logger.on_dispatch(
-                n_pts=len(waypoints),
-                push_ms=(time.time() - _t0) * 1000.0,
-                perpt_avg=avg, perpt_max=mx, busy=busy_total,
-                motion_start_ms=(_t_move * 1000.0) if _t_move is not None else None,
-                qmode_ms=self.last_qmode_ms,
-            )
-        return True
-
-    def _push_one_point(
-        self, pos, vel, t, *, busy_retry_delay: float = 0.02,
-        busy_max_wait_s: float = 2.0,
-    ) -> "int | None":
-        """Push ONE queue point; return its result_code.
-
-        BUSY(4) = the bounded MotoROS2 queue is momentarily FULL — normal
-        backpressure when streaming faster than the robot consumes (measured
-        queue depth ~10 points). We WAIT for a slot, retrying for up to
-        ``busy_max_wait_s`` (the robot frees one slot per consumed point,
-        ~0.2s), instead of giving up after a few ms — which would abort a long
-        continuous stream mid-way. SUCCESS=1, WRONG_MODE=2, INIT_FAILURE=3,
-        INVALID_JOINT_LIST=5, UNABLE_TO_PROCESS_POINT=6; ``None`` = service
-        timeout. Sustained BUSY past the budget returns 4 (a reject, not a
-        silent drop). The message (carries the '204'/init text on a re-checked
-        start position) is logged on a hard reject.
-        """
-        req = QueueTrajPoint.Request()
-        req.joint_names = JOINT_NAMES
-        req.point.positions = [float(x) for x in pos]
-        req.point.velocities = [float(x) for x in vel]
-        req.point.time_from_start = _seconds_to_duration(float(t))
-        busy_waited = 0.0
-        while True:
-            fut = self._queue_point_client.call_async(req)
-            _wait_future(fut, 2.0)
-            res = fut.result()
-            if res is None:
-                self._node.get_logger().error("[PERSIST] queue point: service timeout")
-                return None
-            code = int(res.result_code.value)
-            if code == 4:  # queue full -> honor backpressure, wait for a slot
-                if busy_waited >= busy_max_wait_s:
-                    self._node.get_logger().warn(
-                        f"[PERSIST] queue BUSY for {busy_waited:.1f}s; giving up")
-                    return 4
-                time.sleep(busy_retry_delay)
-                busy_waited += busy_retry_delay
-                continue
-            if code != 1:
-                self._node.get_logger().warn(
-                    f"[PERSIST] queue reject code={code} msg='{res.message}'")
-            return code
-
-    def push_segments_persistent(
-        self, segments, *, wait: bool = True, tail_buffer: float = 0.3,
-        join_tol: float = 0.05,
-    ):
-        """Stage-C 영속 큐 프리미티브 — N 세그먼트를 하나의 큐 세션에 연속 스트리밍.
-
-        세그먼트마다 큐모드를 재진입(stop+start, 측정 ~0.41s = dispatch 오버헤드의
-        61%)하는 대신, 큐를 비우지 않고 다음 세그먼트 점들을 이어붙여 재진입을 제거.
-
-        segments: ``[(traj, vel, timestep, final_joint), ...]`` (send_trajectory_queue
-        와 동일 형식; **속도-연속**이어야 함). 하나의 **순증가** 타임라인으로 병합:
-        - 첫 세그먼트의 첫 점만 측정 현재 위치로 스냅(큐 초기화 — MotoROS2는 새 큐의
-          첫 점이 현재 위치와 일치해야 함; 거부는 result_code 3/6 + 메시지의 '204').
-        - 이후 세그먼트는 직전 세그먼트 끝 시각 뒤로 offset; 공유 경계점(seg[0] ≈ 직전
-          끝점, ``join_tol`` 이내)은 **중복 제거**해 시각이 strictly-increasing 유지.
-        - 정지(zero-vel) settle 점은 **마지막에 한 번만** 부여(중간 정지/속도 불연속 방지).
-
-        호출 전 ``enter_queue_mode()`` 1회 필요. 반환 ``(ok, seg_codes)`` —
-        ``seg_codes[i]`` = 세그먼트 i가 받은 result_code들.
-
-        **거부 시 즉시 중단(abort-on-reject)**: 어떤 점이든 non-SUCCESS면 그 자리에서
-        푸시를 멈춰 큐에 **연속 prefix만** 남긴다(구멍 없음). 따라서 큐 드레인
-        (WRONG_MODE=2)이든, 비-빈 큐 append 재검사(INIT_FAILURE=3/UNABLE=6)든,
-        영리한 재개를 시도하지 않고 안전하게 실패를 알린다 — 팔은 큐된 prefix를 마치고
-        정지(물리적으로 안전). 복구(현재 위치 재측정 후 일반 경로)는 호출자 책임.
-
-        NOTE(Stage-C 게이트): 비-빈 큐 append가 시작점 재검사를 받는지 여부는
-        ``tests/persistent_queue_spike.py``로 HW 검증. 기본 skill 경로엔 미연결.
-        """
-        n_seg = len(segments)
-        if n_seg == 0:
-            return True, []
-        if self.current_joints is None:
-            self._node.get_logger().error("[PERSIST] no current_joints; aborting.")
-            return False, []
-
-        # --- build ONE strictly-increasing, boundary-deduped waypoint stream ---
-        stream = []                      # (pos, vel, time, seg_idx)
-        running_end = 0.0
-        prev_last_pos = None
-        for si, (traj, vel, ts, final_joint) in enumerate(segments):
-            pos = [list(p) for p in traj.T.tolist()]
-            vels = [list(v) for v in vel.T.tolist()]
-            times = [float(t) for t in ts]
-            if si == 0:
-                pos[0] = list(self.current_joints)        # queue-init match
-                start_idx, offset = 0, 0.0
-            else:
-                offset = running_end
-                if _max_abs_diff(pos[0], prev_last_pos) <= join_tol:
-                    start_idx = 1                          # drop shared boundary point
-                else:                                      # discontinuous: connect, keep monotonic
-                    start_idx = 0
-                    step = (times[1] - times[0]) if len(times) > 1 else 0.05
-                    offset = running_end + step
-                    self._node.get_logger().warn(
-                        f"[PERSIST] seg {si} boundary gap "
-                        f"{_max_abs_diff(pos[0], prev_last_pos):.3f} rad; inserting connector.")
-            for i in range(start_idx, len(times)):
-                stream.append((pos[i], vels[i], times[i] + offset, si))
-            running_end = times[-1] + offset
-            prev_last_pos = pos[-1]
-        # single full-stop settle point at the very end
-        last_final = segments[-1][3]
-        fj = list(last_final) if last_final is not None else list(prev_last_pos)
-        running_end += 0.05
-        stream.append((fj, [0.0] * 6, running_end, n_seg - 1))
-
-        # defensive: times must be strictly increasing for the MotoROS2 queue
-        for a, b in zip(stream, stream[1:]):
-            if b[2] <= a[2]:
-                self._node.get_logger().error(
-                    f"[PERSIST] non-monotonic time {a[2]:.3f}->{b[2]:.3f}; aborting.")
-                return False, [[] for _ in range(n_seg)]
-
-        # --- push with ABORT-ON-REJECT (queue keeps only a continuous prefix) ---
-        seg_codes = [[] for _ in range(n_seg)]
-        if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
-            self._node.get_logger().error("[PERSIST] queue_traj_point unavailable.")
-            return False, seg_codes
-        t_start = time.time()
-        ok = True
-        pushed_end = 0.0
-        for pos, v, t, si in stream:
-            code = self._push_one_point(pos, v, t)
-            seg_codes[si].append(code)
-            if code != 1:
-                ok = False
-                self._node.get_logger().warn(
-                    f"[PERSIST] seg {si}: rejected (code={code}); stopping push — "
-                    "queue holds continuous prefix, caller must recover.")
-                break
-            pushed_end = t
-        if wait:
-            # wait only for what was actually queued (the continuous prefix)
-            self._wait_trajectory_end(pushed_end, t_start=t_start, tail_buffer=tail_buffer)
-        return ok, seg_codes
-
-    # ------------------------------------------------------------------
-    # Persistent-queue SESSION (stateful): pick + ambush hold + throw in ONE
-    # queue, with NO per-segment re-entry. push_segments_persistent handles the
-    # all-known-upfront case; this session adds a dynamic HOLD (feed points at
-    # grasp during the ambush wait so the queue never drains) between segments.
-    # ------------------------------------------------------------------
-    @property
-    def pq_active(self) -> bool:
-        """True while a persistent-queue session is live (queue mode held, not yet
-        pq_finish'd). A skill checks this at cycle start to decide whether it can
-        RESUME the session cross-cycle instead of re-entering queue mode."""
-        return self._pq_active
-
-    def pq_begin(self) -> None:
-        """Open a persistent-queue session on the CURRENT (already-entered) queue.
-
-        Caller must have a fresh ``enter_queue_mode()`` succeed first. Resets the
-        monotonic session timeline; the next ``pq_segment`` snaps its first point
-        to the measured current position (queue-init / code 204)."""
-        if self._pq_active:
-            self._node.get_logger().warn(
-                "[PQ] pq_begin while a session is active; resetting timeline — "
-                "ensure a fresh enter_queue_mode() preceded this.")
-        self._pq_active = True
-        self._pq_t = 0.0
-        self._pq_last_pos = None
-        self._pq_start = time.time()
-        self._pq_start_pose = list(self.current_joints) if self.current_joints else None
-        self._pq_motion_start = None
-
-    def _pq_push_stream(self, wp, *, between_fn=None) -> tuple:
-        """Push (pos, vel, time) points with ABORT-ON-REJECT; advance the session
-        timeline to the last SUCCESS point. ``between_fn`` (if given) is called
-        after each successful push — used to fire a POSITION-BASED suction event
-        while the queue drains (current_joints kept fresh by the MTE spinner).
-        Returns (ok, codes)."""
-        codes = []
-        ok = True
-        for pos, v, t in wp:
-            if self._pq_last_pos is not None and t <= self._pq_t:
-                self._node.get_logger().error(
-                    f"[PQ] non-monotonic time {self._pq_t:.3f}->{t:.3f}; aborting.")
-                ok = False
-                break
-            code = self._push_one_point(pos, v, t)
-            codes.append(code)
-            if code != 1:
-                ok = False
-                self._node.get_logger().warn(
-                    f"[PQ] point rejected code={code}; stopping (continuous prefix kept).")
-                break
-            self._pq_t = t
-            self._pq_last_pos = list(pos)
-            # Record when the arm ACTUALLY first moves (current_joints kept fresh by
-            # the MTE spinner) — pq_hold_until anchors its pacing to this, not pq_begin.
-            if (self._pq_motion_start is None and self._pq_start_pose is not None
-                    and self.current_joints is not None
-                    and _max_abs_diff(self.current_joints, self._pq_start_pose) > 0.01):
-                self._pq_motion_start = time.time()
-            if between_fn is not None:
-                between_fn()
-        return ok, codes
-
-    def pq_segment(self, traj, vel, ts, final_joint, *, is_last: bool = False,
-                   join_tol: float = 0.05, between_fn=None) -> tuple:
-        """Append one trajectory segment onto the session timeline (no re-entry).
-
-        Session's first segment snaps its first point to current joints; later
-        segments append raw and drop the shared boundary point (seg[0] ≈ last
-        queued pose within ``join_tol``) so times stay strictly increasing. The
-        zero-velocity settle point is added only when ``is_last``. ``between_fn``
-        is called after each successful push (position-based IO hook, e.g. throw
-        release). (ok, codes)."""
-        if not self._pq_active:
-            self._node.get_logger().error("[PQ] pq_segment without pq_begin; aborting.")
-            return False, []
-        pos = [list(p) for p in traj.T.tolist()]
-        vels = [list(v) for v in vel.T.tolist()]
-        times = [float(t) for t in ts]
-        first_seg = self._pq_last_pos is None
-        if first_seg:
-            if self.current_joints is None:
-                self._node.get_logger().error("[PQ] no current_joints; aborting.")
-                return False, []
-            pos[0] = list(self.current_joints)
-            start_idx, offset = 0, 0.0
-        else:
-            offset = self._pq_t
-            if _max_abs_diff(pos[0], self._pq_last_pos) <= join_tol:
-                start_idx = 1
-            else:
-                start_idx = 0
-                step = (times[1] - times[0]) if len(times) > 1 else 0.05
-                offset = self._pq_t + step
-                self._node.get_logger().warn(
-                    f"[PQ] segment boundary gap "
-                    f"{_max_abs_diff(pos[0], self._pq_last_pos):.3f} rad; connector.")
-        wp = [(pos[i], vels[i], times[i] + offset) for i in range(start_idx, len(times))]
-        if is_last:
-            base = wp[-1][2] if wp else offset
-            fj = list(final_joint) if final_joint is not None else list(pos[-1])
-            wp.append((fj, [0.0] * 6, base + 0.05))
-        if not wp:
-            return True, []          # degenerate (single point deduped away)
-        if not self._queue_point_client.wait_for_service(timeout_sec=2.0):
-            self._node.get_logger().error("[PQ] queue_traj_point unavailable.")
-            return False, []
-        # Diagnostic (no-op unless GP8_MOTION_LOG_DIR): record this segment as a
-        # dispatch so persistent cycles show up in motion_commands.csv comparably
-        # to the non-persistent path. qmode_ms = the queue re-entry cost, but ONLY
-        # for the session's FIRST segment (which followed enter_queue_mode); later
-        # segments (the throw) had NO re-entry -> 0.0, which is exactly the ~0.41s
-        # this path removes — so a persistent throw row reads qmode_ms=0 vs the
-        # non-persistent throw's ~400ms.
-        _log = self._motion_logger.enabled
-        if _log:
-            self._motion_logger.on_command(wp[0][0], wp[-1][0], wp[-1][2] - wp[0][2])
-        _t0 = time.time()
-        ok, codes = self._pq_push_stream(wp, between_fn=between_fn)
-        if _log:
-            self._motion_logger.on_dispatch(
-                n_pts=len(wp), push_ms=(time.time() - _t0) * 1000.0,
-                qmode_ms=(self.last_qmode_ms if first_seg else 0.0))
-        return ok, codes
-
-    def pq_hold_until(self, hold_joint, deadline_wall: float, *,
-                      dt: float = 0.12, lead: float = 0.35, tick_fn=None) -> bool:
-        """Keep the queue ALIVE at ``hold_joint`` until wall clock ``deadline_wall``.
-
-        Feeds zero-velocity hold points at ``hold_joint`` so queue mode does not
-        auto-exit during an ambush wait. Paced: push when the session timeline is
-        < ``lead`` ahead of elapsed real MOTION time (anchored to the measured
-        motion-start ``_pq_motion_start``, NOT pq_begin), so the buffer ahead of
-        the arm is ~``lead`` — no longer ``lead + startup-dead-time``. This is the
-        buffer the NEXT segment (the throw) waits behind, so keeping it near the
-        keep-alive floor (~1 point) directly cuts the throw's onset delay.
-
-        WARNING: with a small lead the queue is only ~1 hold point deep, so an
-        unfed gap AFTER the hold (e.g. a slow NN/IK throw plan) can drain it →
-        WRONG_MODE. The caller must PRECOMPUTE the throw during the hold (no unfed
-        planning gap after) before shrinking lead, else the throw append aborts.
-
-        Only WRONG_MODE(2) means the queue genuinely drained (fatal → False).
-        BUSY(4)/timeout leave the queue ALIVE (full/transient) → skip that point
-        and keep going. ``hold_joint`` MUST equal where the arm actually is (the
-        last queued pose); a mismatch would be a position step over dt → velocity
-        spike / alarm 4414, so it is refused."""
-        if not self._pq_active:
-            return False
-        hold = list(hold_joint)[:6]
-        if self._pq_last_pos is not None:
-            d = _max_abs_diff(hold, self._pq_last_pos)
-            if d > 0.02:
-                self._node.get_logger().error(
-                    f"[PQ] hold_joint is {d:.3f} rad from the last queued pose; "
-                    "refusing (would command a jump). Hold at the segment's end pose.")
-                return False
-        zero = [0.0] * 6
-        # Anchor to when the arm actually started moving (falls back to pq_begin if
-        # motion-start was never detected, e.g. a prepositioned pick with no drive).
-        anchor = self._pq_motion_start if self._pq_motion_start is not None else self._pq_start
-        while time.time() < deadline_wall:
-            if self._pq_t < (time.time() - anchor) + lead:
-                code = self._push_one_point(hold, zero, self._pq_t + dt)
-                if code == 2:  # WRONG_MODE = queue drained/exited -> genuinely lost
-                    self._node.get_logger().warn("[PQ] hold: WRONG_MODE — queue drained.")
-                    return False
-                if code == 1:
-                    self._pq_t += dt
-                    self._pq_last_pos = hold
-                # BUSY(4)/None(timeout): queue still alive (full/transient) -> skip
-            else:
-                time.sleep(0.01)
-            if tick_fn is not None:
-                tick_fn()      # e.g. fire suction_on once its wall-clock instant passes
-        return True
-
-    def _pq_keepalive_tick(self, *, dt: float = 0.15, lead: float = 0.35) -> str:
-        """ONE keep-alive iteration (the QueueFeeder calls this in a loop between
-        segments). If the buffered timeline ``_pq_t`` is within ``lead`` of the
-        arm's real motion time, push ONE zero-velocity hold point at the last
-        queued pose so the queue never empties (mode never exits). This is the
-        single-tick form of ``pq_hold_until``'s pacing loop.
-
-        Before the first segment ``_pq_last_pos`` is None: seed the queue at the
-        MEASURED current position — that first point equals current joints, which
-        is exactly the code-204 queue-init requirement, and every later hold/segment
-        is a mid-stream append (not re-checked). Returns 'pushed' / 'buffered'
-        (queue deep enough, no push) / 'drained' (WRONG_MODE — the queue genuinely
-        emptied and mode exited; the feeder must stop and hand back to re-entry)."""
-        if not self._pq_active:
-            return "buffered"
-        if self._pq_last_pos is not None:
-            hold = self._pq_last_pos
-            t_push = self._pq_t + dt
-        elif self.current_joints is not None:
-            # Seed the empty queue at the measured current position. The queue's
-            # FIRST point must equal current joints AND (by convention) start at
-            # t=0 — this satisfies code-204 queue-init; every later point is a
-            # mid-stream append.
-            hold = list(self.current_joints)
-            t_push = 0.0 if self._pq_t <= 0.0 else self._pq_t + dt
-        else:
-            return "buffered"
-        anchor = self._pq_motion_start if self._pq_motion_start is not None else self._pq_start
-        if self._pq_t < (time.time() - anchor) + lead:
-            code = self._push_one_point(hold, [0.0] * 6, t_push)
-            if code == 2:  # WRONG_MODE = queue drained/exited
-                self._node.get_logger().warn("[FEEDER] keep-alive WRONG_MODE — queue drained.")
-                return "drained"
-            if code == 1:
-                self._pq_t = t_push
-                self._pq_last_pos = hold
-            return "pushed"
-        return "buffered"
-
-    def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
-                  settle_tol: float = 0.03) -> None:
-        """End the session; optionally wait for the queued motion to complete.
-
-        After the time estimate, CONFIRM arrival at the last queued pose via joint
-        feedback — the pure wall-clock estimate can under-shoot by the startup
-        dead-time or a BUSY-throttled final push, which would otherwise let a
-        caller read a still-moving arm or chop it on the next mode switch."""
-        if wait and self._pq_active:
-            self._wait_trajectory_end(
-                self._pq_t, t_start=self._pq_start, tail_buffer=tail_buffer)
-            if self._pq_last_pos is not None:
-                self._wait_for_position(
-                    np.asarray(self._pq_last_pos, dtype=float),
-                    tolerance=settle_tol, timeout_sec=1.5)
-        self._pq_active = False
-
-    def pq_throw_segment(self, traj, vel, timestep, final_joint, *,
-                         release_index, suction_on_at=None,
-                         release_tol: float = 0.05) -> tuple:
-        """Append the THROW onto the live session with a POSITION-BASED suction
-        release. Returns ``(ok, primed_next)``: ok is False if the append was
-        REJECTED (e.g. the queue drained during throw planning) so the caller can
-        salvage/abort instead of silently dropping the object — no bogus release
-        is fired in that case.
-
-        Release uses a LAYERED detector (fire on entering the release band OR on
-        the first receding sample after the closest approach) so a fast swing
-        that crosses the band between ~50 ms polls still fires within one sample,
-        not chain-late. In the persistent path the throw is queued ~the hold
-        buffer AHEAD of execution, so the index/queue-time release of
-        ``send_trajectory_queue_with_timed_release`` would fire early — hence
-        position-based here.
-
-        WARNING: release timing is throw-critical; verify on HW where the object
-        lands and tune release_tol / RELEASE_LEAD before enabling the flag."""
-        arr = np.asarray(traj)
-        rel = int(max(0, min(release_index, arr.shape[1] - 1)))
-        release_pose = [float(x) for x in arr[:, rel]]
-        state = {"fired": False, "primed_next": False, "min_diff": float("inf")}
-        self.last_throw = {
-            "throw_start": time.time(), "release_wall": None, "io_ms": None,
-            "release_index": rel, "n_waypoints": int(arr.shape[1]),
-        }
-
-        def _do_release(note: str) -> None:
-            t_io = time.time()
-            self.suction_off()
-            state["fired"] = True
-            self.last_throw["release_wall"] = getattr(self, "last_suction_off_t", None)
-            self.last_throw["io_ms"] = (time.time() - t_io) * 1000.0
-            self._node.get_logger().info(f"[PQ] release: suction_off ({note}, idx {rel}).")
-
-        def _tick() -> None:
-            if not state["fired"]:
-                if self.current_joints is not None:
-                    d = _max_abs_diff(self.current_joints, release_pose)
-                    receding = (state["min_diff"] <= release_tol * 1.5
-                                and d > state["min_diff"] + release_tol / 2)
-                    if d <= release_tol or receding:
-                        _do_release("at pose" if d <= release_tol else "past closest")
-                    else:
-                        state["min_diff"] = min(state["min_diff"], d)
-            elif (suction_on_at is not None and not state["primed_next"]
-                  and time.time() >= suction_on_at):
-                self.suction_on()
-                state["primed_next"] = True
-                self._node.get_logger().info("[PQ] return-prime: suction_on for next pick.")
-
-        ok, _ = self.pq_segment(traj, vel, timestep, final_joint, is_last=True,
-                                between_fn=_tick)
-        if not ok:
-            # Append rejected (queue drained during planning, or a reject). Do NOT
-            # fire a release — the throw never queued; the caller salvages/aborts.
-            self._node.get_logger().error(
-                "[PQ] throw append REJECTED — not queued; caller must recover.")
-            return False, state["primed_next"]
-        # Post-push: the throw is still draining. Keep catching the release
-        # (bounded — never carry the object into the chain) and the prime deadline.
-        t_end = time.time() + 1.0
-        while (not state["fired"] or not state["primed_next"]) and time.time() < t_end:
-            time.sleep(0.02)
-            _tick()
-        if not state["fired"]:
-            _do_release("post-push last resort")
-        return True, state["primed_next"]
-        return state["primed_next"]
-
-    def _wait_trajectory_end(
-        self,
-        total_duration: float,
-        t_start: float | None = None,
-        tail_buffer: float = 0.1,
-    ) -> None:
-        """time_from_start 기반 trajectory 완료 대기."""
-        if t_start is None:
-            t_start = time.time()
-        remaining = total_duration - (time.time() - t_start) + tail_buffer
-        if remaining > 0:
-            # joint_state 캐시는 백그라운드 MTE가 최신화 (여기선 sleep만)
-            t_end = time.time() + remaining
-            while time.time() < t_end:
-                time.sleep(0.05)
-
-    def _wait_for_target(self, target_joint, tolerance: float = 1e-4) -> None:
-        """Spin until robot reaches target joint position."""
-        while rclpy.ok():
-            time.sleep(0.01)
-            if self.current_joints is not None:
-                diff = math.sqrt(sum(
-                    (a - b) ** 2 for a, b in zip(self.current_joints, target_joint)
-                ))
-                if diff < tolerance:
-                    break
-
-    def _wait_for_position(
-        self,
-        target_joint: np.ndarray,
-        tolerance: float = 0.05,
-        timeout_sec: float | None = None,
-    ) -> bool:
-        """Spin until robot is near ``target_joint``, or we pass it, or timeout.
-
-        Returns True iff the position was actually reached (one of the
-        closeness conditions fired), False iff the hard timeout expired.
-
-        Detection is layered to survive fast throws:
-          1. ``diff < tolerance`` — the ideal hit.
-          2. ``diff > min_diff + tolerance/2`` — we already grazed the point
-             and are now moving away. This saves us when the robot zips
-             through the tolerance zone between two joint_states samples.
-          3. ``time.time() - start > timeout_sec`` — hard fallback. We'd
-             rather release slightly too early than never.
-        """
-        target_list = target_joint.tolist()
-        start = time.time()
-        min_diff = float("inf")
-
-        while rclpy.ok():
-            time.sleep(0.01)
-            if self.current_joints is not None:
-                diff = math.sqrt(sum(
-                    (a - b) ** 2 for a, b in zip(self.current_joints, target_list)
-                ))
-                if diff < tolerance:
-                    return True
-                if min_diff != float("inf") and diff > min_diff + tolerance / 2.0:
-                    # Past the closest approach — release now.
-                    return True
-                if diff < min_diff:
-                    min_diff = diff
-            if timeout_sec is not None and (time.time() - start) > timeout_sec:
-                return False
-
-    # ------------------------------------------------------------------
-    # Suction gripper
-    # ------------------------------------------------------------------
-
-    def suction_on(self) -> None:
-        self.last_suction_on_t = time.time()   # for the pick-cycle timing log
-        self._call_io(SUCTION_IO_ADDRESS, 0)
-
-    def suction_off(self) -> None:
-        self.last_suction_off_t = time.time()
-        self._call_io(SUCTION_IO_ADDRESS, 1)
-
-    def _call_io(self, address: int, value: int) -> None:
-        """Call WriteSingleIO service synchronously."""
-        req = WriteSingleIO.Request()
-        req.address = address
-        req.value = value
-        future = self._io_client.call_async(req)
-        _wait_future(future)
-        result = future.result()
-        if not result.success:
-            self._node.get_logger().error(f"IO write failed: {result.message}")
-
-    # ------------------------------------------------------------------
-    # Goal building
-    # ------------------------------------------------------------------
-
-    def _build_goal(
-        self,
-        traj: np.ndarray,
-        vel: np.ndarray,
-        timestep: np.ndarray,
-        final_joint: np.ndarray | None = None,
-        extra_time: float = 0.05,
-    ) -> FollowJointTrajectory.Goal:
-        """Build FollowJointTrajectory goal from numpy arrays."""
-        positions = traj.T.tolist()
-        if self.current_joints is not None:
-            positions[0] = list(self.current_joints)
-        velocities = vel.T.tolist()
-        times = timestep.tolist()
-
-        if final_joint is None:
-            final_joint_list = positions[-1]
-        else:
-            final_joint_list = list(final_joint)
-
-        positions.append(final_joint_list)
-        velocities.append([0.0] * 6)
+        positions = np.asarray(traj).T.tolist()
+        velocities = np.asarray(vel).T.tolist()
+        times = list(np.asarray(timestep).tolist())
+
+        final = list(final_joint) if final_joint is not None else positions[-1]
+        positions.append(final)
+        velocities.append([0.0] * len(JOINT_NAMES))
         times.append(times[-1] + extra_time)
 
         jt = JointTrajectory()
@@ -1347,9 +215,419 @@ class TrajectoryController:
             pt = JointTrajectoryPoint()
             pt.positions = [float(x) for x in pos]
             pt.velocities = [float(x) for x in v]
-            pt.time_from_start = _seconds_to_duration(t)
+            pt.time_from_start = _seconds_to_duration(float(t))
             jt.points.append(pt)
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = jt
         return goal
+
+    def _send_goal(self, goal_msg):
+        """Send a goal; return the accepted goal_handle (or None if rejected)."""
+        fut = self._fjt_client.send_goal_async(goal_msg)
+        _wait_future(fut)
+        gh = fut.result()
+        if gh is None or not gh.accepted:
+            self._node.get_logger().warn("Trajectory goal rejected.")
+            return None
+        return gh
+
+    def _send_blocking(self, traj, vel, timestep, final_joint=None) -> bool:
+        """Send a trajectory and block until the JTC reports completion."""
+        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
+        if gh is None:
+            return False
+        _wait_future(gh.get_result_async())
+        return True
+
+    # ------------------------------------------------------------------
+    # 250 Hz streaming backend (JointGroupPositionController)
+    # ------------------------------------------------------------------
+    def _stream_trajectory(self, traj, vel, timestep, final_joint=None, *,
+                           release_index: int | None = None,
+                           suction_on_at: float | None = None,
+                           tick_fn=None) -> dict:
+        """Stream a trajectory to the JointGroupPositionController at ~250 Hz.
+
+        The app's trajectories are sampled at ~20 Hz (``trajectory()``: ``timestep`` is the
+        cumulative time_from_start = arange(L+1)/hertz). The 250 Hz ros2_control loop wants a
+        fresh position every 4 ms, so we RESAMPLE (per-joint linear interpolation) onto a 4 ms
+        grid and publish each sample, paced to wall clock.
+
+        ⚠️ SOFT real-time: this is a Python paced loop (GIL / scheduler jitter), NOT hard 250 Hz.
+        The controller runs the true 250 Hz; the JGPC zero-order-holds our last command between
+        publishes, and the B6 host command_limiter + controller-side clamp bound any per-cycle
+        jump — so jitter degrades smoothness, not safety. For hard-RT, a C++ node would be needed.
+
+        ``release_index`` → fire suction_off when the stream reaches that waypoint's time.
+        ``suction_on_at`` (wall clock) → after release, fire suction_on once to prime the next pick.
+        ``tick_fn`` → called every sample (e.g. to prime suction on a positioning move).
+        Returns {'fired': bool, 'primed_next': bool}.
+        """
+        arr = np.asarray(traj, dtype=float)                       # (n_joints, n_steps)
+        n_joints, n_steps = arr.shape
+        times = np.asarray(timestep, dtype=float).ravel()         # cumulative time_from_start
+        t_release = float(times[int(release_index)]) if release_index is not None else None
+        if final_joint is not None:
+            arr = np.concatenate(
+                [arr, np.asarray(final_joint, dtype=float).reshape(n_joints, 1)], axis=1)
+            times = np.append(times, times[-1] + 0.05)
+        T = float(times[-1])
+        grid = np.arange(0.0, T + STREAM_DT, STREAM_DT)
+        # per-joint linear interpolation onto the 4 ms grid -> (n_grid, n_joints)
+        samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
+
+        st = {"fired": False, "primed_next": False}
+        msg = Float64MultiArray()
+        start = time.monotonic()
+        for k in range(samples.shape[0]):
+            if not rclpy.ok():
+                break
+            msg.data = [float(x) for x in samples[k]]
+            self._jgpc_pub.publish(msg)
+
+            if (t_release is not None and not st["fired"] and grid[k] >= t_release):
+                t_io = time.time()
+                self.suction_off()
+                st["fired"] = True
+                self.last_throw = {
+                    "throw_start": start, "release_wall": self.last_suction_off_t,
+                    "io_ms": (time.time() - t_io) * 1000.0,
+                    "release_index": int(release_index), "n_waypoints": int(n_steps),
+                }
+            elif (st["fired"] and suction_on_at is not None and not st["primed_next"]
+                  and time.time() >= suction_on_at):
+                self.suction_on()
+                st["primed_next"] = True
+            if tick_fn is not None:
+                tick_fn()
+
+            # pace to the next 4 ms tick (drop no samples; sleep the remainder)
+            dt_sleep = (start + (k + 1) * STREAM_DT) - time.monotonic()
+            if dt_sleep > 0:
+                time.sleep(dt_sleep)
+        return st
+
+    def _stream_hold(self, hold_joint, deadline_wall: float, tick_fn=None) -> None:
+        """Keep publishing ``hold_joint`` at ~250 Hz until wall-clock ``deadline_wall``
+        (feeds the servo during an ambush hold). tick_fn runs each cycle (e.g. prime suction)."""
+        pose = [float(x) for x in hold_joint]
+        msg = Float64MultiArray()
+        msg.data = pose
+        nxt = time.monotonic()
+        while time.time() < deadline_wall and rclpy.ok():
+            self._jgpc_pub.publish(msg)
+            if tick_fn is not None:
+                tick_fn()
+            nxt += STREAM_DT
+            dt_sleep = nxt - time.monotonic()
+            if dt_sleep > 0:
+                time.sleep(dt_sleep)
+            else:
+                nxt = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # send_trajectory family (all -> JTC; no queue mode)
+    # ------------------------------------------------------------------
+    def send_trajectory(self, traj, vel, timestep, final_joint=None) -> bool:
+        if self._backend == "stream":
+            self._stream_trajectory(traj, vel, timestep, final_joint)
+            return True
+        return self._send_blocking(traj, vel, timestep, final_joint)
+
+    def send_trajectory_queue(self, traj, vel, timestep, final_joint=None) -> bool:
+        """(MotoROS2 name kept.) backend "stream" → 250 Hz JGPC publish; "jtc" → JTC action."""
+        if self._backend == "stream":
+            self._stream_trajectory(traj, vel, timestep, final_joint)
+            return True
+        return self._send_blocking(traj, vel, timestep, final_joint)
+
+    def send_trajectory_with_release(self, traj, vel, timestep, final_joint, release_joint) -> bool:
+        return self._send_with_position_release(traj, vel, timestep, final_joint, release_joint)
+
+    def send_trajectory_queue_with_release(self, traj, vel, timestep, final_joint, release_joint) -> bool:
+        return self._send_with_position_release(traj, vel, timestep, final_joint, release_joint)
+
+    def send_trajectory_queue_with_attach(self, traj, vel, timestep, final_joint,
+                                          attach_target_joint, attach_tolerance: float = 0.05) -> bool:
+        """Fire suction_on just before reaching attach_target_joint (pneumatic lead), during the JTC move."""
+        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
+        if gh is None:
+            return False
+        result_fut = gh.get_result_async()
+        total = float(np.sum(timestep)) + 0.2
+        fired = False
+        deadline = time.time() + total
+        while not result_fut.done() and time.time() < deadline:
+            if (not fired and self.current_joints is not None
+                    and _max_abs_diff(self.current_joints, attach_target_joint) < attach_tolerance):
+                self.suction_on()
+                fired = True
+            time.sleep(0.01)
+        if not fired:
+            self.suction_on()
+        _wait_future(result_fut, 2.0)
+        return True
+
+    def _send_with_position_release(self, traj, vel, timestep, final_joint, release_joint) -> bool:
+        """Send a JTC goal; fire suction_off when the arm reaches release_joint during the move."""
+        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
+        if gh is None:
+            return False
+        result_fut = gh.get_result_async()
+        timeout = float(np.sum(timestep)) + 0.1
+        reached = self._wait_for_position(release_joint, tolerance=0.05, timeout_sec=timeout)
+        self.suction_off()
+        if not reached:
+            self._node.get_logger().warn("Release joint not detected; suction_off on timeout fallback.")
+        _wait_future(result_fut, 2.0)
+        return True
+
+    def send_trajectory_queue_with_timed_release(self, traj, vel, timestep, final_joint,
+                                                 release_index: int,
+                                                 suction_on_at: float | None = None) -> bool:
+        """Throw path: fire suction_off when the arm reaches the release WAYPOINT pose during the
+        JTC move, then (optionally) prime the next pick's vacuum once ``suction_on_at`` passes.
+        Returns True iff the next-pick suction was primed.
+
+        (MotoROS2 used the index during the per-point push; under JTC there is no push, so we
+        watch /joint_states for the release POSE = traj[:, release_index] — position-based.)
+        """
+        if self._backend == "stream":
+            arr = np.asarray(traj)
+            rel = int(max(0, min(release_index, arr.shape[1] - 1)))
+            st = self._stream_trajectory(traj, vel, timestep, final_joint,
+                                         release_index=rel, suction_on_at=suction_on_at)
+            if not st["fired"]:
+                self.suction_off()   # fallback: never carry the object past release
+            return st["primed_next"]
+        arr = np.asarray(traj)
+        rel = int(max(0, min(release_index, arr.shape[1] - 1)))
+        release_pose = [float(x) for x in arr[:, rel]]
+        total = float(np.sum(timestep))
+
+        state = {"fired": False, "primed_next": False}
+        t_start = time.time()
+        self.last_throw = {
+            "throw_start": t_start, "release_wall": None, "io_ms": None,
+            "release_index": rel, "n_waypoints": int(arr.shape[1]),
+        }
+
+        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
+        if gh is None:
+            return False
+        result_fut = gh.get_result_async()
+        deadline = t_start + total + 0.3
+
+        while not result_fut.done() and time.time() < deadline:
+            if (not state["fired"] and self.current_joints is not None
+                    and _max_abs_diff(self.current_joints, release_pose) <= 0.05):
+                t_io = time.time()
+                self.suction_off()
+                state["fired"] = True
+                self.last_throw["release_wall"] = self.last_suction_off_t
+                self.last_throw["io_ms"] = (time.time() - t_io) * 1000.0
+                self._node.get_logger().info(f"Release: suction_off at waypoint {rel}.")
+            elif (state["fired"] and suction_on_at is not None and not state["primed_next"]
+                  and time.time() >= suction_on_at):
+                self.suction_on()
+                state["primed_next"] = True
+                self._node.get_logger().info("Return-prime: suction_on for next pick.")
+            time.sleep(0.01)
+
+        if not state["fired"]:
+            self.suction_off()   # fallback: never carry the object past the release
+            state["fired"] = True
+        _wait_future(result_fut, 2.0)
+        self._wait_for_position(final_joint, tolerance=0.03, timeout_sec=1.5)
+        return state["primed_next"]
+
+    def send_trajectory_queue_timed_suction(self, traj, vel, timestep, final_joint,
+                                            suction_on_at: float) -> bool:
+        """Positioning move that fires suction_ON once wall-clock ``suction_on_at`` passes
+        (priming the vacuum before grasp). Returns True iff suction fired before the move ended."""
+        if self._backend == "stream":
+            fired = {"v": False}
+
+            def _tick() -> None:
+                if not fired["v"] and time.time() >= suction_on_at:
+                    self.suction_on()
+                    fired["v"] = True
+
+            self._stream_trajectory(traj, vel, timestep, final_joint, tick_fn=_tick)
+            if not fired["v"] and time.time() >= suction_on_at:
+                self.suction_on()
+                fired["v"] = True
+            return fired["v"]
+        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
+        if gh is None:
+            return False
+        result_fut = gh.get_result_async()
+        total = float(np.sum(timestep)) + 0.3
+        deadline = time.time() + total
+        fired = False
+        while not result_fut.done() and time.time() < deadline:
+            if not fired and time.time() >= suction_on_at:
+                self.suction_on()
+                fired = True
+            time.sleep(0.01)
+        if not fired and time.time() >= suction_on_at:
+            self.suction_on()
+            fired = True
+        _wait_future(result_fut, 2.0)
+        return fired
+
+    # ------------------------------------------------------------------
+    # Queue-mode shims (no-ops under ros2_control JTC)
+    # ------------------------------------------------------------------
+    def enter_queue_mode(self) -> bool:
+        """No-op under ros2_control: the JTC is always ready (no Point Queue Mode)."""
+        return True
+
+    def exit_queue_mode(self) -> bool:
+        """No-op under ros2_control."""
+        return True
+
+    # ------------------------------------------------------------------
+    # Persistent-session shims (pq_*). JTC needs no queue keep-alive, so these
+    # are thin: a segment is one JTC goal; a hold is a wall-clock wait.
+    # ------------------------------------------------------------------
+    def pq_active(self) -> bool:
+        return self._pq_active
+
+    def pq_begin(self) -> None:
+        self._pq_active = True
+
+    def pq_segment(self, traj, vel, ts, final_joint, *, is_last: bool = False,
+                   join_tol: float = 0.05, between_fn=None) -> tuple:
+        """Execute one segment (stream: 250 Hz JGPC publish; jtc: JTC goal); call ``between_fn``
+        each cycle (used to fire suction_on when its wall-clock instant passes). Returns (ok, codes)."""
+        if self._backend == "stream":
+            self._stream_trajectory(traj, vel, ts, final_joint, tick_fn=between_fn)
+            return (True, [])
+        gh = self._send_goal(self._build_goal(traj, vel, ts, final_joint))
+        if gh is None:
+            return (False, [])
+        result_fut = gh.get_result_async()
+        total = float(np.sum(ts)) + 0.3
+        deadline = time.time() + total
+        while not result_fut.done() and time.time() < deadline:
+            if between_fn is not None:
+                between_fn()
+            time.sleep(0.01)
+        if between_fn is not None:
+            between_fn()
+        _wait_future(result_fut, 2.0)
+        return (True, [])
+
+    def pq_hold_until(self, hold_joint, deadline_wall: float, *,
+                      dt: float = 0.12, lead: float = 0.35, tick_fn=None) -> bool:
+        """Wait until wall-clock ``deadline_wall`` at the current (hold) pose. Under JTC there
+        is no queue to keep alive — the arm simply holds the last commanded pose — so this is a
+        responsive sleep that calls ``tick_fn`` each iteration (e.g. to prime suction on time)."""
+        if self._backend == "stream":
+            self._stream_hold(hold_joint, deadline_wall, tick_fn=tick_fn)
+            return True
+        while time.time() < deadline_wall and rclpy.ok():
+            if tick_fn is not None:
+                tick_fn()
+            time.sleep(0.01)
+        return True
+
+    def pq_throw_segment(self, traj, vel, timestep, final_joint, *,
+                         release_index, suction_on_at=None,
+                         release_tol: float = 0.05) -> bool:
+        """Throw as a JTC goal with a POSITION-based suction release (same logic as
+        send_trajectory_queue_with_timed_release). Returns primed_next."""
+        return self.send_trajectory_queue_with_timed_release(
+            traj, vel, timestep, final_joint, release_index, suction_on_at=suction_on_at,
+        )
+
+    def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
+                  settle_tol: float = 0.03) -> None:
+        """End the session. (JTC already blocks per-segment, so nothing to drain.)"""
+        self._pq_active = False
+
+    # ------------------------------------------------------------------
+    # Waiting helpers
+    # ------------------------------------------------------------------
+    def _wait_for_position(self, target_joint, tolerance: float = 1e-4,
+                           timeout_sec: float = 5.0) -> bool:
+        """Block until the arm is within ``tolerance`` (max-abs) of ``target_joint``."""
+        target = [float(x) for x in target_joint]
+        t_end = time.time() + timeout_sec
+        while time.time() < t_end and rclpy.ok():
+            if self.current_joints is not None and _max_abs_diff(self.current_joints, target) <= tolerance:
+                return True
+            time.sleep(0.005)
+        return False
+
+    def _wait_trajectory_end(self, total_duration: float, t_start: float | None = None) -> None:
+        t0 = t_start if t_start is not None else time.time()
+        remaining = total_duration - (time.time() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+
+    # ------------------------------------------------------------------
+    # Suction / IO  —  SINGLE BLOCKER SEAM
+    # ------------------------------------------------------------------
+    def suction_on(self) -> None:
+        self.last_suction_on_t = time.time()
+        self._call_io(SUCTION_IO_ADDRESS, 0)
+
+    def suction_off(self) -> None:
+        self.last_suction_off_t = time.time()
+        self._call_io(SUCTION_IO_ADDRESS, 1)
+
+    def _call_io(self, address: int, value: int) -> None:
+        """Write a single IO bit via the controller's Simple Message IoServer (TCP 50242).
+
+        Option A: adv4ncr has no /write_single_io ROS service, but its controller_driver
+        runs the legacy ros-industrial Simple Message IoServer (Controller.c
+        OpenTcpSocket(TCP_PORT_IO); IoServer.c handles ROS_MSG_MOTO_WRITE_IO_BIT=2005), so
+        we recover suction with a small TCP client — no controller-code or wiring change.
+
+        Wire format (little-endian, ``__packed__``):
+          prefix int32 = len(header+body) = 20
+          header: msgType int32 = 2005, commType int32 = 2 (SERVICE_REQUEST), replyType int32 = 0
+          body:   ioAddress uint32, ioValue uint32
+        Reply: prefix(4) + header(12) + resultCode int32 @ offset 16.
+
+        ⚠️ UNVERIFIED ON HW. Confirm: port reachable; address 10017 writable; the reply
+        resultCode's success value (IoResultCodes); ON=0/OFF=1 convention. On failure this
+        logs loudly and returns (does NOT raise) so the motion loop isn't killed mid-cycle —
+        but a failed suction release IS a safety concern, so it must be caught in low-speed
+        validation before any real pick/throw.
+        """
+        pkt = struct.pack("<iiiiII", 20, 2005, 2, 0, int(address), int(value))
+        with self._io_lock:
+            for attempt in (0, 1):   # one reconnect retry
+                try:
+                    if self._io_sock is None:
+                        self._io_sock = socket.create_connection(
+                            (self._io_ip, self._io_port), timeout=2.0)
+                        self._io_sock.settimeout(2.0)
+                    self._io_sock.sendall(pkt)
+                    reply = self._io_sock.recv(64)
+                    if len(reply) >= 20:
+                        result_code = struct.unpack_from("<i", reply, 16)[0]
+                        # IoResultCodes success value is controller-defined — log for HW verify.
+                        self._node.get_logger().debug(
+                            f"[IO] write addr={address} val={value} -> resultCode={result_code}")
+                    else:
+                        self._node.get_logger().warn(
+                            f"[IO] short/no reply ({len(reply)} B) for addr={address} val={value}")
+                    return
+                except OSError as e:
+                    self._node.get_logger().warn(
+                        f"[IO] TCP write failed (attempt {attempt}) to {self._io_ip}:{self._io_port}: "
+                        f"{e}; reconnecting.")
+                    try:
+                        if self._io_sock is not None:
+                            self._io_sock.close()
+                    except OSError:
+                        pass
+                    self._io_sock = None
+            self._node.get_logger().error(
+                f"[IO] suction write addr={address} val={value} FAILED "
+                f"({self._io_ip}:{self._io_port}) — SAFETY: verify release before any real throw.")
