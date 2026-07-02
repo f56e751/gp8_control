@@ -331,19 +331,13 @@ class PushSkill(ManipulationSkill):
                 f"stroke (y={obj_y_now:+.3f} < stroke_min {stroke_min_y:+.3f}); "
                 f"skipping stale stroke"
             )
-            ctx.traj_ctrl.suction_off()
-            ctx.set_active_target(None)
-            ctx.set_status("IDLE", "")
-            return SkillResult(False, "object passed stroke span; push aborted")
+            return self._abort("object passed stroke span; push aborted")
 
         # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
         ctx.set_status("PUSHING", target.class_name)
         if not ctx.traj_ctrl.enter_queue_mode():
             ctx.log.error("Failed to (re)enter queue mode for push; dropping object")
-            ctx.traj_ctrl.suction_off()
-            ctx.set_active_target(None)
-            ctx.set_status("IDLE", "")
-            return SkillResult(False, "enter_queue_mode (push) failed")
+            return self._abort("enter_queue_mode (push) failed")
 
         # Per-class stroke distance (falls back to PUSH_DISTANCE).
         push_distance = PUSH_DISTANCE_MAP.get(target.class_name, PUSH_DISTANCE)

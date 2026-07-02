@@ -168,16 +168,7 @@ class ThrowSkill(ManipulationSkill):
             # (cross-cycle: it was committed by the PRIOR throw) so the next epoch
             # re-selects from a fresh, re-entered session.
             ctx.log.error("Persistent pick failed (queue drained/rejected); aborting.")
-            ctx.traj_ctrl.suction_off()
-            # wait=True: let the queued prefix finish so the arm is STOPPED before
-            # the next cycle's enter_queue_mode — a mode switch on a moving arm
-            # faults the controller (active Alarm) and cascades WRONG_MODE rejects.
-            ctx.traj_ctrl.pq_finish(wait=True)
-            ctx.committed_next = None
-            ctx.committed_intercept = None
-            ctx.set_active_target(None)
-            ctx.set_status("IDLE", "")
-            return SkillResult(False, "persistent pick failed")
+            return self._abort("persistent pick failed", close_session=True, drop_committed=True)
 
         # Lift + throw — same path as the moving strategy.
         # MotoROS2 leaves point-queue mode once the pick trajectory's queue
@@ -189,10 +180,7 @@ class ThrowSkill(ManipulationSkill):
         # so NO throw re-entry — that is the ~0.41s this path removes.
         if not persistent and not ctx.traj_ctrl.enter_queue_mode():
             ctx.log.error("Failed to (re)enter queue mode for throw; dropping object")
-            ctx.traj_ctrl.suction_off()
-            ctx.set_active_target(None)
-            ctx.set_status("IDLE", "")
-            return SkillResult(False, "enter_queue_mode (throw) failed")
+            return self._abort("enter_queue_mode (throw) failed")
 
         # Throw heading = bearing from THIS object's grasp to the fixed bin,
         # recomputed per object so the swing re-aims from any grab position (the
@@ -250,16 +238,7 @@ class ThrowSkill(ManipulationSkill):
             # committed_next, so roll it back or the next (prepositioned) cycle
             # would grab air at a pose the arm never reached.
             ctx.log.error("Persistent throw push failed; dropping object + aborting.")
-            ctx.traj_ctrl.suction_off()
-            # wait=True: let the queued prefix finish so the arm is STOPPED before
-            # the next cycle's enter_queue_mode — a mode switch on a moving arm
-            # faults the controller (active Alarm) and cascades WRONG_MODE rejects.
-            ctx.traj_ctrl.pq_finish(wait=True)
-            ctx.committed_next = None
-            ctx.committed_intercept = None
-            ctx.set_active_target(None)
-            ctx.set_status("IDLE", "")
-            return SkillResult(False, "persistent throw push failed")
+            return self._abort("persistent throw push failed", close_session=True, drop_committed=True)
         # CROSS-CYCLE: when a next object is committed (the chain is streaming the
         # arm to its grasp on this live session), do NOT close the session — leave
         # it open so the next prepositioned cycle resumes it with NO pick re-entry.
