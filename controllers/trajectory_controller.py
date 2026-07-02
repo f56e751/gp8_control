@@ -122,6 +122,7 @@ class TrajectoryController:
         self.last_suction_on_t: float | None = None
         self.last_suction_off_t: float | None = None
         self.last_throw: dict | None = None
+        self._last_throw_ok: bool = True   # #R3: last timed-release dispatch accepted? (pq_throw_segment ok)
 
         # Kept for API compatibility with the skills' timeline model
         # (push_skill.t_to_contact reads qmode_ms_avg for T_setup). Under JTC there is
@@ -280,17 +281,30 @@ class TrajectoryController:
         Returns {'fired': bool, 'primed_next': bool}.
         """
         arr = np.asarray(traj, dtype=float)                       # (n_joints, n_steps)
+        varr = np.asarray(vel, dtype=float)                       # velocity profile (same shape)
         n_joints, n_steps = arr.shape
         times = np.asarray(timestep, dtype=float).ravel()         # cumulative time_from_start
         t_release = float(times[int(release_index)]) if release_index is not None else None
         if final_joint is not None:
             arr = np.concatenate(
                 [arr, np.asarray(final_joint, dtype=float).reshape(n_joints, 1)], axis=1)
+            varr = np.concatenate([varr, np.zeros((n_joints, 1))], axis=1)   # settle at rest
             times = np.append(times, times[-1] + 0.05)
         T = float(times[-1])
         grid = np.arange(0.0, T + STREAM_DT, STREAM_DT)
-        # per-joint linear interpolation onto the 4 ms grid -> (n_grid, n_joints)
-        samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
+        # Resample onto the 4ms grid HONORING the knot velocities (#R3: a plain linear resample of
+        # the coarse ~20Hz arc yields chord-slope velocity, not the designed NN release speed —
+        # matters because throw range ~ v^2). Cubic-Hermite uses positions+velocities; fall back to
+        # linear if times aren't strictly increasing (degenerate/segment-join) or scipy is missing.
+        if varr.shape == arr.shape and np.all(np.diff(times) > 0):
+            try:
+                from scipy.interpolate import CubicHermiteSpline
+                samples = np.column_stack(
+                    [CubicHermiteSpline(times, arr[j], varr[j])(grid) for j in range(n_joints)])
+            except Exception:
+                samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
+        else:
+            samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
 
         st = {"fired": False, "primed_next": False}
         msg = Float64MultiArray()
@@ -416,6 +430,7 @@ class TrajectoryController:
                                          release_index=rel, suction_on_at=suction_on_at)
             if not st["fired"]:
                 self.suction_off()   # fallback: never carry the object past release
+            self._last_throw_ok = True   # stream publish never "rejects" (#R3)
             return st["primed_next"]
         arr = np.asarray(traj)
         rel = int(max(0, min(release_index, arr.shape[1] - 1)))
@@ -425,15 +440,19 @@ class TrajectoryController:
         total = _traj_total(timestep)
 
         state = {"fired": False, "primed_next": False}
+
+        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
+        if gh is None:
+            self._last_throw_ok = False   # #R3: propagate rejection to pq_throw_segment's ok
+            return False
+        # #R2: start the release clock AFTER goal acceptance (~motion start), so the goal-dispatch
+        # round-trip latency isn't counted into t_release (which would fire the time backstop early).
         t_start = time.time()
+        self._last_throw_ok = True
         self.last_throw = {
             "throw_start": t_start, "release_wall": None, "io_ms": None,
             "release_index": rel, "n_waypoints": int(arr.shape[1]),
         }
-
-        gh = self._send_goal(self._build_goal(traj, vel, timestep, final_joint))
-        if gh is None:
-            return False
         result_fut = gh.get_result_async()
         deadline = t_start + total + 0.3
 
@@ -572,7 +591,7 @@ class TrajectoryController:
         primed_next = self.send_trajectory_queue_with_timed_release(
             traj, vel, timestep, final_joint, release_index, suction_on_at=suction_on_at,
         )
-        return (True, bool(primed_next))
+        return (self._last_throw_ok, bool(primed_next))
 
     def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
                   settle_tol: float = 0.03) -> None:
