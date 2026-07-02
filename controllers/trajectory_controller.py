@@ -39,6 +39,7 @@ changes are needed to try this backend.
 from __future__ import annotations
 
 import os
+import queue
 import socket
 import struct
 import threading
@@ -160,6 +161,12 @@ class TrajectoryController:
         self._io_port = 50242            # TCP_PORT_IO (Controller.h)
         self._io_sock: socket.socket | None = None
         self._io_lock = threading.Lock()
+        # Suction I/O runs on a dedicated worker thread (review finding #2): suction_on/off
+        # ENQUEUE and return immediately, so a blocking TCP round-trip never stalls the
+        # 250 Hz stream/servo loop at the release instant. FIFO preserves off-before-prime order.
+        self._io_queue: "queue.Queue" = queue.Queue()
+        self._io_thread = threading.Thread(target=self._io_worker, daemon=True)
+        self._io_thread.start()
 
     # ------------------------------------------------------------------
     # Setup / state
@@ -279,7 +286,8 @@ class TrajectoryController:
 
         st = {"fired": False, "primed_next": False}
         msg = Float64MultiArray()
-        start = time.monotonic()
+        start = time.monotonic()      # pacing clock (monotonic)
+        wall_start = time.time()      # telemetry clock (wall) — last_throw must stay wall-clock (#3)
         for k in range(samples.shape[0]):
             if not rclpy.ok():
                 break
@@ -291,7 +299,7 @@ class TrajectoryController:
                 self.suction_off()
                 st["fired"] = True
                 self.last_throw = {
-                    "throw_start": start, "release_wall": self.last_suction_off_t,
+                    "throw_start": wall_start, "release_wall": self.last_suction_off_t,
                     "io_ms": (time.time() - t_io) * 1000.0,
                     "release_index": int(release_index), "n_waypoints": int(n_steps),
                 }
@@ -536,12 +544,16 @@ class TrajectoryController:
 
     def pq_throw_segment(self, traj, vel, timestep, final_joint, *,
                          release_index, suction_on_at=None,
-                         release_tol: float = 0.05) -> bool:
-        """Throw as a JTC goal with a POSITION-based suction release (same logic as
-        send_trajectory_queue_with_timed_release). Returns primed_next."""
-        return self.send_trajectory_queue_with_timed_release(
+                         release_tol: float = 0.05) -> tuple:
+        """Throw with a POSITION/time-based suction release (same logic as
+        send_trajectory_queue_with_timed_release). Returns ``(ok, primed_next)`` — a 2-tuple to
+        match the caller's ``ok_throw, primed_next = ...`` unpack (throw_skill.py) and the sibling
+        pq_segment's (ok, ...) contract (#1). ok is True once the segment is dispatched; a jtc-path
+        goal rejection is not distinguished here (consistent with pq_segment's optimistic ok)."""
+        primed_next = self.send_trajectory_queue_with_timed_release(
             traj, vel, timestep, final_joint, release_index, suction_on_at=suction_on_at,
         )
+        return (True, bool(primed_next))
 
     def pq_finish(self, *, wait: bool = True, tail_buffer: float = 0.3,
                   settle_tol: float = 0.03) -> None:
@@ -572,12 +584,28 @@ class TrajectoryController:
     # Suction / IO  —  SINGLE BLOCKER SEAM
     # ------------------------------------------------------------------
     def suction_on(self) -> None:
+        """Enqueue suction ON (non-blocking); the IO worker does the TCP write off the servo loop (#2)."""
         self.last_suction_on_t = time.time()
-        self._call_io(SUCTION_IO_ADDRESS, 0)
+        self._io_queue.put((SUCTION_IO_ADDRESS, 0))
 
     def suction_off(self) -> None:
+        """Enqueue suction OFF (non-blocking); the IO worker does the TCP write off the servo loop (#2)."""
         self.last_suction_off_t = time.time()
-        self._call_io(SUCTION_IO_ADDRESS, 1)
+        self._io_queue.put((SUCTION_IO_ADDRESS, 1))
+
+    def _io_worker(self) -> None:
+        """Daemon: drain the IO queue and perform the blocking Simple Message TCP writes, so the
+        250 Hz stream/servo loop is NEVER blocked by a suction round-trip (review finding #2).
+        FIFO order preserves off-before-prime. An IO error is logged, never kills the worker."""
+        while True:
+            item = self._io_queue.get()
+            if item is None:
+                break
+            addr, val = item
+            try:
+                self._call_io(addr, val)
+            except Exception as e:
+                self._node.get_logger().error(f"[IO] worker write addr={addr} val={val} error: {e}")
 
     def _call_io(self, address: int, value: int) -> None:
         """Write a single IO bit via the controller's Simple Message IoServer (TCP 50242).
