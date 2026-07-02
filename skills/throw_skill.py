@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import csv
 import datetime
-import os
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -332,21 +330,8 @@ class ThrowSkill(ManipulationSkill):
         T_grasp1: np.ndarray,
         T_aim2: np.ndarray,
     ):
-        """IK for all three keyframes; zero last joint. Returns None on IK fail."""
-        ctx = self.ctx
-        aim_joint1 = ctx.robot.inverse_kinematics(T_aim1)
-        grasp_joint1 = ctx.robot.inverse_kinematics(T_grasp1)
-        aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
-        if aim_joint1 is None or grasp_joint1 is None or aim_joint2 is None:
-            ctx.log.warn("IK failed after target lock; aborting")
-            return None
-        aim_joint1 = np.asarray(aim_joint1, dtype=float)
-        grasp_joint1 = np.asarray(grasp_joint1, dtype=float)
-        aim_joint2 = np.asarray(aim_joint2, dtype=float)
-        aim_joint1[-1] = 0.0
-        grasp_joint1[-1] = 0.0
-        aim_joint2[-1] = 0.0
-        return aim_joint1, grasp_joint1, aim_joint2
+        """IK for the aim/grasp/aim2 keyframes; wrist (joint 6) zeroed. None on IK fail."""
+        return self._ik_keyframes((T_aim1, T_grasp1, T_aim2), wrist=0.0)
 
     # ------------------------------------------------------------------
     # Throw trajectory build + dispatch
@@ -568,12 +553,4 @@ class ThrowSkill(ManipulationSkill):
             "n_steps": meta.get("n_steps", ""),
             "io_ms": round(lt["io_ms"], 1) if lt.get("io_ms") is not None else "",
         }
-        try:
-            new_file = not os.path.exists(path) or os.path.getsize(path) == 0
-            with open(path, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(row.keys()))
-                if new_file:
-                    w.writeheader()
-                w.writerow(row)
-        except OSError as e:
-            ctx.log.warn(f"pick-log write failed: {e}")
+        self._append_csv_row(path, row, ctx.log)

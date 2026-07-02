@@ -25,9 +25,7 @@ Shared primitives live on ``self.ctx`` (a ``SkillContext``):
 
 from __future__ import annotations
 
-import csv
 import datetime
-import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -519,27 +517,13 @@ class PushSkill(ManipulationSkill):
         T_grasp1: np.ndarray,
         T_aim2: np.ndarray,
     ):
-        """IK for aim, grasp, and push-target keyframes; zero last joint.
+        """IK for aim, grasp, and push-target keyframes; wrist (joint 6) faces the push
+        direction (forward == PUSH_JOINT6_ANGLE).
 
-        Returns ``(aim_joint, grasp_joint, push_target_joint)`` or ``None``
-        on any IK failure.
+        Returns ``(aim_joint, grasp_joint, push_target_joint)`` or ``None`` on IK failure.
         """
-        ctx = self.ctx
-        aim_joint1 = ctx.robot.inverse_kinematics(T_aim1)
-        grasp_joint1 = ctx.robot.inverse_kinematics(T_grasp1)
-        aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
-        if aim_joint1 is None or grasp_joint1 is None or aim_joint2 is None:
-            ctx.log.warn("Push IK failed for keyframes; aborting")
-            return None
-        aim_joint1 = np.asarray(aim_joint1, dtype=float)
-        grasp_joint1 = np.asarray(grasp_joint1, dtype=float)
-        aim_joint2 = np.asarray(aim_joint2, dtype=float)
-        # Face the TCP along the push direction (forward == PUSH_JOINT6_ANGLE).
         j6 = self._facing_joint6(self._compute_push_direction(T_grasp1, T_aim2))
-        aim_joint1[-1] = j6
-        grasp_joint1[-1] = j6
-        aim_joint2[-1] = j6
-        return aim_joint1, grasp_joint1, aim_joint2
+        return self._ik_keyframes((T_aim1, T_grasp1, T_aim2), wrist=j6)
 
     # ------------------------------------------------------------------
     # Push trajectory build + dispatch
@@ -1108,12 +1092,4 @@ class PushSkill(ManipulationSkill):
             "chained": meta.get("chained_to_next", ""),
             "io_ms": round(lt["io_ms"], 1) if lt.get("io_ms") is not None else "",
         }
-        try:
-            new_file = not os.path.exists(path) or os.path.getsize(path) == 0
-            with open(path, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(row.keys()))
-                if new_file:
-                    w.writeheader()
-                w.writerow(row)
-        except OSError as e:
-            ctx.log.warn(f"push-log write failed: {e}")
+        self._append_csv_row(path, row, ctx.log)

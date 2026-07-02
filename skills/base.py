@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import csv
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import numpy as np
+import numpy as np
 
+if TYPE_CHECKING:
     from gp8_control.skills.context import SkillContext, PickRequest
     from gp8_control.tracking import TrackedObject
 
@@ -100,6 +102,43 @@ class ManipulationSkill(ABC):
         active, timed sweep with no forgiveness, so it needs the honest timeline.
         """
         return move_time * self.ctx.cfg.PICK_FEASIBILITY_FACTOR
+
+    # ------------------------------------------------------------------
+    # Shared helpers (used by concrete skills)
+    # ------------------------------------------------------------------
+    def _ik_keyframes(self, transforms, wrist: float = 0.0):
+        """Solve IK for each keyframe ``transforms`` and set joint 6 (wrist) to
+        ``wrist``. Returns a tuple of joint arrays (one per transform), or ``None``
+        (after a warning) if any IK fails. Shared by ThrowSkill/PushSkill
+        ``solve_keyframe_joints`` — throw passes ``wrist=0``, push a push-facing angle."""
+        joints = []
+        for T in transforms:
+            q = self.ctx.robot.inverse_kinematics(T)
+            if q is None:
+                self.ctx.log.warn("IK failed for a keyframe; aborting")
+                return None
+            q = np.asarray(q, dtype=float)
+            q[-1] = wrist
+            joints.append(q)
+        return tuple(joints)
+
+    @staticmethod
+    def _append_csv_row(path: str, row: dict, logger=None) -> None:
+        """Append one dict ``row`` to the CSV at ``path`` (writing the header when the
+        file is new/empty). No-op if ``path`` is falsy. OSError is swallowed (logged
+        via ``logger`` if given). Shared by the skills' pick-cycle timing logs."""
+        if not path:
+            return
+        try:
+            new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+            with open(path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new_file:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as e:
+            if logger is not None:
+                logger.warn(f"csv-log write failed: {e}")
 
     @abstractmethod
     def execute(self, request: "PickRequest") -> "SkillResult":
