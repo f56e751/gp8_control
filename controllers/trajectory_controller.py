@@ -101,6 +101,14 @@ def _max_abs_diff(a, b) -> float:
     return max((abs(float(a[i]) - float(b[i])) for i in range(n)), default=0.0)
 
 
+def _traj_total(timestep) -> float:
+    """Total trajectory duration. ``timestep`` from trajectory() is CUMULATIVE time_from_start
+    (arange(L+1)/hertz), so the duration is the LAST value — NOT np.sum(timestep) (which is
+    ~T*(n+1)/2 and grossly inflates timeouts/deadlines). Review finding #3/#4."""
+    t = np.asarray(timestep, dtype=float).ravel()
+    return float(t[-1]) if t.size else 0.0
+
+
 class TrajectoryController:
     """Executes joint trajectories via the adv4ncr JTC action; suction I/O is a
     single seam (``_call_io``) that is currently a hard blocker (no adv4ncr IO service)."""
@@ -363,7 +371,7 @@ class TrajectoryController:
         if gh is None:
             return False
         result_fut = gh.get_result_async()
-        total = float(np.sum(timestep)) + 0.2
+        total = _traj_total(timestep) + 0.2
         fired = False
         deadline = time.time() + total
         while not result_fut.done() and time.time() < deadline:
@@ -383,7 +391,7 @@ class TrajectoryController:
         if gh is None:
             return False
         result_fut = gh.get_result_async()
-        timeout = float(np.sum(timestep)) + 0.1
+        timeout = _traj_total(timestep) + 0.1
         reached = self._wait_for_position(release_joint, tolerance=0.05, timeout_sec=timeout)
         self.suction_off()
         if not reached:
@@ -412,7 +420,9 @@ class TrajectoryController:
         arr = np.asarray(traj)
         rel = int(max(0, min(release_index, arr.shape[1] - 1)))
         release_pose = [float(x) for x in arr[:, rel]]
-        total = float(np.sum(timestep))
+        _times = np.asarray(timestep, dtype=float).ravel()
+        t_release = float(_times[rel]) if rel < _times.size else float(_times[-1])
+        total = _traj_total(timestep)
 
         state = {"fired": False, "primed_next": False}
         t_start = time.time()
@@ -428,8 +438,13 @@ class TrajectoryController:
         deadline = t_start + total + 0.3
 
         while not result_fut.done() and time.time() < deadline:
-            if (not state["fired"] and self.current_joints is not None
-                    and _max_abs_diff(self.current_joints, release_pose) <= 0.05):
+            # Release on EITHER reaching the release pose OR the release TIME elapsing (#B):
+            # a fast throw can sweep through the pose between 4 ms polls; the time backstop
+            # guarantees we don't miss it and carry the object to the next intercept.
+            if (not state["fired"]
+                    and (((self.current_joints is not None)
+                          and _max_abs_diff(self.current_joints, release_pose) <= 0.05)
+                         or (time.time() - t_start) >= t_release)):
                 t_io = time.time()
                 self.suction_off()
                 state["fired"] = True
@@ -441,7 +456,7 @@ class TrajectoryController:
                 self.suction_on()
                 state["primed_next"] = True
                 self._node.get_logger().info("Return-prime: suction_on for next pick.")
-            time.sleep(0.01)
+            time.sleep(0.004)
 
         if not state["fired"]:
             self.suction_off()   # fallback: never carry the object past the release
@@ -471,7 +486,7 @@ class TrajectoryController:
         if gh is None:
             return False
         result_fut = gh.get_result_async()
-        total = float(np.sum(timestep)) + 0.3
+        total = _traj_total(timestep) + 0.3
         deadline = time.time() + total
         fired = False
         while not result_fut.done() and time.time() < deadline:
@@ -500,7 +515,11 @@ class TrajectoryController:
     # Persistent-session shims (pq_*). JTC needs no queue keep-alive, so these
     # are thin: a segment is one JTC goal; a hold is a wall-clock wait.
     # ------------------------------------------------------------------
+    @property
     def pq_active(self) -> bool:
+        """True while a persistent session is open. **@property** (read as an attribute,
+        not called) — callers do `traj_ctrl.pq_active` without parens (app.py, throw_skill.py);
+        a plain method would evaluate truthy always and defeat the session-live guard (#A)."""
         return self._pq_active
 
     def pq_begin(self) -> None:
@@ -517,7 +536,7 @@ class TrajectoryController:
         if gh is None:
             return (False, [])
         result_fut = gh.get_result_async()
-        total = float(np.sum(ts)) + 0.3
+        total = _traj_total(ts) + 0.3
         deadline = time.time() + total
         while not result_fut.done() and time.time() < deadline:
             if between_fn is not None:
