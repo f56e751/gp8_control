@@ -106,6 +106,12 @@ class ThrowSkill(ManipulationSkill):
             start_lead=self.arrival_lead(),
         )
 
+        # DIAGNOSTIC: object vs intercept at the instant the lift/throw fires.
+        # delta < 0 -> the object already passed the grasp point and we suction
+        # empty belt / lift behind it (the multi-object symptom). See
+        # SkillContext.log_action_timing.
+        ctx.log_action_timing(target, T_grasp[1, 3], "throw-lift")
+
         # Lift + throw.
         ctx.set_status("THROWING", target.class_name)
 

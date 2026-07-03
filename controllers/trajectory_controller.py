@@ -120,6 +120,9 @@ class TrajectoryController:
 
         # Pick-cycle timing telemetry (kept for the skills' logs).
         self.last_suction_on_t: float | None = None
+        # Joint state snapshotted at the instant suction turned ON, so a skill can
+        # FK it to the EE pose the vacuum actually fired at (diagnostic).
+        self.last_suction_on_joints: list | None = None
         self.last_suction_off_t: float | None = None
         self.last_throw: dict | None = None
         self._last_throw_ok: bool = True   # #R3: last timed-release dispatch accepted? (pq_throw_segment ok)
@@ -634,6 +637,12 @@ class TrajectoryController:
     def suction_on(self) -> None:
         """Enqueue suction ON (non-blocking); the IO worker does the TCP write off the servo loop (#2)."""
         self.last_suction_on_t = time.time()
+        # Snapshot the joint state AT the fire instant (this may run inside the
+        # stream loop mid-move) so callers can FK the true EE pose the vacuum
+        # fired at. list() to freeze it against the joint_states callback.
+        self.last_suction_on_joints = (
+            list(self.current_joints) if self.current_joints is not None else None
+        )
         self._io_queue.put((SUCTION_IO_ADDRESS, 0))
 
     def suction_off(self) -> None:

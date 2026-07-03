@@ -125,6 +125,61 @@ class SkillContext:
         """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases)."""
         return target.T_grasp_base[1, 3] - v * (now - target.detect_time)
 
+    def log_action_timing(self, target: "TrackedObject", intercept_y: float, tag: str) -> None:
+        """DIAGNOSTIC: object position vs the intercept at the instant the action fires.
+
+        ``delta = obj_y - intercept_y``. The belt travels -Y, so ``delta > 0`` means the
+        object is still UPSTREAM of the intercept (approaching — good, we act as it
+        arrives); ``delta < 0`` means it has ALREADY PASSED the intercept and the action
+        lands BEHIND it — the multi-object "석션/push가 물체 지나간 자리에서 일어난다"
+        symptom. ``age`` is how long the object has been dead-reckoned since its last
+        detection (large for 2nd+ objects that coasted through the previous cycle).
+        Called by each skill right before it commits (throw lift / push stroke)."""
+        now = time.time()
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        obj_y = self.object_y_now(target, now, v)
+        delta = obj_y - intercept_y
+        state = "approaching(+)" if delta >= 0.0 else "PASSED-BEHIND(-)"
+        self.log.info(
+            f"[fire-timing] {tag} id={target.track_id} {target.class_name}: "
+            f"obj_y={obj_y:+.3f} intercept_y={intercept_y:+.3f} delta={delta:+.3f}m "
+            f"{state} age={now - target.detect_time:.2f}s belt={v:.3f}m/s"
+        )
+
+    def log_suction_on(self, target: "TrackedObject") -> None:
+        """DIAGNOSTIC: at the instant suction turned ON, log the object's CALCULATED
+        (belt-extrapolated) position vs the end-effector's ACTUAL position.
+
+        The object position is ``object_y_now`` evaluated at ``last_suction_on_t``
+        (the exact fire instant), with its lane X/Z; the EE position is the forward
+        kinematics of ``last_suction_on_joints`` (the joint state snapshotted the
+        moment the vacuum fired, possibly mid-move). ``dY = obj_y - ee_y`` is how far
+        along the belt the object is from the cup when suction fires: ``>0`` the
+        object is still upstream of the cup, ``<0`` it has already passed it."""
+        tc = self.traj_ctrl
+        t_son = getattr(tc, "last_suction_on_t", None)
+        q_son = getattr(tc, "last_suction_on_joints", None)
+        if t_son is None or q_son is None:
+            self.log.warn("[suction-on] no suction-on snapshot available (joints/time None)")
+            return
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        obj_x = float(target.T_grasp_base[0, 3])
+        obj_y = self.object_y_now(target, t_son, v)
+        obj_z = float(target.T_grasp_base[2, 3])
+        try:
+            T_ee = self.robot.forward_kinematics(np.asarray(q_son, dtype=float)[:6])
+            ee_x, ee_y, ee_z = float(T_ee[0, 3]), float(T_ee[1, 3]), float(T_ee[2, 3])
+        except Exception as e:  # noqa: BLE001 — diagnostic must never kill the cycle
+            self.log.warn(f"[suction-on] EE FK failed: {e}")
+            return
+        self.log.info(
+            f"[suction-on] id={getattr(target, 'track_id', '?')} "
+            f"obj=({obj_x:+.3f},{obj_y:+.3f},{obj_z:+.3f}) "
+            f"ee=({ee_x:+.3f},{ee_y:+.3f},{ee_z:+.3f}) "
+            f"dX={obj_x - ee_x:+.3f} dY={obj_y - ee_y:+.3f} dZ={obj_z - ee_z:+.3f} "
+            f"belt={v:.3f} age={t_son - target.detect_time:.2f}s"
+        )
+
     def earliest_reachable_intercept(
         self,
         target: "TrackedObject",
@@ -279,7 +334,12 @@ class SkillContext:
         # robot's consumption (see move_through) — a long via-routed positioning
         # has even more points, so this matters more here.
         traj, vel, ts = decimate_for_queue(traj, vel, ts)
+        # DIAGNOSTIC: wall-clock positioning duration (this call blocks for the
+        # whole move). Push's wait_for_arrival re-checks arrival AFTER this, so a
+        # long positioning here is what makes the stroke land behind the object.
+        _t_pos0 = time.time()
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+        self.log.info(f"[positioning] move_through_via {time.time() - _t_pos0:.2f}s")
 
     def sleep_until(self, deadline: float) -> None:
         """Block until ``deadline`` (wall clock), staying responsive to shutdown.
@@ -353,6 +413,16 @@ class SkillContext:
             f"Ambush: suction in {eta - lead:.2f}s, arrival/lift in {eta:.2f}s "
             f"(dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s, lead {lead:.2f}s)"
         )
+        # DIAGNOSTIC: the object is already at/below the intercept when the WAIT
+        # begins -> positioning (move_through_via) overran and the object reached
+        # the intercept before the arm was ready; the action will land BEHIND it.
+        if (obj_y - intercept_y) <= 0.0:
+            self.log.warn(
+                f"[late] id={getattr(target, 'track_id', '?')} object already "
+                f"at/below intercept at wait entry: obj_y={obj_y:+.3f} "
+                f"intercept_y={intercept_y:+.3f} dist={obj_y - intercept_y:+.3f}m "
+                f"age={now - target.detect_time:.2f}s — arm not ready in time"
+            )
         self.sleep_until(now + eta - offset)
 
     def position_and_prime(
@@ -364,49 +434,77 @@ class SkillContext:
         intercept_y: float,
         start_lead: "Optional[float]" = None,
     ) -> bool:
-        """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
+        """Drive to the grasp pose, then POSITION-PRIME suction: fire it only once
+        the cup is PARKED at the grasp, capped at SUCTION_LEAD before arrival.
 
         Always returns True (kept as bool for the caller's signature).
 
-        Unlike the old "position (blocking) THEN wait+suction" split (which fired
-        suction only after positioning finished, so a slow positioning ate into
-        the lead), the suction-on here is keyed to an ABSOLUTE wall-clock instant
-        ``t_suction = arrival - SUCTION_LEAD``. If that instant falls while the
-        arm is still positioning, suction fires mid-move (priming the vacuum
-        early is harmless). This guarantees the full SUCTION_LEAD regardless of
-        how long positioning takes, so a borderline pick keeps its lead. Returns
-        once the object has reached the intercept (caller then lifts/throws).
+        Restores the fix-throwing behaviour that the wall-clock timer regressed:
+        suction is keyed to the arm actually REACHING the grasp (cup down at the
+        object), never to a bare predicted-arrival clock. The vacuum fires at
+        ``max(cup-parked, arrival - SUCTION_LEAD)``:
+          * backed-up object (eta < SUCTION_LEAD): fires the instant the cup parks
+            at the grasp — as early as physically possible, but NEVER while the cup
+            is still descending mid-move (the old bug that fired with the cup high);
+          * object with slack (eta >= SUCTION_LEAD, e.g. the first pick): fires
+            SUCTION_LEAD before arrival, cup already parked.
+        The adv4ncr 250 Hz stream (<10 ms command->motion) makes "fire when parked"
+        land within a stream tick of the grasp. Returns once the object has reached
+        the intercept (caller then lifts/throws).
         """
         now = time.time()
         v = self.conveyor.current
         obj_y = self.object_y_now(target, now, v)
         eta = max(0.0, min((obj_y - intercept_y) / (v + 1e-6), self.cfg.AMBUSH_MAX_WAIT))
         t_arrival = now + eta
-        t_suction = t_arrival - self.cfg.SUCTION_LEAD     # absolute; may be <= now
         self.log.info(
-            f"Ambush: prime {self.cfg.SUCTION_LEAD:.2f}s before arrival, arrival/lift "
-            f"in {eta:.2f}s (dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s)"
+            f"Ambush: cap prime {self.cfg.SUCTION_LEAD:.2f}s before arrival, "
+            f"arrival/lift in {eta:.2f}s (dist {obj_y - intercept_y:.3f} m / "
+            f"belt {v:.3f} m/s)"
         )
 
+        # 1) Drive to the grasp pose — NO suction during the move. send_trajectory_queue
+        #    blocks for the whole move (stream paces it in real time), so the cup is
+        #    parked AT the grasp when it returns.
         zero = np.zeros_like(self.M1)
         traj, vel, ts = trajectory(
             current_joint, zero, grasp_joint, zero,
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
-        # Fire suction the instant t_suction passes — mid-move when the object is
-        # already within SUCTION_LEAD by the time we get there.
-        fired = self.traj_ctrl.send_trajectory_queue_timed_suction(
-            traj, vel, ts, final_joint=grasp_joint, suction_on_at=t_suction,
-        )
-        if not fired:
-            # t_suction still ahead -> park until it, then prime.
-            self.sleep_until(t_suction)
-            self.traj_ctrl.suction_on()
+        _t_pos0 = time.time()
+        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+        _pos_dur = time.time() - _t_pos0
+        # DIAGNOSTIC: did positioning finish before the object reaches the intercept?
+        # If it exceeds eta, the object arrives before the cup parks and the pick
+        # lands behind it (the throughput-limited case).
+        if _pos_dur > eta:
+            self.log.warn(
+                f"[positioning-overrun] id={getattr(target, 'track_id', '?')} "
+                f"positioning {_pos_dur:.2f}s > eta {eta:.2f}s: object reaches "
+                f"intercept before the cup parks; action will land behind"
+            )
+        else:
+            self.log.info(
+                f"[positioning] {_pos_dur:.2f}s (eta {eta:.2f}s, "
+                f"margin {eta - _pos_dur:.2f}s)"
+            )
+
+        # 2) Cup is parked at the grasp. Prime at max(now, arrival - SUCTION_LEAD):
+        #    never before the cup is down (now = just parked), never more than
+        #    SUCTION_LEAD early. Backed-up object -> ~now; slack pick -> waits until
+        #    SUCTION_LEAD before arrival.
         self.set_status("WAITING", getattr(target, "class_name", ""))
-        # End the wait `start_lead` s before predicted arrival so the post-wait
-        # trajectory dispatch overlaps the object's final approach and the lift lands
-        # ON arrival instead of trailing it. start_lead defaults to the shared
-        # cfg.ACTION_START_LEAD; the skill passes its own arrival_lead().
+        t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
+        self.sleep_until(t_suction)
+        self.traj_ctrl.suction_on()
+        # DIAGNOSTIC: object's calculated position vs the EE's actual position at
+        # the instant suction fired (see log_suction_on).
+        self.log_suction_on(target)
+
+        # 3) End the wait `start_lead` s before predicted arrival so the post-wait
+        #    trajectory dispatch overlaps the object's final approach and the lift
+        #    lands ON arrival. start_lead defaults to cfg.ACTION_START_LEAD; the
+        #    skill passes its own arrival_lead().
         if start_lead is None:
             start_lead = self.cfg.ACTION_START_LEAD
         self.sleep_until(t_arrival - start_lead)

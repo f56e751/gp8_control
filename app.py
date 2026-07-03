@@ -390,11 +390,32 @@ class GP8App:
         self.queue.pop_head()
         # Keep the active target visible in belt_viz while we execute the cycle.
         self._active_target = target
+        # DIAGNOSTIC: where the object actually is NOW (obj_y) vs the entry-edge
+        # reach limit (y_b) and how long it has been dead-reckoned (age). A 2nd+
+        # object that coasted through the previous cycle shows obj_y already BELOW
+        # y_b (past the entry edge) with a large age and a small eta — i.e. it is
+        # engaged late. The intercept (y=) is where the arm will wait.
+        obj_y_sel = self.ctx.object_y_now(target, now, v)
+        x_sel = float(target.T_grasp_base[0, 3])
+        _denom = self.cfg.MAX_REACH ** 2 - x_sel ** 2
+        y_b_sel = float(np.sqrt(_denom)) if _denom > 0.0 else float("nan")
         self._node.get_logger().info(
             f"Ambush lock: id={target.track_id} {target.class_name} "
             f"(conf {target.conf:.2f}) @ x={target_it.T_grasp[0, 3]:+.3f} "
             f"y={target_it.intercept_y:+.3f} z={target_it.T_grasp[2, 3]:+.3f} "
-            f"(eta {target_it.eta:.2f}s, move {target_it.move_time:.2f}s)"
+            f"(eta {target_it.eta:.2f}s, move {target_it.move_time:.2f}s) "
+            f"obj_y={obj_y_sel:+.3f} y_b={y_b_sel:+.3f} "
+            f"age={now - target.detect_time:.2f}s"
+        )
+        # DIAGNOSTIC: full queue snapshot at lock (active target + everything still
+        # queued), so a GHOST track (a spurious [track-NEW] for an already-thrown
+        # object) or a mis-sorted head is obvious across a multi-object run.
+        _q_dump = ", ".join(
+            f"#{o.track_id}:{o.class_name}:y{self.ctx.object_y_now(o, now, v):+.2f}"
+            for o in list(self.queue._objects)
+        ) or "(empty)"
+        self._node.get_logger().info(
+            f"[queue] locked #{target.track_id}; remaining=[{_q_dump}]"
         )
         return PickRequest(
             target=target,
@@ -485,7 +506,32 @@ class GP8App:
         try:
             self._cam_latest = json.loads(msg.data)
         except (ValueError, TypeError):
-            pass
+            return
+        self._log_latency_correction(self._cam_latest)
+
+    def _log_latency_correction(self, snap: dict) -> None:
+        """Throttled INFO so the bringup console shows how much perception-latency
+        back-projection camera_debug is applying: the EMA-estimated camera FPS, the
+        frame-acquisition-age term it implies, and the total correction expressed as
+        the belt-Y distance the detection is advanced downstream. Lets you watch the
+        FPS-delay correction live under ``gp8_bringup.launch.py`` (the camera_debug
+        TUI only shows in its own terminal)."""
+        applied = snap.get("applied_delay_s")
+        if applied is None:
+            return  # camera_debug without the latency fields (not rebuilt) — nothing to log
+        v = float(snap.get("belt_mps", 0.0))
+        elapsed = float(snap.get("perception_delay_s", 0.0))
+        frame_age = float(snap.get("frame_age_s", 0.0))
+        extra = float(applied) - elapsed - frame_age            # residual transport term
+        est_fps = snap.get("est_fps")
+        fps_str = f"{est_fps:.1f}" if est_fps is not None else "…"
+        self._node.get_logger().info(
+            f"[latency-corr] est_fps={fps_str} applied={applied * 1000:.0f}ms "
+            f"(elapsed {elapsed * 1000:.0f} + frame_age {frame_age * 1000:.0f} "
+            f"+ extra {extra * 1000:.0f}) -> back-proj {applied * v * 100:+.1f} cm "
+            f"@ belt {v:.3f} m/s",
+            throttle_duration_sec=2.0,
+        )
 
     # ------------------------------------------------------------------
     # Main loop

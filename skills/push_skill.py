@@ -340,6 +340,12 @@ class PushSkill(ManipulationSkill):
             return self._abort("object passed stroke span; push aborted")
 
         # ---- 3. PUSHING: dispatch push traj ----
+        # DIAGNOSTIC: object vs intercept at the instant the stroke fires. delta < 0
+        # means the object already passed the grasp/contact point and the stroke
+        # lands behind it (and can sweep into the next object). The stale-stroke
+        # guard above aborts the worst case; this logs every non-aborted stroke so
+        # borderline "behind" hits are visible too. See log_action_timing.
+        ctx.log_action_timing(target, T_grasp[1, 3], "push-stroke")
         ctx.set_status("PUSHING", target.class_name)
 
         # Per-class stroke distance (falls back to PUSH_DISTANCE).

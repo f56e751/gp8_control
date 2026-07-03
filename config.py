@@ -77,9 +77,12 @@ class Config:
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
     GRASP_Z: float = 0.062
-    # SUCTION_LEAD = 1.0 (throw tuning) won the push/throw merge; push had 0.5.
-    # If push over-primes, split this per-skill instead of re-globalizing.
-    SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
+    # CAP on how early suction primes, now that priming is POSITION-triggered
+    # (position_and_prime fires at max(cup-parked, arrival - SUCTION_LEAD)). The cup
+    # is always parked at the grasp before suction fires; this only bounds how far
+    # ahead of arrival a SLACK pick (e.g. the first) primes. 0.5 s per request; a
+    # backed-up pick primes as soon as the cup parks regardless of this value.
+    SUCTION_LEAD: float = 0.5           # max seconds before arrival to prime suction [s]
     # SHARED base arrival-lead for every skill: end the WAITING block this many
     # seconds BEFORE the object's predicted arrival so the post-wait trajectory
     # dispatch overlaps the object's final approach and the action lands ON arrival
