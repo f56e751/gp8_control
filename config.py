@@ -132,10 +132,10 @@ class Config:
     # over-estimate the real move (~2x), so this trusts the real move is only
     # a fraction of the planned one; bump higher (toward 1.0) to be more
     # conservative (drop sooner) or lower to attempt more borderline catches.
-    # MERGE NOTE: the old push selection gate (factor + SUCTION_LEAD, tuned to
-    # 1.0) is replaced by throw's earliest_reachable_intercept; this factor now
-    # gates the throw chain (scan_next_intercept) + the intercept helper. Push
-    # selection now flows through the dynamic intercept too — validate on push.
+    # MERGE NOTE: the old push selection gate (factor + SUCTION_LEAD, tuned to 1.0)
+    # is replaced by earliest_reachable_intercept; this factor now gates the intercept
+    # feasibility for both skills (the throw return-chain that also used it was removed
+    # in Option C — uniform per-object flow). Validate on push.
     PICK_FEASIBILITY_FACTOR: float = 1.05
 
     # opt_time -> real positioning-time calibration for the SKILL TIMELINE model
