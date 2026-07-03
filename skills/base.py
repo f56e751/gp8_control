@@ -62,7 +62,7 @@ class ManipulationSkill(ABC):
         computed once at setup. Override to give a skill its own idle pose —
         mirrors :meth:`can_handle` (base default + per-skill override). Returns a
         TARGET, not a motion, so the return stays folded into the skill's single
-        chained trajectory (no extra dispatch / queue-mode re-entry).
+        chained trajectory (no extra dispatch).
         """
         return self.ctx.idle_joint
 

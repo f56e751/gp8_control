@@ -281,11 +281,11 @@ class GP8App:
         )
 
     def _enable_robot(self) -> None:
-        """Enable robot in Point Queue Mode (FJT의 INIT_TRAJ_INVALID_STARTING_POS 회피)."""
-        self._node.get_logger().info("Enabling robot (point queue mode)...")
+        """Ready the robot for motion (one-time; a no-op on the adv4ncr stream backend)."""
+        self._node.get_logger().info("Enabling robot for motion...")
         if not self.traj_ctrl.enter_queue_mode():
             raise RuntimeError(
-                "Failed to enter point queue mode. Check pendant is in REMOTE "
+                "Failed to ready the robot. Check pendant is in REMOTE "
                 "mode with no active alarm and cycle mode AUTO."
             )
         time.sleep(1.0)

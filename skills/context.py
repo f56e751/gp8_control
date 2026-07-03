@@ -44,8 +44,8 @@ class PickRequest:
     grasp_joint: np.ndarray
     secondary: "Optional[TrackedObject]" = None
     # True when this object IS the previous throw's committed return target — the
-    # swing already parked the arm at its grasp pose, so the pick must not re-enter
-    # queue mode (stop would chop the swing) or re-drive; just wait + grab.
+    # swing already streamed the arm to its grasp pose, so the pick must not re-drive
+    # (it is already there); just wait + grab.
     prepositioned: bool = False
 
 
@@ -115,7 +115,7 @@ class SkillContext:
     # in GP8App._build_skills from cfg.INITIAL_R/T (the boot pose). Skills reach it
     # via ManipulationSkill.idle_target() — see base.py. Returning a TARGET (not a
     # motion) keeps the return folded into each skill's single chained trajectory,
-    # so no extra dispatch / queue-mode re-entry (which would chop the swing).
+    # so no extra dispatch (which would chop the swing).
     idle_joint: np.ndarray
     # Set True by the prior throw's return (chain) when it already primed the
     # NEXT pick's suction (vacuum ON). The upcoming pick then must NOT re-prime
@@ -216,7 +216,7 @@ class SkillContext:
             # The contact budget is the skill's real timeline (t_to_contact_fn:
             # setup + positioning + contact offset) when supplied, else the legacy
             # opt_time*factor proxy. This is the placement+feasibility fix: the old
-            # proxy omitted queue-re-entry + push pre-travel, so the grasp was aimed
+            # proxy omitted the dispatch + push pre-travel, so the grasp was aimed
             # upstream of where the object actually was at strike.
             budget = (
                 t_to_contact_fn(move_time) if t_to_contact_fn is not None
