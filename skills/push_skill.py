@@ -118,12 +118,15 @@ PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 _MIN_QUEUE_GAP: float = 0.15
 
 FIXED_DELAY_PUSH = 0.8
-# Push-stroke depth below grasp height. A lower stroke (larger value) shrinks
-# the joint-5 margin to the wrist singularity, so it must be balanced against
-# the forward swing end (SWING_BIAS + SWING_ANGLE): at 0.06 the singularity is
-# still cleared as long as that forward end stays ≲ +5° (see SWING_BIAS).
+# ABSOLUTE base-frame Z (m) of the push stroke — assigned directly to the
+# grasp-retreat / stroke waypoints' [2,3] (the old relative ``-= HEIGHT_OFFSET`` is
+# disabled below). It MUST sit at ~belt surface (GRASP_Z = 0.062), NOT below it: the
+# prior 0.01 put the TCP ~5 cm UNDER the belt and drove the arm into it on the first
+# real metal push (alarm 4315 / STATE 101 CODE 112). Also balanced against the joint-5
+# wrist singularity — 0.06 clears it as long as the forward swing end stays ≲ +5°
+# (see SWING_BIAS). HW-calibrate against the measured belt height before fast runs.
 # HEIGHT_OFFSET = 0.05
-PUSH_HEIGHT = 0.01
+PUSH_HEIGHT = 0.06
 
 # Swing push *half-amplitude* (rad). During the stroke the TCP tilts
 # progressively about the horizontal axis perpendicular to the push direction,
