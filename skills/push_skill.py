@@ -26,6 +26,7 @@ Shared primitives live on ``self.ctx`` (a ``SkillContext``):
 from __future__ import annotations
 
 import datetime
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -117,7 +118,14 @@ PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 # ``_push_waypoints`` never falls behind the robot's execution clock.
 _MIN_QUEUE_GAP: float = 0.15
 
-FIXED_DELAY_PUSH = 0.8
+# Push arrival-lead (s): how far BEFORE the object's predicted arrival to end the WAITING
+# block, so positioning + the stroke's retreat->contact pre-travel land the stroke ON the
+# object (push has no suction to forgive an early/late hit). Was 0.8 on MotoROS2, which
+# INCLUDED the ~0.4 s point-queue re-entry per move. On the adv4ncr 250 Hz stream that
+# re-entry is GONE, so 0.8 fires the stroke ~0.4 s EARLY -> it misses ahead of the object.
+# Default dropped to 0.4; HW-tune via GP8_FIXED_DELAY_PUSH at low speed (RAISE if the stroke
+# trails the object, LOWER if it still leads).
+FIXED_DELAY_PUSH = float(os.environ.get("GP8_FIXED_DELAY_PUSH", "0.4"))
 # ABSOLUTE base-frame Z (m) of the push stroke — assigned directly to the
 # grasp-retreat / stroke waypoints' [2,3] (the old relative ``-= HEIGHT_OFFSET`` is
 # disabled below). It MUST sit at ~belt surface (GRASP_Z = 0.062), NOT below it: the
@@ -184,9 +192,9 @@ class PushSkill(ManipulationSkill):
         (feature/push, which timed correctly); the merge cut it to throw's 0.2 s and
         push started hitting behind the object. That 0.8 ALREADY includes the retreat
         pre-travel, so it is NOT composed on top of the base (no double-count).
-        (adv4ncr stream: the old ~0.4 s point-queue re-entry that 0.8 partly covered
-        is gone — HW-recalibrate FIXED_DELAY_PUSH.) If the hit still trails, bump
-        FIXED_DELAY_PUSH or move the scan off the contact path.
+        (adv4ncr stream: the old ~0.4 s point-queue re-entry that 0.8 covered is GONE,
+        so the default dropped to 0.4 — env-tune GP8_FIXED_DELAY_PUSH at low speed:
+        RAISE if the hit trails the object, LOWER if it still leads.)
         """
         return FIXED_DELAY_PUSH
 
