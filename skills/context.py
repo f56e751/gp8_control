@@ -381,12 +381,10 @@ class SkillContext:
         intercept_y: float,
         skip_move: bool = False,
         start_lead: "Optional[float]" = None,
-        persistent: bool = False,
     ) -> bool:
         """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
 
-        Returns True on success; False (persistent path only) if a queue push was
-        rejected / the queue drained during the wait, so the caller aborts cleanly.
+        Always returns True (kept as bool for the caller's signature).
 
         Unlike the old "position (blocking) THEN wait+suction" split (which fired
         suction only after positioning finished, so a slow positioning ate into
@@ -415,51 +413,6 @@ class SkillContext:
         )
 
         zero = np.zeros_like(self.M1)
-        if persistent:
-            # Stage-C persistent path: ONE queue session stays alive from the pick
-            # drive through the ambush hold so the throw needs NO re-entry.
-            # ``skip_move`` = a CROSS-CYCLE prepositioned reuse: the prior throw's
-            # chain already flew the arm to this grasp on the SAME live session, so
-            # there is no drive to push — go straight to the keep-alive hold (which
-            # continues the still-streaming chain into holds at grasp).
-            st = {"fired": already_primed}
-
-            def _prime() -> None:
-                if not st["fired"] and time.time() >= t_suction:
-                    self.traj_ctrl.suction_on()
-                    st["fired"] = True
-
-            if not skip_move:
-                traj, vel, ts = trajectory(
-                    current_joint, zero, grasp_joint, zero,
-                    self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
-                )
-                # is_last=True appends grasp_joint (final_joint) as the exact last
-                # point at rest. WITHOUT it the trajectory()'s discretized last point
-                # can land ~0.05 rad short of grasp (L=int(T*hz) truncation), and the
-                # following pq_hold_until(grasp) then trips its >0.02 rad jump-guard
-                # and refuses — the pick fails intermittently. The settle-at-grasp is
-                # also correct: the arm stops at grasp to wait for the object.
-                ok_drive, _ = self.traj_ctrl.pq_segment(
-                    traj, vel, ts, grasp_joint, is_last=True, between_fn=_prime)
-                if not ok_drive:
-                    self.log.error("[PQ] pick drive push rejected; aborting pick.")
-                    return False
-            self.set_status("WAITING", getattr(target, "class_name", ""))
-            if start_lead is None:
-                start_lead = self.cfg.ACTION_START_LEAD
-            # pq_hold_until returns False iff the queue drained during the wait
-            # (cross-cycle: iff the session died before this cycle resumed it).
-            ok_hold = self.traj_ctrl.pq_hold_until(
-                grasp_joint, t_arrival - start_lead, tick_fn=_prime)
-            # GUARANTEE the suction prime: on a reuse cycle (skip_move) the hold is
-            # the ONLY priming hook, and if the object is already within start_lead
-            # of arrival the hold loop never iterates -> _prime never fires -> empty
-            # gripper. Mirror the non-persistent skip_move path's unconditional prime.
-            if not st["fired"] and time.time() >= t_suction:
-                self.traj_ctrl.suction_on()
-                st["fired"] = True
-            return ok_hold
         if skip_move:
             # Arm already AT the grasp pose (the return swing parked it here) — no
             # drive, no mode switch. Just prime (if not already on) and wait, so
@@ -487,9 +440,9 @@ class SkillContext:
                     self.traj_ctrl.suction_on()
         self.set_status("WAITING", getattr(target, "class_name", ""))
         # End the wait `start_lead` s before predicted arrival so the post-wait
-        # queue-mode re-entry (~0.4 s) overlaps the object's final approach and the
-        # lift lands on arrival instead of trailing it. start_lead defaults to the
-        # shared cfg.ACTION_START_LEAD; the skill passes its own arrival_lead().
+        # trajectory dispatch overlaps the object's final approach and the lift lands
+        # ON arrival instead of trailing it. start_lead defaults to the shared
+        # cfg.ACTION_START_LEAD; the skill passes its own arrival_lead().
         if start_lead is None:
             start_lead = self.cfg.ACTION_START_LEAD
         self.sleep_until(t_arrival - start_lead)

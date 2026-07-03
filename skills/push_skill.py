@@ -281,11 +281,6 @@ class PushSkill(ManipulationSkill):
         aim_joint = aim_joint.copy()
         aim_joint[-1] = wait_joint[-1]
 
-        # Re-enter point queue mode each cycle (same as ThrowSkill).
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to (re)enter queue mode; skipping this pick")
-            return SkillResult(False, "enter_queue_mode (pick) failed")
-
         # ---- 1. POSITIONING: route current → aim hover → low push-start pose
         # (grasp_retreat) and park there. move_through_via PASSES THROUGH the
         # aim hover (vs move_through's direct cut), so the arm rises over before
@@ -333,11 +328,8 @@ class PushSkill(ManipulationSkill):
             )
             return self._abort("object passed stroke span; push aborted")
 
-        # ---- 3. PUSHING: re-enter queue mode and dispatch push traj ----
+        # ---- 3. PUSHING: dispatch push traj ----
         ctx.set_status("PUSHING", target.class_name)
-        if not ctx.traj_ctrl.enter_queue_mode():
-            ctx.log.error("Failed to (re)enter queue mode for push; dropping object")
-            return self._abort("enter_queue_mode (push) failed")
 
         # Per-class stroke distance (falls back to PUSH_DISTANCE).
         push_distance = PUSH_DISTANCE_MAP.get(target.class_name, PUSH_DISTANCE)

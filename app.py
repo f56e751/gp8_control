@@ -583,15 +583,6 @@ class GP8App:
         if not self.queue:
             self.frame_gate.reset()
             self._release_orphan_suction()
-            # Cross-cycle: a queue gap means the committed chain target vanished
-            # (belt advanced it past reach). Close the now-orphaned live session and
-            # drop the stale commitment so a later epoch re-enters fresh instead of
-            # resuming a drained session against an object that is no longer here.
-            if self.cfg.PERSISTENT_QUEUE_CROSS_CYCLE and self.traj_ctrl.pq_active:
-                self.traj_ctrl.pq_finish(wait=False)
-                if self.ctx is not None:
-                    self.ctx.committed_next = None
-                    self.ctx.committed_intercept = None
             time.sleep(self.cfg.TIME_STEP)
             return
 

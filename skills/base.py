@@ -122,22 +122,12 @@ class ManipulationSkill(ABC):
             joints.append(q)
         return tuple(joints)
 
-    def _abort(self, detail: str, *, close_session: bool = False,
-               drop_committed: bool = False) -> "SkillResult":
-        """Shared execute() failure cleanup: release suction; optionally settle+close a
-        persistent queue session (``close_session``) and drop a cross-cycle commitment
-        (``drop_committed``); clear the active target; go IDLE; return a failed
-        ``SkillResult(detail)``. The caller logs the specific error first. Consolidates the
-        repeated abort blocks in ThrowSkill/PushSkill.execute()."""
+    def _abort(self, detail: str) -> "SkillResult":
+        """Shared execute() failure cleanup: release suction, clear the active target,
+        go IDLE, and return a failed ``SkillResult(detail)``. The caller logs the
+        specific error first."""
         ctx = self.ctx
         ctx.traj_ctrl.suction_off()
-        if close_session:
-            # wait=True: settle the queued prefix so the arm is STOPPED before the next
-            # cycle's enter_queue_mode (a mode switch on a moving arm faults the controller).
-            ctx.traj_ctrl.pq_finish(wait=True)
-        if drop_committed:
-            ctx.committed_next = None
-            ctx.committed_intercept = None
         ctx.set_active_target(None)
         ctx.set_status("IDLE", "")
         return SkillResult(False, detail)

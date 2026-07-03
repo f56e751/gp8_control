@@ -80,17 +80,17 @@ class Config:
     # If push over-primes, split this per-skill instead of re-globalizing.
     SUCTION_LEAD: float = 1.0           # fire suction this many seconds before arrival [s]
     # SHARED base arrival-lead for every skill: end the WAITING block this many
-    # seconds BEFORE the object's predicted arrival so the post-wait queue-mode
-    # re-entry (~0.4 s) + trajectory dispatch overlap the object's final approach
-    # and the action lands ON arrival instead of trailing it. This covers ONLY the
-    # queue-reentry/dispatch budget common to all skills; a skill that needs MORE
-    # lead (e.g. push must also cover its stroke's retreat->contact pre-travel)
-    # adds its own extra by overriding ManipulationSkill.arrival_lead() — see
-    # base.py. 0 = wait for full predicted arrival (old behavior). Default 0.2
-    # tuned on hardware; the limit is the object's actual arrival (too large ->
-    # act before the object is there). env-overridable for re-tuning w/o a rebuild.
+    # seconds BEFORE the object's predicted arrival so the post-wait trajectory
+    # dispatch overlaps the object's final approach and the action lands ON arrival
+    # instead of trailing it. On the adv4ncr 250Hz stream driver the old ~0.4 s
+    # point-queue re-entry is GONE, so this now only covers the ~10-20 ms command->
+    # motion dispatch (HW-measured ~10 ms). A skill needing MORE lead (e.g. push must
+    # also cover its stroke's retreat->contact pre-travel) adds its own by overriding
+    # ManipulationSkill.arrival_lead() — see base.py. 0 = wait for full predicted
+    # arrival. Default 0.02 for the stream dispatch; HW-calibrate + env-override
+    # (GP8_ACTION_START_LEAD) if the lift trails/leads arrival.
     ACTION_START_LEAD: float = field(    # [s] — env GP8_ACTION_START_LEAD
-        default_factory=lambda: float(os.environ.get("GP8_ACTION_START_LEAD", "0.2"))
+        default_factory=lambda: float(os.environ.get("GP8_ACTION_START_LEAD", "0.02"))
     )
     # Fire throw-release suction_off this early to cover the WriteSingleIO
     # service round-trip + pneumatic vent lag (object releases after the
@@ -147,27 +147,6 @@ class Config:
     # re-tuning without a rebuild. See PushSkill.t_to_contact / base.py.
     OPT_TIME_TO_REAL: float = field(    # env GP8_OPT_TIME_TO_REAL
         default_factory=lambda: float(os.environ.get("GP8_OPT_TIME_TO_REAL", "1.0"))
-    )
-
-    # Persistent-queue path (Stage C): stream pick + ambush-hold + throw through
-    # ONE queue session so the throw needs NO queue-mode re-entry (~0.41s saved
-    # per cycle). Default OFF — the current per-segment path is unchanged. When
-    # ON, ThrowSkill uses the pq_* session + a POSITION-based throw release; the
-    # first HW run must verify release timing. Only applies to non-prepositioned
-    # picks for now. env GP8_PERSISTENT_QUEUE=1.
-    PERSISTENT_QUEUE: bool = field(
-        default_factory=lambda: os.environ.get("GP8_PERSISTENT_QUEUE", "0")
-        not in ("0", "", "false", "False", "no")
-    )
-    # Cross-cycle: keep ONE queue session alive ACROSS cycles too — when a throw
-    # commits the next object (chain to next grasp), don't pq_finish; the next
-    # prepositioned cycle RESUMES the live session (skip enter_queue_mode + pq_begin),
-    # removing the per-cycle PICK re-entry (~0.4s) as well. Layered on top of
-    # PERSISTENT_QUEUE (needs it ON). Default OFF; committed back-to-back only, else
-    # falls back to the per-cycle path. env GP8_PERSISTENT_QUEUE_CROSS_CYCLE=1.
-    PERSISTENT_QUEUE_CROSS_CYCLE: bool = field(
-        default_factory=lambda: os.environ.get("GP8_PERSISTENT_QUEUE_CROSS_CYCLE", "0")
-        not in ("0", "", "false", "False", "no")
     )
 
     # Throw NN post-processing (main_sam7)
