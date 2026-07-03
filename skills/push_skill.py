@@ -346,12 +346,15 @@ class PushSkill(ManipulationSkill):
         push_distance = PUSH_DISTANCE_MAP.get(target.class_name, PUSH_DISTANCE)
 
         # Build & dispatch: STROKE ONLY (append_descent=False) — the arm already
-        # descended to grasp_retreat during POSITIONING and waited there. Append a
-        # chain to a safe lifted-standby / idle park (uniform flow: the next pick is
-        # selected + driven fresh next epoch, no cross-object pre-position) so the arm
-        # parks HIGH instead of low at push_end.
+        # descended to grasp_retreat during POSITIONING and waited there. Chain the
+        # follow-through toward the NEXT object's grasp (best-effort overlap; pre_delay =
+        # the stroke duration the arm is busy first), else a lifted-standby park. Symmetric
+        # + stateless: the next epoch selects + drives fresh from this closer pose.
+        push_time = push_distance / max(PUSH_SPEED, 1e-6)
+        next_grasp = ctx.next_chain_target(grasp_retreat_joint, push_time)
         self.build_push_trajectory(
             grasp_retreat_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
+            next_grasp=next_grasp,
             append_chain=True,
             append_descent=False, push_distance=push_distance,
         )
@@ -486,6 +489,7 @@ class PushSkill(ManipulationSkill):
         T_grasp: np.ndarray,
         T_aim2: np.ndarray,
         theta: float,
+        next_grasp: "Optional[np.ndarray]" = None,
         append_chain: bool = True,
         append_descent: bool = True,
         push_distance: float = PUSH_DISTANCE,
@@ -615,7 +619,13 @@ class PushSkill(ManipulationSkill):
             # standby — push_end raised to home Z, so the arm clears the belt without
             # the wasted home round-trip. copy() so ctx.idle_joint is never mutated
             # by the wrist write below.
-            if not ctx.queue:
+            if next_grasp is not None:
+                # Park OVER the next grasp (raised to home Z), NOT at belt height — a
+                # belt-height chain from push_end (bin side) would sweep the TCP low
+                # across the belt (alarm 4315 / grazing objects). Raise Z; descend next epoch.
+                chain_target = ctx.lifted_standby_joint(next_grasp)
+                chain_dest = "over next grasp"
+            elif not ctx.queue:
                 chain_target = self.idle_target().copy()
                 chain_dest = "home/idle (queue empty)"
             else:

@@ -140,10 +140,12 @@ class ThrowSkill(ManipulationSkill):
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
         params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
-        # Throw, then chain the follow-through to a safe lifted-standby / idle park.
-        # (Uniform flow: the next pick is selected + driven fresh next epoch — no
-        # cross-object pre-position, so throw<->push handoffs stay symmetric.)
-        self.build_throw_trajectory(grasp_joint, aim_joint2, params)
+        # Chain the follow-through toward the NEXT object's grasp (best-effort) so the arm
+        # OVERLAPS the next approach with this throw instead of parking far and re-driving
+        # serially. Symmetric + stateless: the next epoch still SELECTS + DRIVES fresh from
+        # this closer pose (no commit/preposition). None -> lifted-standby park.
+        next_grasp = ctx.next_chain_target(grasp_joint, float(params.T))
+        self.build_throw_trajectory(grasp_joint, aim_joint2, params, next_grasp=next_grasp)
         ctx.traj_ctrl.suction_off()   # release the object after the throw
         self._log_throw_cycle(target)
         ctx.set_active_target(None)
@@ -197,6 +199,7 @@ class ThrowSkill(ManipulationSkill):
         grasp_joint: np.ndarray,
         aim_joint2: np.ndarray,
         params,
+        next_grasp: "Optional[np.ndarray]" = None,
     ) -> None:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
@@ -275,7 +278,14 @@ class ThrowSkill(ManipulationSkill):
         ts_pre = ts_ext
         start_q5 = traj_ext[-1]                     # aim_joint2 at rest
         start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
-        if not ctx.queue:
+        if next_grasp is not None:
+            # Park OVER the next grasp (its XY raised to home Z), NOT at belt height. A
+            # belt-height chain endpoint would leave the arm low, and the next epoch's
+            # drive to a different-lane grasp would sweep the TCP low across the belt
+            # (floor-dip / grazing). lifted_standby_joint keeps the XY, raises Z, wrist=0.
+            chain_target = ctx.lifted_standby_joint(next_grasp)
+            chain_dest = "over next grasp"
+        elif not ctx.queue:
             chain_target = self.idle_target().copy()
             chain_dest = "home/idle (queue empty)"
         else:

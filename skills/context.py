@@ -432,3 +432,31 @@ class SkillContext:
         q = np.asarray(q, dtype=float)
         q[-1] = 0.0
         return q
+
+    def next_chain_target(self, from_joint: np.ndarray, action_time: float):
+        """Grasp joints of the next object the arm should head toward AFTER the current
+        action, so the follow-through chain OVERLAPS the next approach (recovers the
+        throughput the plain-standby park lost). Reuses ``earliest_reachable_intercept``
+        with ``pre_delay=action_time`` (the arm frees up only after this action) — its
+        fixed-point loop resolves the move-time <-> object-position circularity. Returns
+        the first feasible object's grasp joints (wrist=0), or ``None`` (no next / none
+        catchable) so the caller parks at lifted_standby. Works for ANY next skill
+        (symmetric). NO commitment: the next epoch still SELECTS + DRIVES fresh from this
+        closer pose, so the handoff stays stateless (no committed/prepositioned/skip_move)."""
+        now = time.time()
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        # No queue.update() here — earliest_reachable_intercept computes each object's
+        # position from object_y_now itself, and mutating the queue mid-chain (pruning)
+        # is a side effect the next epoch's own update should own.
+        for cand in list(self.queue._objects):
+            it = self.earliest_reachable_intercept(
+                cand, from_joint, v, now, pre_delay=action_time,
+                t_to_contact_fn=self.skill_obj_for(cand).t_to_contact,
+            )
+            if it is not None:
+                self.log.info(
+                    f"Chain toward next: id={cand.track_id} {cand.class_name} @ "
+                    f"y={it.intercept_y:+.3f} (arrival {it.eta:.2f}s, pre_delay {action_time:.2f}s)"
+                )
+                return it.grasp_joint
+        return None
