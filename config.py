@@ -83,6 +83,18 @@ class Config:
     # ahead of arrival a SLACK pick (e.g. the first) primes. 0.5 s per request; a
     # backed-up pick primes as soon as the cup parks regardless of this value.
     SUCTION_LEAD: float = 0.5           # max seconds before arrival to prime suction [s]
+    # GUARANTEED parked vacuum-forming hold: the throw pick's t_to_contact adds this
+    # to the positioning budget, so earliest_reachable_intercept places the grasp far
+    # enough DOWNSTREAM that the arm reaches it >= this many seconds before the object
+    # arrives — the vacuum then seals during that parked wait (which was ~0 for
+    # backed-up 2nd+ objects, the miss cause). An object that can't be caught that far
+    # downstream (obj_y_arrival < -y_b) is DROPPED rather than grabbed with no hold.
+    # Keep <= SUCTION_LEAD - ACTION_START_LEAD so suction actually fires at park (else
+    # the SUCTION_LEAD cap fires it later). Env GP8_MIN_SUCTION_HOLD / launch
+    # min_suction_hold:=. 0 = old behaviour (grab at earliest reachable, no hold).
+    MIN_SUCTION_HOLD: float = field(    # [s] — env GP8_MIN_SUCTION_HOLD
+        default_factory=lambda: float(os.environ.get("GP8_MIN_SUCTION_HOLD", "0.3"))
+    )
     # SHARED base arrival-lead for every skill: end the WAITING block this many
     # seconds BEFORE the object's predicted arrival so the post-wait trajectory
     # dispatch overlaps the object's final approach and the action lands ON arrival
@@ -102,7 +114,11 @@ class Config:
     # Positive = release earlier; NEGATIVE = release LATER. lead_steps =
     # round(RELEASE_LEAD * TRAJ_HZ), release_idx = eta_idx - lead_steps, so
     # -0.1 @ 20 Hz shifts release +2 waypoints (~0.1 s of trajectory time later).
-    RELEASE_LEAD: float = -0.1          # [s]  (negative -> release ~0.1 s later)
+    # Env-overridable (GP8_RELEASE_LEAD) so it can be tuned without a rebuild;
+    # the bringup launch exposes it as `release_lead:=<value>`.
+    RELEASE_LEAD: float = field(        # [s]  env GP8_RELEASE_LEAD / launch release_lead:=
+        default_factory=lambda: float(os.environ.get("GP8_RELEASE_LEAD", "-0.1"))
+    )
 
     # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
     PICK_LOG_CSV: str = field(

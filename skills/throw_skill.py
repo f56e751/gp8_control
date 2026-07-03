@@ -74,6 +74,20 @@ class ThrowSkill(ManipulationSkill):
         super().__init__(ctx)
         self._last_throw_meta: dict = {}
 
+    def t_to_contact(self, move_time: float) -> float:
+        """Throw pick budget = positioning estimate + a GUARANTEED parked
+        vacuum-forming hold (``cfg.MIN_SUCTION_HOLD``).
+
+        Adding the hold to the base ``move_time * PICK_FEASIBILITY_FACTOR`` makes
+        ``earliest_reachable_intercept`` place the grasp far enough DOWNSTREAM that
+        the arm reaches it ~``MIN_SUCTION_HOLD`` before the object arrives, so the
+        vacuum seals during the parked wait instead of firing with ~0 lead (the
+        backed-up 2nd+ object miss). An object that can't be caught that far
+        downstream is dropped by the same solver rather than grabbed with no hold.
+        """
+        base = move_time * self.ctx.cfg.PICK_FEASIBILITY_FACTOR
+        return base + self.ctx.cfg.MIN_SUCTION_HOLD
+
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
     # ------------------------------------------------------------------

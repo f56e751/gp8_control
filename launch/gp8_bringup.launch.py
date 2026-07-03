@@ -41,7 +41,11 @@ from launch.actions import (
     SetEnvironmentVariable,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (
+    EnvironmentVariable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+)
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -107,6 +111,26 @@ def generate_launch_description():
         "axis_acceleration_factor", default_value="0.02",
         description="Per-cycle acceleration factor [0..1]. 0.02 = hardware-validated max "
                     "(sync-fix holds); throw needs only ~0.005, so this is ample headroom.",
+    )
+    # Throw suction-RELEASE timing (config.py RELEASE_LEAD). Shifts the suction_off
+    # waypoint vs the NN release point: POSITIVE = release EARLIER, NEGATIVE = LATER
+    # (covers WriteSingleIO + vent lag). At TRAJ_HZ=20, ±0.1 s = ±2 waypoints. Pass
+    # `release_lead:=-0.05` to tune WITHOUT a rebuild; when the arg is omitted a
+    # shell-set GP8_RELEASE_LEAD is honored, else -0.1.
+    release_lead_arg = DeclareLaunchArgument(
+        "release_lead",
+        default_value=EnvironmentVariable("GP8_RELEASE_LEAD", default_value="-0.1"),
+        description="Throw suction-release lead [s]: +earlier / -later (RELEASE_LEAD).",
+    )
+    # Guaranteed parked vacuum-forming hold before the throw lift (config.py
+    # MIN_SUCTION_HOLD). Places the grasp far enough downstream that the arm parks
+    # >= this many seconds before the object arrives; objects that can't be caught
+    # that far downstream are dropped. Pass `min_suction_hold:=0.3` to tune without a
+    # rebuild; omitted -> shell GP8_MIN_SUCTION_HOLD, else 0.3.
+    min_suction_hold_arg = DeclareLaunchArgument(
+        "min_suction_hold",
+        default_value=EnvironmentVariable("GP8_MIN_SUCTION_HOLD", default_value="0.3"),
+        description="Guaranteed parked suction hold before throw lift [s] (MIN_SUCTION_HOLD).",
     )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
@@ -258,6 +282,11 @@ def generate_launch_description():
         output="screen",
         additional_env={
             **app_env,
+            # Throw suction-release lead: `release_lead:=` launch arg (falling back
+            # to shell GP8_RELEASE_LEAD, then -0.1) -> GP8_RELEASE_LEAD for Config.
+            "GP8_RELEASE_LEAD": LaunchConfiguration("release_lead"),
+            # Guaranteed parked suction hold: `min_suction_hold:=` -> GP8_MIN_SUCTION_HOLD.
+            "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
         },
     )
 
@@ -269,6 +298,8 @@ def generate_launch_description():
         robot_ip_arg,
         inc_factor_arg,
         acc_factor_arg,
+        release_lead_arg,
+        min_suction_hold_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,
