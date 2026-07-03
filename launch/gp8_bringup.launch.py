@@ -42,6 +42,7 @@ from launch.actions import (
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -129,6 +130,26 @@ def generate_launch_description():
             "axis_increment_factor": LaunchConfiguration("axis_increment_factor"),
             "axis_acceleration_factor": LaunchConfiguration("axis_acceleration_factor"),
         }.items(),
+    )
+
+    # =====================================================================
+    # 2b. joint_trajectory_controller spawned INACTIVE.
+    #    The app's TrajectoryController.wait_for_servers() waits for the JTC
+    #    FollowJointTrajectory action server even in the default "stream"
+    #    backend (which actually drives via the ACTIVE JointGroupPositionController
+    #    at 250 Hz). A configured-but-inactive JTC creates its action server
+    #    (on_configure) so wait_for_servers passes, WITHOUT claiming the position
+    #    command interface — so it never conflicts with the active JGPC. It stays
+    #    inactive because the stream backend never sends it a goal.
+    #    (For GP8_ADV4NCR_BACKEND=jtc, activate it instead of JGPC — they can't
+    #    both be active.)
+    # =====================================================================
+    jtc_spawner_inactive = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["joint_trajectory_controller", "--inactive",
+                   "--controller-manager", "/controller_manager"],
+        output="screen",
     )
 
     # =====================================================================
@@ -243,6 +264,7 @@ def generate_launch_description():
         inc_factor_arg,
         acc_factor_arg,
         adv4ncr_stack,
+        jtc_spawner_inactive,
         moveit_launch,
         gp8_app,
     ])
