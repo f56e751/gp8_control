@@ -11,9 +11,16 @@ about object lifecycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import itertools
+from dataclasses import dataclass, field
 
 import numpy as np
+
+
+# Monotonic per-process track-id source. Diagnostic: lets logs follow one
+# physical object across dedup re-anchors, and exposes duplicate/ghost tracks
+# (a NEW id appearing for an object that should have re-matched an existing one).
+_track_id_counter = itertools.count(1)
 
 
 @dataclass
@@ -25,15 +32,45 @@ class TrackedObject:
     # Raw camera-frame position [cx, cy, cz] (m) reported by the perception
     # stream, kept verbatim for belt_viz / diagnostics. None on legacy paths.
     cam_pos: tuple | None = None
+    # Latest detection confidence (camera_debug "confidence"); -1.0 until set.
+    # Updated on every dedup re-anchor so it reflects the most recent sighting.
+    conf: float = -1.0
+    # Stable id assigned at creation and KEPT across re-anchors, so logs can
+    # follow this track and spot duplicates. Diagnostic only (not used for logic).
+    track_id: int = field(default_factory=lambda: next(_track_id_counter))
+    # Confidence-weighted class-vote tally {class_name: cumulative_weight}. The
+    # class is NOT latched at spawn — the first frame is often the noisy entry-edge
+    # frame, so a PET whose spawn misfired as "metal" would otherwise be routed to
+    # push forever. Every detection adds its confidence here (see vote_class) and
+    # the EFFECTIVE class_name is the running argmax.
+    class_votes: dict = field(default_factory=dict)
+
+    def vote_class(self, cls: str, conf: float) -> str:
+        """Add a confidence-weighted vote for ``cls``; return the winning class.
+
+        Weight = max(conf, 0) + a tiny floor (so a missing/zero-confidence frame
+        still counts once). Cumulative over the track's life, so a low-confidence
+        spawn misclassification is quickly overridden by consistent higher-
+        confidence detections, while a genuinely-confident class isn't flipped by a
+        couple of stray frames. Does NOT mutate class_name — the caller adopts the
+        returned winner (so it can log a flip).
+        """
+        self.class_votes[cls] = (
+            self.class_votes.get(cls, 0.0) + max(float(conf), 0.0) + 1e-3
+        )
+        return max(self.class_votes, key=self.class_votes.get)
 
 
 class TrackedObjectQueue:
     def __init__(self, max_reach: float, drop_below_y: float = 0.0) -> None:
         self._max_reach = max_reach
-        # Objects whose current y has fallen below this line are considered
-        # past the pick point and dropped from the queue (so the head is
-        # always "next-front not yet past the robot"). Default 0.0 matches
-        # the ambush intercept_y.
+        # COARSE drop line: objects whose current y has fallen below this are
+        # past the workspace and removed (keeps the head meaningful). Callers pass
+        # the worst-case downstream reach edge (-max_reach); the PRECISE per-object
+        # "still catchable?" test (lane-specific -y_b, plus arm timing) lives in
+        # SkillContext.earliest_reachable_intercept, NOT here — so this must stay
+        # coarse and must NOT be the old fixed intercept line, or it would drop
+        # downstream-but-still-reachable objects.
         self._drop_below_y = drop_below_y
         self._objects: list[TrackedObject] = []
 

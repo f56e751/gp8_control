@@ -12,6 +12,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
+from gp8_control.controllers.trajectory_controller import _wait_future
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     Constraints,
@@ -72,7 +73,7 @@ class MoveItController:
 
         # Send goal
         future = self._move_group_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self._node, future)
+        _wait_future(future)
 
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -81,7 +82,7 @@ class MoveItController:
 
         if wait:
             result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self._node, result_future)
+            _wait_future(result_future)
             result = result_future.result().result
             if result.error_code.val == result.error_code.SUCCESS:
                 self._node.get_logger().info("MoveIt planning + execution succeeded.")

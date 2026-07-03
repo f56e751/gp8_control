@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, Callable, Optional
 import numpy as np
 import rclpy
 
-from gp8_control.trajectory.trajectory_primitive import trajectory
+from gp8_control.trajectory.trajectory_primitive import (
+    trajectory,
+    trajectory_3points,
+    decimate_for_queue,
+    opt_time,
+)
 
 if TYPE_CHECKING:
     from rclpy.node import Node
@@ -17,8 +22,9 @@ if TYPE_CHECKING:
     from gp8_control.robots.gp8 import GP8
     from gp8_control.controllers.trajectory_controller import TrajectoryController
     from gp8_control.planning import PickThrowPlanner
-    from gp8_control.perception.conveyor_speed import ConveyorSpeedTracker
+    from gp8_control.conveyor import ConveyorSpeedTracker
     from gp8_control.tracking import TrackedObject, TrackedObjectQueue
+    from gp8_control.skills.base import ManipulationSkill
 
 
 @dataclass
@@ -37,6 +43,33 @@ class PickRequest:
     aim_joint: np.ndarray
     grasp_joint: np.ndarray
     secondary: "Optional[TrackedObject]" = None
+
+
+# Fixed-point convergence for earliest_reachable_intercept (intercept-Y <-> move-time
+# depend on each other because the object keeps moving while the arm moves). The loop
+# is cheap (closed-form IK + arithmetic), so we converge tightly.
+_INTERCEPT_TOL = 1e-4          # m
+_INTERCEPT_RELAX = 0.5         # under-relaxation for stability (plan_pick-style)
+_INTERCEPT_MAX_ITERS = 30      # generous cap; a 1-D contraction converges in a few
+
+
+@dataclass
+class Intercept:
+    """Earliest reachable intercept for one object: where + how to grab it.
+
+    ``intercept_y`` is the dynamic belt-frame Y to grab at (NOT the old fixed
+    ``GRASP_INTERCEPT_Y`` line); ``eta`` is the time from now until the object
+    reaches that Y; ``move_time`` is the arm's estimated travel to the grasp pose.
+    Produced by :meth:`SkillContext.earliest_reachable_intercept`.
+    """
+
+    intercept_y: float
+    T_aim: np.ndarray
+    T_grasp: np.ndarray
+    aim_joint: np.ndarray
+    grasp_joint: np.ndarray
+    eta: float
+    move_time: float
 
 
 @dataclass
@@ -65,6 +98,21 @@ class SkillContext:
     publish_state: Callable[[], None]
     set_status: Callable[[str, str], None]
     set_active_target: Callable[["Optional[TrackedObject]"], None]
+    # Skill NAME that will handle a given object (wired to ActionSelector.skill_for).
+    # Lets the chain pre-position the NEXT object with the skill that will run it.
+    skill_for: Callable[["TrackedObject"], str]
+    # The SKILL OBJECT (not just its name) that will handle a given object. Lets the
+    # intercept solver query that skill's t_to_contact() timeline — push and throw
+    # have different setup/positioning/contact costs, so the grasp must be placed
+    # using the skill that will actually run. Wired in GP8App._build_skills.
+    skill_obj_for: Callable[["TrackedObject"], "ManipulationSkill"]
+    # Default standby pose (6-DOF joint vector, wrist/j6 = 0) the post-action
+    # chain returns to when there is NO next object to pre-position. Computed once
+    # in GP8App._build_skills from cfg.INITIAL_R/T (the boot pose). Skills reach it
+    # via ManipulationSkill.idle_target() — see base.py. Returning a TARGET (not a
+    # motion) keeps the return folded into each skill's single chained trajectory,
+    # so no extra dispatch (which would chop the swing).
+    idle_joint: np.ndarray
 
     @property
     def log(self):
@@ -76,6 +124,160 @@ class SkillContext:
     def object_y_now(self, target: "TrackedObject", now: float, v: float) -> float:
         """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases)."""
         return target.T_grasp_base[1, 3] - v * (now - target.detect_time)
+
+    def log_action_timing(self, target: "TrackedObject", intercept_y: float, tag: str) -> None:
+        """DIAGNOSTIC: object position vs the intercept at the instant the action fires.
+
+        ``delta = obj_y - intercept_y``. The belt travels -Y, so ``delta > 0`` means the
+        object is still UPSTREAM of the intercept (approaching — good, we act as it
+        arrives); ``delta < 0`` means it has ALREADY PASSED the intercept and the action
+        lands BEHIND it — the multi-object "석션/push가 물체 지나간 자리에서 일어난다"
+        symptom. ``age`` is how long the object has been dead-reckoned since its last
+        detection (large for 2nd+ objects that coasted through the previous cycle).
+        Called by each skill right before it commits (throw lift / push stroke)."""
+        now = time.time()
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        obj_y = self.object_y_now(target, now, v)
+        delta = obj_y - intercept_y
+        state = "approaching(+)" if delta >= 0.0 else "PASSED-BEHIND(-)"
+        self.log.info(
+            f"[fire-timing] {tag} id={target.track_id} {target.class_name}: "
+            f"obj_y={obj_y:+.3f} intercept_y={intercept_y:+.3f} delta={delta:+.3f}m "
+            f"{state} age={now - target.detect_time:.2f}s belt={v:.3f}m/s"
+        )
+
+    def log_suction_on(self, target: "TrackedObject") -> None:
+        """DIAGNOSTIC: at the instant suction turned ON, log the object's CALCULATED
+        (belt-extrapolated) position vs the end-effector's ACTUAL position.
+
+        The object position is ``object_y_now`` evaluated at ``last_suction_on_t``
+        (the exact fire instant), with its lane X/Z; the EE position is the forward
+        kinematics of ``last_suction_on_joints`` (the joint state snapshotted the
+        moment the vacuum fired, possibly mid-move). ``dY = obj_y - ee_y`` is how far
+        along the belt the object is from the cup when suction fires: ``>0`` the
+        object is still upstream of the cup, ``<0`` it has already passed it."""
+        tc = self.traj_ctrl
+        t_son = getattr(tc, "last_suction_on_t", None)
+        q_son = getattr(tc, "last_suction_on_joints", None)
+        if t_son is None or q_son is None:
+            self.log.warn("[suction-on] no suction-on snapshot available (joints/time None)")
+            return
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        obj_x = float(target.T_grasp_base[0, 3])
+        obj_y = self.object_y_now(target, t_son, v)
+        obj_z = float(target.T_grasp_base[2, 3])
+        try:
+            T_ee = self.robot.forward_kinematics(np.asarray(q_son, dtype=float)[:6])
+            ee_x, ee_y, ee_z = float(T_ee[0, 3]), float(T_ee[1, 3]), float(T_ee[2, 3])
+        except Exception as e:  # noqa: BLE001 — diagnostic must never kill the cycle
+            self.log.warn(f"[suction-on] EE FK failed: {e}")
+            return
+        self.log.info(
+            f"[suction-on] id={getattr(target, 'track_id', '?')} "
+            f"obj=({obj_x:+.3f},{obj_y:+.3f},{obj_z:+.3f}) "
+            f"ee=({ee_x:+.3f},{ee_y:+.3f},{ee_z:+.3f}) "
+            f"dX={obj_x - ee_x:+.3f} dY={obj_y - ee_y:+.3f} dZ={obj_z - ee_z:+.3f} "
+            f"belt={v:.3f} age={t_son - target.detect_time:.2f}s"
+        )
+
+    def earliest_reachable_intercept(
+        self,
+        target: "TrackedObject",
+        current_joint: np.ndarray,
+        v: float,
+        now: float,
+        pre_delay: float = 0.0,
+        t_to_contact_fn: "Optional[Callable[[float], float]]" = None,
+    ) -> "Optional[Intercept]":
+        """Earliest belt-Y at which the arm can grab ``target``, or ``None`` if it
+        can't be caught anywhere in the workspace before passing downstream.
+
+        The object travels in -Y; for its lane X the reach window is
+        ``Y in [-y_b, +y_b]`` with ``y_b = sqrt(MAX_REACH^2 - x^2)``. We grab as
+        EARLY as possible: if the object is still upstream of the entry edge
+        ``+y_b`` when the arm can be ready, wait at ``+y_b``; otherwise meet it
+        where it will be when the arm arrives (which may be downstream of the old
+        ``y=0`` line — that is the point). We give up ONLY when the object would
+        pass the downstream edge ``-y_b`` before the arm — after any ``pre_delay``
+        (e.g. the current throw the arm must finish first) — can reach it. Being
+        upstream (not yet arrived) is never a reason to give up.
+
+        intercept-Y and the arm's ``move_time`` depend on each other (the object
+        keeps moving while the arm moves), so we fixed-point iterate to
+        convergence. The loop is cheap (closed-form IK + arithmetic). The
+        ``PICK_FEASIBILITY_FACTOR`` margin is baked into the arm-travel estimate
+        here, so callers just use the result (or drop on ``None``).
+
+        ``current_joint`` is the move-estimate reference (the pose the arm lifts
+        from). ``pre_delay`` is dead time before the arm starts moving (0 for the
+        immediate pick; the throw duration for the post-throw chain).
+        """
+        cfg = self.cfg
+        x = float(target.T_grasp_base[0, 3])
+        obj_y = self.object_y_now(target, now, v)
+        denom = cfg.MAX_REACH ** 2 - x ** 2
+        if denom <= 0.0:
+            return None                          # lane laterally out of reach (degenerate)
+        y_b = float(np.sqrt(denom))
+        if obj_y < -y_b:
+            return None                          # already past the downstream reach edge
+
+        zero = np.zeros_like(self.M1)
+        factor = cfg.PICK_FEASIBILITY_FACTOR
+        approach_dz = float(target.T_aim_base[2, 3] - target.T_grasp_base[2, 3])
+        T_grasp = target.T_grasp_base.copy()
+        T_aim = target.T_aim_base.copy()
+        T_grasp[0, 3] = x
+        T_aim[0, 3] = x
+
+        y_guess = float(min(obj_y, y_b))         # seed at the object, capped at the entry edge
+        y_eval = y_guess
+        aj = gj = None
+        move_time = 0.0
+        for _ in range(_INTERCEPT_MAX_ITERS):
+            y_eval = y_guess
+            T_grasp[1, 3] = y_eval
+            T_grasp[2, 3] = cfg.GRASP_Z
+            T_aim[1, 3] = y_eval
+            T_aim[2, 3] = cfg.GRASP_Z + approach_dz
+            gj = self.robot.inverse_kinematics(T_grasp)
+            aj = self.robot.inverse_kinematics(T_aim)
+            if gj is None or aj is None:
+                return None
+            gj = np.asarray(gj, dtype=float); gj[-1] = 0.0
+            aj = np.asarray(aj, dtype=float); aj[-1] = 0.0
+            move_time = (
+                opt_time(current_joint, zero, aj, zero, self.M1, self.M2)
+                + opt_time(aj, zero, gj, zero, self.M1, self.M2)
+            )
+            # Where the object will be once the arm reaches CONTACT (after pre_delay).
+            # The contact budget is the skill's real timeline (t_to_contact_fn:
+            # setup + positioning + contact offset) when supplied, else the legacy
+            # opt_time*factor proxy. This is the placement+feasibility fix: the old
+            # proxy omitted the dispatch + push pre-travel, so the grasp was aimed
+            # upstream of where the object actually was at strike.
+            budget = (
+                t_to_contact_fn(move_time) if t_to_contact_fn is not None
+                else move_time * factor
+            )
+            obj_y_arrival = obj_y - v * (pre_delay + budget)
+            if obj_y_arrival < -y_b:
+                return None                      # exits downstream before the arm arrives
+            target_y = min(obj_y_arrival, y_b)   # wait at the entry edge if still upstream
+            if abs(target_y - y_eval) < _INTERCEPT_TOL:
+                break
+            y_guess = (1.0 - _INTERCEPT_RELAX) * y_eval + _INTERCEPT_RELAX * target_y
+
+        eta = (obj_y - y_eval) / (v + 1e-6)
+        return Intercept(
+            intercept_y=y_eval,
+            T_aim=T_aim.copy(),
+            T_grasp=T_grasp.copy(),
+            aim_joint=aj,
+            grasp_joint=gj,
+            eta=eta,
+            move_time=move_time,
+        )
 
     def move_through(
         self,
@@ -99,20 +301,56 @@ class SkillContext:
             current_joint, zero, grasp_joint, zero,
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
+        # Thin to >= queue-gap so the synchronous point push keeps up with the
+        # robot's consumption — otherwise a long positioning move (e.g. from the
+        # bin-side push_end back to the next intercept) drains the queue and
+        # MotoROS2 exits queue mode (code 2 'Must call start_point_queue_mode').
+        traj, vel, ts = decimate_for_queue(traj, vel, ts)
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+
+    def move_through_via(
+        self,
+        current_joint: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+    ) -> None:
+        """Queue-mode move current -> aim -> grasp, ACTUALLY passing through aim.
+
+        Unlike :meth:`move_through` (which ignores ``aim_joint`` and cuts a
+        direct path to ``grasp_joint``), this routes through the ``aim_joint``
+        via-point (zero velocity there) using ``trajectory_3points``. The push
+        skill uses it so the arm rises to the high aim hover before descending
+        to the low push-start pose, instead of cutting a direct (possibly
+        belt-dipping) path from a far parked pose like the bin-side push_end.
+        """
+        zero = np.zeros_like(self.M1)
+        traj, vel, ts = trajectory_3points(
+            current_joint, zero,
+            aim_joint, zero,
+            grasp_joint, zero,
+            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+        )
+        # Thin to >= queue-gap so the synchronous point push keeps up with the
+        # robot's consumption (see move_through) — a long via-routed positioning
+        # has even more points, so this matters more here.
+        traj, vel, ts = decimate_for_queue(traj, vel, ts)
+        # DIAGNOSTIC: wall-clock positioning duration (this call blocks for the
+        # whole move). Push's wait_for_arrival re-checks arrival AFTER this, so a
+        # long positioning here is what makes the stroke land behind the object.
+        _t_pos0 = time.time()
+        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+        self.log.info(f"[positioning] move_through_via {time.time() - _t_pos0:.2f}s")
 
     def sleep_until(self, deadline: float) -> None:
         """Block until ``deadline`` (wall clock), staying responsive to shutdown.
 
-        During the long ambush wait we still pump ROS callbacks (so belt
-        speed and detection snapshots stay fresh), publish viz state, and
-        — importantly — keep ingesting new detections into the queue and
-        updating its order. Otherwise objects that arrive on the belt
-        during the wait are invisible to app.py until the current cycle's
-        throw completes (~10 s later), often too late to catch.
+        The background MTE keeps belt speed and detection snapshots fresh; this
+        loop publishes viz state and — importantly — keeps ingesting new
+        detections into the queue and updating its order. Otherwise objects that
+        arrive on the belt during the wait are invisible to app.py until the
+        current cycle's throw completes (~10 s later), often too late to catch.
         """
         while rclpy.ok() and time.time() < deadline:
-            rclpy.spin_once(self.node, timeout_sec=0.0)
             self.publish_state()
             now = time.time()
             self.intake(now)
@@ -154,33 +392,169 @@ class SkillContext:
         #    so the lift/throw motion begins at eta.
         self.sleep_until(now + eta)
 
-    def scan_next_intercept(self) -> "Optional[np.ndarray]":
-        """Re-poll the live queue for the next reachable object's intercept joint.
+    def wait_for_arrival(
+        self, target: "TrackedObject", intercept_y: float, offset = 0.18
+    ) -> None:
+        """One-shot wait, parked at the grasp pose. Suction fires SUCTION_LEAD
+        seconds before the object arrives so the vacuum is already pulling, but
+        this method only returns at the predicted arrival — so the caller's
+        lift/throw motion starts on time (at eta), not early.
 
-        Used as the post-release chain target so the arm flows straight to the
-        next pick instead of parking. Re-polls here (NOT a value captured at
-        lock time) because new objects may have entered the queue during the
-        ~10 s ambush wait. Walks from the head and returns the first reachable
-        candidate's intercept joint config, or ``None`` if none is reachable.
+        eta is computed once here from remaining distance / belt speed sampled
+        now (no per-tick recompute). Assumes a roughly steady belt.
         """
-        self.queue.update(
-            time.time(),
-            self.conveyor.current if self.conveyor is not None else 0.0,
+        now = time.time()
+        v = self.conveyor.current
+        obj_y = self.object_y_now(target, now, v)
+        eta = (obj_y - intercept_y) / (v + 1e-6)
+        eta = max(0.0, min(eta, self.cfg.AMBUSH_MAX_WAIT))
+        lead = min(self.cfg.SUCTION_LEAD, eta)   # can't fire before now
+        self.log.info(
+            f"Ambush: suction in {eta - lead:.2f}s, arrival/lift in {eta:.2f}s "
+            f"(dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s, lead {lead:.2f}s)"
         )
-        for cand in list(self.queue._objects):
-            T_next_grasp = cand.T_grasp_base.copy()
-            T_next_grasp[1, 3] = self.cfg.GRASP_INTERCEPT_Y
-            T_next_grasp[2, 3] = self.cfg.GRASP_Z
-            if np.linalg.norm(T_next_grasp[:2, 3]) > self.cfg.MAX_REACH:
-                continue
-            ik = self.robot.inverse_kinematics(T_next_grasp)
-            if ik is None:
-                continue
-            next_intercept_joint = np.asarray(ik, dtype=float)
-            next_intercept_joint[-1] = 0.0
-            self.log.info(
-                f"Throw chain target: {cand.class_name} at "
-                f"x={float(T_next_grasp[0, 3]):+.3f}"
+        # DIAGNOSTIC: the object is already at/below the intercept when the WAIT
+        # begins -> positioning (move_through_via) overran and the object reached
+        # the intercept before the arm was ready; the action will land BEHIND it.
+        if (obj_y - intercept_y) <= 0.0:
+            self.log.warn(
+                f"[late] id={getattr(target, 'track_id', '?')} object already "
+                f"at/below intercept at wait entry: obj_y={obj_y:+.3f} "
+                f"intercept_y={intercept_y:+.3f} dist={obj_y - intercept_y:+.3f}m "
+                f"age={now - target.detect_time:.2f}s — arm not ready in time"
             )
-            return next_intercept_joint
+        self.sleep_until(now + eta - offset)
+
+    def position_and_prime(
+        self,
+        current_joint: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+        target: "TrackedObject",
+        intercept_y: float,
+        start_lead: "Optional[float]" = None,
+    ) -> bool:
+        """Drive to the grasp pose, then POSITION-PRIME suction: fire it only once
+        the cup is PARKED at the grasp, capped at SUCTION_LEAD before arrival.
+
+        Always returns True (kept as bool for the caller's signature).
+
+        Restores the fix-throwing behaviour that the wall-clock timer regressed:
+        suction is keyed to the arm actually REACHING the grasp (cup down at the
+        object), never to a bare predicted-arrival clock. The vacuum fires at
+        ``max(cup-parked, arrival - SUCTION_LEAD)``:
+          * backed-up object (eta < SUCTION_LEAD): fires the instant the cup parks
+            at the grasp — as early as physically possible, but NEVER while the cup
+            is still descending mid-move (the old bug that fired with the cup high);
+          * object with slack (eta >= SUCTION_LEAD, e.g. the first pick): fires
+            SUCTION_LEAD before arrival, cup already parked.
+        The adv4ncr 250 Hz stream (<10 ms command->motion) makes "fire when parked"
+        land within a stream tick of the grasp. Returns once the object has reached
+        the intercept (caller then lifts/throws).
+        """
+        now = time.time()
+        v = self.conveyor.current
+        obj_y = self.object_y_now(target, now, v)
+        eta = max(0.0, min((obj_y - intercept_y) / (v + 1e-6), self.cfg.AMBUSH_MAX_WAIT))
+        t_arrival = now + eta
+        self.log.info(
+            f"Ambush: cap prime {self.cfg.SUCTION_LEAD:.2f}s before arrival, "
+            f"arrival/lift in {eta:.2f}s (dist {obj_y - intercept_y:.3f} m / "
+            f"belt {v:.3f} m/s)"
+        )
+
+        # 1) Drive to the grasp pose — NO suction during the move. send_trajectory_queue
+        #    blocks for the whole move (stream paces it in real time), so the cup is
+        #    parked AT the grasp when it returns.
+        zero = np.zeros_like(self.M1)
+        traj, vel, ts = trajectory(
+            current_joint, zero, grasp_joint, zero,
+            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+        )
+        _t_pos0 = time.time()
+        self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
+        _pos_dur = time.time() - _t_pos0
+        # DIAGNOSTIC: did positioning finish before the object reaches the intercept?
+        # If it exceeds eta, the object arrives before the cup parks and the pick
+        # lands behind it (the throughput-limited case).
+        if _pos_dur > eta:
+            self.log.warn(
+                f"[positioning-overrun] id={getattr(target, 'track_id', '?')} "
+                f"positioning {_pos_dur:.2f}s > eta {eta:.2f}s: object reaches "
+                f"intercept before the cup parks; action will land behind"
+            )
+        else:
+            self.log.info(
+                f"[positioning] {_pos_dur:.2f}s (eta {eta:.2f}s, "
+                f"margin {eta - _pos_dur:.2f}s)"
+            )
+
+        # 2) Cup is parked at the grasp. Prime at max(now, arrival - SUCTION_LEAD):
+        #    never before the cup is down (now = just parked), never more than
+        #    SUCTION_LEAD early. Backed-up object -> ~now; slack pick -> waits until
+        #    SUCTION_LEAD before arrival.
+        self.set_status("WAITING", getattr(target, "class_name", ""))
+        t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
+        self.sleep_until(t_suction)
+        self.traj_ctrl.suction_on()
+        # DIAGNOSTIC: object's calculated position vs the EE's actual position at
+        # the instant suction fired (see log_suction_on).
+        self.log_suction_on(target)
+
+        # 3) End the wait `start_lead` s before predicted arrival so the post-wait
+        #    trajectory dispatch overlaps the object's final approach and the lift
+        #    lands ON arrival. start_lead defaults to cfg.ACTION_START_LEAD; the
+        #    skill passes its own arrival_lead().
+        if start_lead is None:
+            start_lead = self.cfg.ACTION_START_LEAD
+        self.sleep_until(t_arrival - start_lead)
+        return True
+
+    def lifted_standby_joint(self, end_joint: np.ndarray) -> np.ndarray:
+        """Park pose for when a next object EXISTS but wasn't committed for
+        pre-position (it routes to a different skill, or isn't reachable after this
+        action). Keeps the action's end XY but RAISES Z to the home/idle height, so
+        the arm lifts straight up off the belt — avoiding the low-to-low belt sweep
+        that motivated parking at home — WITHOUT the wasteful full trip to the home
+        pose. Only a truly empty queue (no next object detected yet) returns all the
+        way home (via idle_joint); the callers choose between the two. Falls back to
+        idle_joint on FK/IK failure.
+        """
+        end_joint = np.asarray(end_joint, dtype=float)
+        T = self.robot.forward_kinematics(end_joint[:6])
+        T[2, 3] = float(self.cfg.INITIAL_T[2, 0])      # home/idle Z (cfg.INITIAL_T)
+        q = self.robot.inverse_kinematics(T, q_init=end_joint[:6])
+        if q is None:
+            self.log.warn("lifted-standby IK failed; parking at home/idle pose")
+            return self.idle_joint
+        q = np.asarray(q, dtype=float)
+        q[-1] = 0.0
+        return q
+
+    def next_chain_target(self, from_joint: np.ndarray, action_time: float):
+        """Grasp joints of the next object the arm should head toward AFTER the current
+        action, so the follow-through chain OVERLAPS the next approach (recovers the
+        throughput the plain-standby park lost). Reuses ``earliest_reachable_intercept``
+        with ``pre_delay=action_time`` (the arm frees up only after this action) — its
+        fixed-point loop resolves the move-time <-> object-position circularity. Returns
+        the first feasible object's grasp joints (wrist=0), or ``None`` (no next / none
+        catchable) so the caller parks at lifted_standby. Works for ANY next skill
+        (symmetric). NO commitment: the next epoch still SELECTS + DRIVES fresh from this
+        closer pose, so the handoff stays stateless (no committed/prepositioned/skip_move)."""
+        now = time.time()
+        v = self.conveyor.current if self.conveyor is not None else 0.0
+        # No queue.update() here — earliest_reachable_intercept computes each object's
+        # position from object_y_now itself, and mutating the queue mid-chain (pruning)
+        # is a side effect the next epoch's own update should own.
+        for cand in list(self.queue._objects):
+            it = self.earliest_reachable_intercept(
+                cand, from_joint, v, now, pre_delay=action_time,
+                t_to_contact_fn=self.skill_obj_for(cand).t_to_contact,
+            )
+            if it is not None:
+                self.log.info(
+                    f"Chain toward next: id={cand.track_id} {cand.class_name} @ "
+                    f"y={it.intercept_y:+.3f} (arrival {it.eta:.2f}s, pre_delay {action_time:.2f}s)"
+                )
+                return it.grasp_joint
         return None

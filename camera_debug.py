@@ -40,6 +40,32 @@ CONVEYOR_FALLBACK_MPS = 0.083
 
 PUBLISH_HZ = 10.0
 
+# --- Perception latency compensation (moving-object downstream bias) ---
+# The camera only self-reports its PROCESSING time (record["elapsed_s"]). It does
+# NOT include:
+#   (a) frame ACQUISITION age — the latest frame is up to one frame period (1/FPS)
+#       old before processing even starts, and
+#   (b) network/stream TRANSPORT from the camera PC to here.
+# Both leave the object physically v·L further DOWNSTREAM than the elapsed_s-only
+# back-projection places it (verified: static calibration is fine, moving objects
+# drift downstream, worse at higher belt speed). We fold L = (a)+(b) into the Y
+# back-projection. Tune on HW via the [latency] TUI line + these env vars.
+# Frame acquisition age = FRAME_AGE_FACTOR × (frame period). The frame period is
+# NOT hardcoded — it is estimated LIVE as an EMA of the inter-record ARRIVAL
+# interval, so it tracks the camera's real effective FPS (including stream jitter
+# and processing bottlenecks) without hand-setting it. CAMERA_FPS_FALLBACK only
+# seeds the estimate until the EMA warms up (and covers stalls).
+CAMERA_FPS_FALLBACK = float(os.environ.get("GP8_CAMERA_FPS", "30.0"))
+FPS_EMA_ALPHA = float(os.environ.get("GP8_FPS_EMA_ALPHA", "0.2"))     # EMA weight on the newest interval
+# Ignore inter-record gaps longer than this (reconnect/stall) so they don't
+# poison the frame-period EMA. Raise it if your camera runs slower than ~1 fps.
+MAX_FRAME_GAP_S = float(os.environ.get("GP8_MAX_FRAME_GAP_S", "1.0"))
+# Fraction of a frame period to count as acquisition age: 1.0 = a full period
+# (frame + buffer), 0.5 = mean age of a uniformly-sampled frame.
+FRAME_AGE_FACTOR = float(os.environ.get("GP8_FRAME_AGE_FACTOR", "1.0"))
+# Residual fixed latency (transport + anything not in elapsed_s), seconds.
+PERCEPTION_EXTRA_LATENCY_S = float(os.environ.get("GP8_PERCEPTION_LATENCY_S", "0.0"))
+
 
 class CameraDebugNode(Node):
     def __init__(self) -> None:
@@ -52,6 +78,11 @@ class CameraDebugNode(Node):
 
         self._snap_lock = threading.Lock()
         self._snap: dict | None = None
+
+        # Live EMA of the inter-record interval -> estimated frame period (real FPS),
+        # used for the frame-acquisition-age latency term (see _on_record).
+        self._last_record_t: float | None = None
+        self._frame_period_ema: float | None = None
 
         self._pub = self.create_publisher(
             String, "/camera_debug/detections", 10
@@ -97,6 +128,32 @@ class CameraDebugNode(Node):
 
         v = float(self._belt_mps)
         receipt = time.time()
+        # EMA the inter-record arrival interval -> estimated frame period (the
+        # camera's real effective FPS). Gaps > MAX_FRAME_GAP_S (reconnect/stall)
+        # are skipped so they don't poison the estimate.
+        if self._last_record_t is not None:
+            dt = receipt - self._last_record_t
+            if 0.0 < dt < MAX_FRAME_GAP_S:
+                if self._frame_period_ema is None:
+                    self._frame_period_ema = dt
+                else:
+                    self._frame_period_ema = (
+                        FPS_EMA_ALPHA * dt
+                        + (1.0 - FPS_EMA_ALPHA) * self._frame_period_ema
+                    )
+        self._last_record_t = receipt
+        frame_period = (
+            self._frame_period_ema
+            if self._frame_period_ema is not None
+            else 1.0 / max(CAMERA_FPS_FALLBACK, 1e-6)
+        )
+        # Uncompensated latency beyond the camera's elapsed_s: frame acquisition
+        # age (a fraction of the estimated frame period) + a residual transport
+        # term. The object sits v·extra further DOWNSTREAM, so fold it into the Y
+        # back-projection below.
+        frame_age = FRAME_AGE_FACTOR * frame_period
+        extra_latency = frame_age + PERCEPTION_EXTRA_LATENCY_S
+        total_delay = delay_s + extra_latency
 
         offset_aim = extrinsics.DETECTION_OFFSET_AIM
         offset_grasp = extrinsics.DETECTION_OFFSET_GRASP
@@ -128,10 +185,13 @@ class CameraDebugNode(Node):
 
             # Apply Z offsets for aim / grasp, back-project Y by v*delay so the
             # position is "where the object is at receipt time."
+            # Back-project Y by v*total_delay (elapsed_s + frame-age + transport)
+            # so the position is "where the object is at receipt time," removing the
+            # moving-object upstream bias.
             base_grasp = np.array([x_base, y_base, z_base + offset_grasp])
-            base_grasp[1] -= v * delay_s
+            base_grasp[1] -= v * total_delay
             base_aim = np.array([x_base, y_base, z_base + offset_aim])
-            base_aim[1] -= v * delay_s
+            base_aim[1] -= v * total_delay
 
             detections.append({
                 "class": cls,
@@ -151,6 +211,15 @@ class CameraDebugNode(Node):
             "stream_record_ts": stream_ts,
             "belt_mps": v,
             "perception_delay_s": delay_s,
+            "frame_age_s": frame_age,
+            "frame_period_s": frame_period,
+            "est_fps": (1.0 / frame_period) if frame_period > 0.0 else None,
+            "extra_latency_s": extra_latency,
+            "applied_delay_s": total_delay,
+            # Transport estimate: receipt(local clock) − camera stream timestamp.
+            # ONLY meaningful if the two PCs' clocks are NTP-synced; else ignore
+            # its absolute value and tune PERCEPTION_EXTRA_LATENCY_S empirically.
+            "transport_est_s": (receipt - stream_ts) if stream_ts > 0.0 else None,
             "detections": detections,
         }
         with self._snap_lock:
@@ -192,7 +261,19 @@ class CameraDebugNode(Node):
             f" belt: {v:6.3f} m/s   "
             f"stream delay: {delay:.3f}s   "
             f"snapshot age: {dt:.2f}s   "
-            f"detections: {len(detections)}\n\n"
+            f"detections: {len(detections)}\n"
+        )
+        applied = float(snap.get("applied_delay_s", delay))
+        frame_age = float(snap.get("frame_age_s", 0.0))
+        est_fps = snap.get("est_fps", None)
+        fps_str = f"{est_fps:.1f}" if est_fps is not None else "…"
+        transport = snap.get("transport_est_s", None)
+        transport_str = f"{transport:+.3f}s" if transport is not None else "n/a"
+        out.append(
+            f" [latency] elapsed {delay:.3f} + frame_age {frame_age:.3f} "
+            f"(est_fps {fps_str}) + extra {PERCEPTION_EXTRA_LATENCY_S:.3f} "
+            f"= applied {applied:.3f}s (→ {applied * v * 100:+.1f} cm back-proj)   "
+            f"transport_est: {transport_str}\n\n"
         )
         if not detections:
             out.append(" (no objects in latest record)\n")

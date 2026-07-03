@@ -1,7 +1,9 @@
-"""GP8 full system bringup launch file (ROS 2).
+"""GP8 full system bringup launch file (ROS 2) — adv4ncr hardened RT driver.
 
 Launches all nodes needed for GP8 pick-and-throw operation:
-  1. Robot state publisher (URDF -> TF)
+  1. adv4ncr ros2_control stack (ros2_control_node + motoman_hardware +
+     joint_state_broadcaster + JointGroupPositionController) + robot_state
+     publisher — via motoman_bringup/gp8.launch.py (the validated bringup).
   2. MoveIt 2
   3. Main control app
 
@@ -10,29 +12,42 @@ detection stream. The robot PC consumes it via the app's
 StreamDetectionSource (set GP8_PERCEPTION_URL), so no local RealSense /
 camera-calibration / AprilTag nodes are launched here.
 
-MotoROS2 runs on the robot controller firmware — no node needed here.
+**Driver: the hardened adv4ncr RT driver (NOT MotoROS2).** The app's
+TrajectoryController already targets it (default backend "stream" ->
+/JointGroupPositionController/commands at 250 Hz; /joint_states from
+joint_state_broadcaster; suction via the Simple Message IoServer on TCP
+50242). This launch therefore brings up that ros2_control stack instead of
+the old MotoROS2 name_bridge. Requires the motoman_ROS2 workspace overlaid
+(both install/setup.bash sourced) so motoman_bringup/motoman_hardware/
+motoman_description resolve.
+
+Speed factors default to the LOW commissioning values (0.1 / 0.01); raise
+only through the DEPLOYMENT.md §4.4 ramp after the drills pass:
+  ros2 launch gp8_control gp8_bringup.launch.py \\
+      axis_increment_factor:=0.35 axis_acceleration_factor:=0.02
 
 Usage:
   ros2 launch gp8_control gp8_bringup.launch.py
 """
 
 import os
-import subprocess
 from typing import Dict
 
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
-    GroupAction,
     IncludeLaunchDescription,
     SetEnvironmentVariable,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
-from launch_ros.actions import Node, SetRemap
+from launch.substitutions import (
+    EnvironmentVariable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+)
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from ament_index_python.packages import get_package_share_directory
 
 
 def _load_dotenv(path: str) -> Dict[str, str]:
@@ -81,67 +96,105 @@ def generate_launch_description():
         "robot_ip", default_value="192.168.255.1",
         description="Yaskawa controller IP address",
     )
+    # NOTE: app default set to FULL speed (factor 1.0) per operator request. The
+    # 1.0 velocity ceiling + comm-loss stopping (3.4 cm EE @ ~1 m/s) + throw/push
+    # motion paths were validated this session, BUT the graduated §4.3 drill set
+    # (E-stop mid-move + comm-loss) was NOT run at every step 0.5/0.75/1.0, and
+    # suction (TCP 50242) + throw release-timing calibration are still pending.
+    # Override to go slow:  axis_increment_factor:=0.1 axis_acceleration_factor:=0.01
+    inc_factor_arg = DeclareLaunchArgument(
+        "axis_increment_factor", default_value="1.0",
+        description="Per-cycle increment (velocity) factor [0..1]. Default FULL speed (1.0) "
+                    "per operator request; pass 0.1 to fall back to LOW commissioning speed.",
+    )
+    acc_factor_arg = DeclareLaunchArgument(
+        "axis_acceleration_factor", default_value="0.02",
+        description="Per-cycle acceleration factor [0..1]. 0.02 = hardware-validated max "
+                    "(sync-fix holds); throw needs only ~0.005, so this is ample headroom.",
+    )
+    # Throw suction-RELEASE timing (config.py RELEASE_LEAD). Shifts the suction_off
+    # waypoint vs the NN release point: POSITIVE = release EARLIER, NEGATIVE = LATER
+    # (covers WriteSingleIO + vent lag). At TRAJ_HZ=20, ±0.1 s = ±2 waypoints. Pass
+    # `release_lead:=-0.05` to tune WITHOUT a rebuild; when the arg is omitted a
+    # shell-set GP8_RELEASE_LEAD is honored, else -0.1.
+    release_lead_arg = DeclareLaunchArgument(
+        "release_lead",
+        default_value=EnvironmentVariable("GP8_RELEASE_LEAD", default_value="-0.1"),
+        description="Throw suction-release lead [s]: +earlier / -later (RELEASE_LEAD).",
+    )
+    # Guaranteed parked vacuum-forming hold before the throw lift (config.py
+    # MIN_SUCTION_HOLD). Places the grasp far enough downstream that the arm parks
+    # >= this many seconds before the object arrives; objects that can't be caught
+    # that far downstream are dropped. Pass `min_suction_hold:=0.3` to tune without a
+    # rebuild; omitted -> shell GP8_MIN_SUCTION_HOLD, else 0.3.
+    min_suction_hold_arg = DeclareLaunchArgument(
+        "min_suction_hold",
+        default_value=EnvironmentVariable("GP8_MIN_SUCTION_HOLD", default_value="0.3"),
+        description="Guaranteed parked suction hold before throw lift [s] (MIN_SUCTION_HOLD).",
+    )
+
+    # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
+    # the included adv4ncr stack's robot_state_publisher and by move_group
+    # respectively — no standalone robot_state_publisher / xacro call here.
 
     # =====================================================================
-    # 1. Robot model (URDF -> TF)
+    # 2. adv4ncr driver stack (ros2_control) + robot_state_publisher
+    #    Brings up: ros2_control_node (motoman_hardware, RT UDP path),
+    #    joint_state_broadcaster (-> /joint_states with S/L/U/R/B/T names, so
+    #    NO name_bridge needed), JointGroupPositionController (active, the app's
+    #    default "stream" backend), and robot_state_publisher (/joint_states ->
+    #    TF). The controller must be in REMOTE with no alarm; suction goes over
+    #    TCP 50242 directly (Simple Message IoServer), not a ROS service.
+    #
+    #    Reuses the VALIDATED motoman_bringup/gp8.launch.py so this file never
+    #    re-implements the ros2_control wiring. Speed factors are forwarded.
     # =====================================================================
-    xacro_path = os.path.join(
-        get_package_share_directory("motoman_gp8_support"),
-        "urdf", "gp8.xacro",
-    )
-    robot_description = subprocess.check_output(
-        ["xacro", xacro_path], text=True,
+    adv4ncr_stack = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare("motoman_bringup"), "launch", "gp8.launch.py",
+            ])
+        ]),
+        launch_arguments={
+            "robot_ip": LaunchConfiguration("robot_ip"),
+            "axis_increment_factor": LaunchConfiguration("axis_increment_factor"),
+            "axis_acceleration_factor": LaunchConfiguration("axis_acceleration_factor"),
+        }.items(),
     )
 
-    # Load SRDF for MoveItPy (used by gp8_app's MoveItController)
-    moveit_config_share = get_package_share_directory("motoman_gp8_moveit_config")
-    with open(os.path.join(moveit_config_share, "config", "gp8.srdf"), "r") as f:
-        robot_description_semantic = f.read()
-
-    robot_state_publisher = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        parameters=[{
-            "robot_description": robot_description,
-        }],
-        remappings=[("joint_states", "joint_states_urdf")],
+    # =====================================================================
+    # 2b. joint_trajectory_controller spawned INACTIVE.
+    #    The app's TrajectoryController.wait_for_servers() waits for the JTC
+    #    FollowJointTrajectory action server even in the default "stream"
+    #    backend (which actually drives via the ACTIVE JointGroupPositionController
+    #    at 250 Hz). A configured-but-inactive JTC creates its action server
+    #    (on_configure) so wait_for_servers passes, WITHOUT claiming the position
+    #    command interface — so it never conflicts with the active JGPC. It stays
+    #    inactive because the stream backend never sends it a goal.
+    #    (For GP8_ADV4NCR_BACKEND=jtc, activate it instead of JGPC — they can't
+    #    both be active.)
+    # =====================================================================
+    jtc_spawner_inactive = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["joint_trajectory_controller", "--inactive",
+                   "--controller-manager", "/controller_manager"],
         output="screen",
     )
 
     # =====================================================================
-    # 2a. MotoROS2 (robot driver)
-    #     Runs ON the robot controller, not as a ROS 2 node.
-    #     Provides: /joint_states, /follow_joint_trajectory,
-    #               /write_single_io, /read_single_io
+    # 3. MoveIt 2 — reads /joint_states directly from joint_state_broadcaster
+    #    (the adv4ncr broadcaster already publishes S/L/U/R/B/T names, so the
+    #    old /joint_states_urdf name_bridge remap is gone).
     # =====================================================================
-
-    # =====================================================================
-    # 2b. Name bridge — translates MotoROS2 raw joint names (joint_1..6) to
-    #     URDF S/L/U/R/B/T convention (joint_1_s..6_t) on /joint_states_urdf,
-    #     and proxies /motoman_gp8_controller/follow_joint_trajectory.
-    # =====================================================================
-    name_bridge = Node(
-        package="gp8_control",
-        executable="name_bridge",
-        name="motoros2_name_bridge",
-        output="screen",
+    moveit_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare("motoman_gp8_moveit_config"),
+                "launch", "move_group.launch.py",
+            ])
+        ]),
     )
-
-    # =====================================================================
-    # 3. MoveIt 2 — scoped remap so move_group reads bridge output.
-    # =====================================================================
-    moveit_launch = GroupAction([
-        SetRemap(src="/joint_states", dst="/joint_states_urdf"),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource([
-                PathJoinSubstitution([
-                    FindPackageShare("motoman_gp8_moveit_config"),
-                    "launch", "move_group.launch.py",
-                ])
-            ]),
-        ),
-    ])
 
     # =====================================================================
     # Perception (RealSense camera, camera-info publisher, AprilTag) runs on
@@ -229,6 +282,11 @@ def generate_launch_description():
         output="screen",
         additional_env={
             **app_env,
+            # Throw suction-release lead: `release_lead:=` launch arg (falling back
+            # to shell GP8_RELEASE_LEAD, then -0.1) -> GP8_RELEASE_LEAD for Config.
+            "GP8_RELEASE_LEAD": LaunchConfiguration("release_lead"),
+            # Guaranteed parked suction hold: `min_suction_hold:=` -> GP8_MIN_SUCTION_HOLD.
+            "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
         },
     )
 
@@ -238,8 +296,12 @@ def generate_launch_description():
     return LaunchDescription([
         set_pythonpath,
         robot_ip_arg,
-        name_bridge,
-        robot_state_publisher,
+        inc_factor_arg,
+        acc_factor_arg,
+        release_lead_arg,
+        min_suction_hold_arg,
+        adv4ncr_stack,
+        jtc_spawner_inactive,
         moveit_launch,
         gp8_app,
     ])

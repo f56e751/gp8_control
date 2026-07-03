@@ -1,168 +1,175 @@
-"""Detection polling + camera-to-robot pose conversion.
+"""Detection intake: fold camera_debug's corrected detections into the queue.
 
-Wraps the non-blocking poll of a perception source and the per-detection
-camera→robot transform that used to live as private methods on
-``GP8App``. The output is a list of ``GraspCandidate`` ready to be added
-to the tracked-object queue.
+The ``camera_debug`` node (separate process) owns the sensor→base transform,
+Z offsets, ``v×delay`` back-projection, and workspace filter, and publishes
+corrected base-frame detections on ``/camera_debug/detections``. This module is
+the boundary stage on the CONTROL side: it takes one such snapshot and updates
+the ``TrackedObjectQueue``, doing the spatial dedup / re-anchoring the detector
+can't (it emits no per-object identity, so each frame re-detects every visible
+object).
 
-The source is duck-typed: it only needs ``.positions`` / ``.class_names`` /
-``.delay`` attributes. Both the old ROS-callback-driven ``SAMClient`` and the
-HTTP-stream ``StreamDetectionSource`` satisfy this. When ``node`` is None
-(the stream source needs no ROS spinning), ``poll`` just reads the latest
-snapshot instead of pumping ROS callbacks.
+It lives here — in the control process, NOT in the ``camera_debug`` node —
+because the dedup needs robot-side tracking state (the queue and the in-flight
+active target), which only exists in the ``gp8_manager`` process.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-import rclpy
-from rclpy.node import Node
+
+from gp8_control.tracking import TrackedObject
+
+if TYPE_CHECKING:
+    from gp8_control.tracking import TrackedObjectQueue
 
 
-def _make_transform(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+def _make_transform(R: np.ndarray, t) -> np.ndarray:
     T = np.eye(4)
     T[:3, :3] = R
-    T[:3, 3] = t.ravel()
+    T[:3, 3] = np.asarray(t, dtype=float).ravel()
     return T
 
 
-# Default tool orientation: tool pointing down at the belt.
+def _fmt_votes(votes: dict) -> str:
+    """Compact 'cls:weight' dump (highest first) for the reclass log."""
+    return "{" + ", ".join(
+        f"{k}:{v:.2f}" for k, v in sorted(votes.items(), key=lambda kv: -kv[1])
+    ) + "}"
+
+
+# Tool orientation: tool pointing down at the belt. Must match the value the
+# camera_debug node assumes when it reports base_grasp / base_aim.
 _R_GRASP_DEFAULT = np.array(
     [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]
 )
 
 
-@dataclass
-class GraspCandidate:
-    T_aim: np.ndarray
-    T_grasp: np.ndarray
-    class_name: str
-    cam_pos: tuple   # raw camera-frame position [cx, cy, cz] from the stream
-
-
 class DetectionIntake:
-    def __init__(
+    """Folds corrected ``camera_debug`` detections into the tracked-object queue.
+
+    Spatial dedup: each camera frame re-detects every visible object (no
+    per-object identity), so a new detection within ``eps`` of an existing
+    track's conveyor-compensated position is treated as the SAME object and
+    RE-ANCHORS that track (resets its belt-extrapolation reference) instead of
+    enqueuing a duplicate. Only a genuinely-new position becomes a new object.
+    Class-independent: once a spot has an object, any re-detection there is that
+    same one.
+    """
+
+    def __init__(self, eps: float) -> None:
+        #: spatial match radius [m] — OBJECT_MATCH_EPSILON on the app Config.
+        self.eps = eps
+
+    def ingest(
         self,
-        node: Node | None,
-        sam_client,
-        T_robot2base: np.ndarray,
-        T_base2cam: np.ndarray,
-        offset_aim: float,
-        offset_grasp: float,
-        time_step: float,
-        # Workspace filter — Z<0.67 keeps belt-surface detections; X∈(-0.2,0.2)
-        # rejects anything off the belt centerline.
-        workspace_z_max: float = 0.67,
-        workspace_x_abs: float = 0.2,
+        snapshot: "Optional[dict]",
+        queue: "TrackedObjectQueue",
+        active_target: "Optional[TrackedObject]",
+        v: float,
         logger=None,
-        log_raw: bool = False,
-    ) -> None:
-        self._node = node
-        self._sam = sam_client
-        self._T_robot2base = T_robot2base
-        self._T_base2cam = T_base2cam
-        self._offset_aim = offset_aim
-        self._offset_grasp = offset_grasp
-        self._time_step = time_step
-        self._z_max = workspace_z_max
-        self._x_abs = workspace_x_abs
-        self._R_grasp = _R_GRASP_DEFAULT
-        # Optional raw-detection logging: when set, every detection seen on
-        # the stream is logged with its camera-frame position, transformed
-        # base-frame grasp position, and the filter decision. Used to debug
-        # cases like base-X stuck at the constant 0.425 (camera sent [0,0,0]).
-        self._logger = logger
-        self._log_raw = log_raw
+    ) -> int:
+        """Update ``queue`` from one ``/camera_debug/detections`` snapshot.
 
-    def _camera_to_grasp(self, position) -> tuple[np.ndarray, np.ndarray]:
-        T_cam = np.eye(4)
-        T_cam[:3, 3] = np.asarray(position, dtype=float)
-        T_robot = self._T_robot2base @ self._T_base2cam @ T_cam
-        grasp_pos = T_robot[:3, 3]
-        T_aim = _make_transform(
-            self._R_grasp, grasp_pos + np.array([0.0, 0.0, self._offset_aim])
-        )
-        T_grasp = _make_transform(
-            self._R_grasp, grasp_pos + np.array([0.0, 0.0, self._offset_grasp])
-        )
-        return T_aim, T_grasp
+        ``snapshot`` is the parsed message dict (``None`` before the first
+        message). ``active_target`` is the object currently being manipulated
+        (popped from the queue but still on the belt) — included in the dedup so
+        an in-flight pick isn't re-enqueued. ``v`` is the current belt speed.
 
-    def _in_workspace(self, position) -> bool:
-        return position[2] < self._z_max and -self._x_abs < position[0] < self._x_abs
-
-    # ------------------------------------------------------------------
-    def poll(
-        self, time_to_check: float = 0.3
-    ) -> tuple[list[GraspCandidate], float]:
-        """Poll SAM client for ``time_to_check`` seconds.
-
-        Returns ``(candidates, perception_delay)`` — the delay is the
-        SAM-side timestamp the caller uses to back-project the conveyor
-        motion that occurred between detection and now.
+        Mutates ``queue`` (adds new objects / re-anchors existing ones) and
+        returns the count of genuinely-new objects added (0 if none). The caller
+        owns any frame-gate bookkeeping keyed on that count.
         """
-        s_time = time.time()
-        positions = None
-        class_names = None
-        delay = 0.0
+        if snapshot is None:
+            return 0
+        detections = [
+            d for d in snapshot.get("detections", []) if d.get("in_workspace")
+        ]
+        if not detections:
+            return 0
 
-        while time.time() - s_time < time_to_check:
-            if self._node is not None:
-                # Old SAMClient path: pump ROS callbacks so the camera_info
-                # subscription can populate the buffers.
-                rclpy.spin_once(self._node, timeout_sec=0.01)
-            else:
-                # Stream-source path: no ROS callbacks to pump. Pace the loop
-                # so a cold start (no record yet) doesn't busy-wait a core.
-                time.sleep(self._time_step)
-            p = self._sam.positions
-            n = self._sam.class_names
-            if p is not None and n is not None:
-                if p and n:
-                    positions = p
-                    class_names = n
-                    delay = self._sam.delay or 0.0
-                    break
-                # Stale / empty publish — wait and retry
-                time.sleep(self._time_step)
+        # camera_debug already applied the camera→base transform, Z offsets, and
+        # v*delay back-projection. ``receipt_time`` is the moment for which the
+        # corrected positions are valid; the queue extrapolates forward from there.
+        detect_time = float(snapshot.get("receipt_time", time.time()))
+
+        # Project every existing tracked object (active target + queue) forward to
+        # ``detect_time``; a detection within ``eps`` of one is the SAME object.
+        existing: list[TrackedObject] = []
+        if active_target is not None:
+            existing.append(active_target)
+        existing.extend(queue._objects)
+        eps = self.eps
+
+        def _matches(obj: TrackedObject, det_x: float, det_y: float) -> bool:
+            ox = float(obj.T_grasp_base[0, 3])
+            oy = float(obj.T_grasp_base[1, 3] - v * (detect_time - obj.detect_time))
+            return abs(ox - det_x) < eps and abs(oy - det_y) < eps
+
+        added = 0
+        refreshed = 0
+        for d in detections:
+            base_aim = d.get("base_aim", [0.0, 0.0, 0.0])
+            base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
+            det_x = float(base_grasp[0])
+            det_y = float(base_grasp[1])
+            det_class = d.get("class", "?")
+            conf = float(d.get("confidence", -1.0))
+            match = next((o for o in existing if _matches(o, det_x, det_y)), None)
+            if match is not None:
+                # Re-anchor the existing track to this fresh detection instead of
+                # adding a duplicate. Resetting the extrapolation reference
+                # (detect_time + pose) every frame keeps drift below ``eps`` so a
+                # 2nd "object" never spawns at the same spot. Class kept as-is.
+                match.T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
+                match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
+                match.detect_time = detect_time
+                match.cam_pos = tuple(d.get("cam", [0.0, 0.0, 0.0]))
+                match.conf = conf
+                # Class is VOTED, not latched: add this frame's confidence-weighted
+                # vote and adopt the running argmax. The spawn frame is often the
+                # noisy entry-edge frame (low conf), so a PET that misfired as metal
+                # on spawn is corrected here once consistent higher-confidence
+                # transparent detections outweigh it — instead of being pushed
+                # forever. Log only the flip (no per-frame spam).
+                prev_class = match.class_name
+                voted = match.vote_class(det_class, conf)
+                if voted != prev_class:
+                    match.class_name = voted
+                    if logger is not None:
+                        logger.warn(
+                            f"[track-RECLASS] id={match.track_id} {prev_class} -> "
+                            f"{voted} (votes {_fmt_votes(match.class_votes)}; "
+                            f"det {det_class} conf={conf:.2f})"
+                        )
+                refreshed += 1
                 continue
-            self._sam.positions = None
-            self._sam.class_names = None
-
-        if positions is None or class_names is None:
-            return [], 0.0
-
-        candidates: list[GraspCandidate] = []
-        for pos, cls in zip(positions, class_names):
-            in_ws = self._in_workspace(pos)
-            T_aim, T_grasp = (None, None)
-            if in_ws:
-                T_aim, T_grasp = self._camera_to_grasp(pos)
-                candidates.append(
-                    GraspCandidate(
-                        T_aim=T_aim, T_grasp=T_grasp, class_name=cls,
-                        cam_pos=(float(pos[0]), float(pos[1]), float(pos[2])),
-                    )
+            new_obj = TrackedObject(
+                T_aim_base=_make_transform(_R_GRASP_DEFAULT, base_aim),
+                T_grasp_base=_make_transform(_R_GRASP_DEFAULT, base_grasp),
+                class_name=det_class,
+                detect_time=detect_time,
+                cam_pos=tuple(d.get("cam", [0.0, 0.0, 0.0])),
+                conf=conf,
+            )
+            # Seed the class vote with the spawn frame's confidence so a confident
+            # spawn class isn't flipped by one stray frame, but a low-confidence one
+            # (the usual misfire) is easily outvoted. class_name stays det_class here.
+            new_obj.vote_class(det_class, conf)
+            queue.add(new_obj)
+            existing.append(new_obj)  # dedupe within the same intake too
+            if logger is not None:
+                logger.info(
+                    f"[track-NEW] id={new_obj.track_id} class={new_obj.class_name} "
+                    f"x={det_x:+.3f} y={det_y:+.3f} conf={conf:.2f}"
                 )
+            added += 1
 
-            if self._log_raw and self._logger is not None:
-                cx, cy, cz = (float(pos[0]), float(pos[1]), float(pos[2]))
-                if in_ws and T_grasp is not None:
-                    bx, by, bz = (
-                        float(T_grasp[0, 3]),
-                        float(T_grasp[1, 3]),
-                        float(T_grasp[2, 3]),
-                    )
-                    self._logger.info(
-                        f"raw cam=[{cx:+.4f},{cy:+.4f},{cz:+.4f}] cls={cls}"
-                        f" -> base x={bx:+.3f} y={by:+.3f} z={bz:+.3f}"
-                        f" (delay {delay:.3f}s)"
-                    )
-                else:
-                    self._logger.info(
-                        f"raw cam=[{cx:+.4f},{cy:+.4f},{cz:+.4f}] cls={cls}"
-                        f" FILTERED (workspace) (delay {delay:.3f}s)"
-                    )
-        return candidates, delay
+        if added > 0 and logger is not None:
+            logger.info(
+                f"New frame — {added} new object(s) added, {refreshed} re-anchored "
+                f"(queue size: {len(queue._objects)}, belt {v:.3f} m/s)"
+            )
+        return added

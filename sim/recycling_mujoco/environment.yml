@@ -1,0 +1,16 @@
+name: iitp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - mujoco>=3.1
+      - numpy>=1.24
+      - scipy
+      - gymnasium>=0.29
+      - torch
+      - opencv-python>=4.8
+      - matplotlib>=3.7
+      - jupyterlab>=4.0
+      - ipykernel>=6.0

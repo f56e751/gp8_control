@@ -28,7 +28,13 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import qos_profile_sensor_data
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
-from motoros2_interfaces.srv import WriteSingleIO
+from motoros2_interfaces.srv import (
+    QueueTrajPoint,
+    ResetError,
+    StartPointQueueMode,
+    StartTrajMode,
+    WriteSingleIO,
+)
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 
@@ -50,6 +56,16 @@ class MockRobot(Node):
         self._joint_positions = [0.0, 0.0, 0.0, 0.0, -math.pi / 2, 0.0]
         self._joint_velocities = [0.0] * 6
         self._suction_on = False
+
+        # Point Queue Mode state (mirrors MotoROS2). Queued points are stored as
+        # (abs_exec_time, positions, velocities) and played back in real time by
+        # _drive_queue, so the app's wall-clock timing (eta, suction lead) stays
+        # meaningful. A fresh batch begins whenever the queue has drained or
+        # start_point_queue_mode clears it.
+        self._q_lock = threading.Lock()
+        self._q: list = []
+        self._batch_t0 = 0.0
+        self._queue_mode = False
 
         cb_group = ReentrantCallbackGroup()
 
@@ -82,10 +98,36 @@ class MockRobot(Node):
             callback_group=cb_group,
         )
 
+        # Point Queue Mode services — the path the app actually drives
+        # (pick/throw/push go through these, NOT the FJT action).
+        self.create_service(
+            StartPointQueueMode, "/start_point_queue_mode",
+            self._start_queue_cb, callback_group=cb_group,
+        )
+        self.create_service(
+            StartTrajMode, "/start_traj_mode",
+            self._start_traj_cb, callback_group=cb_group,
+        )
+        self.create_service(
+            Trigger, "/stop_traj_mode",
+            self._stop_traj_cb, callback_group=cb_group,
+        )
+        self.create_service(
+            ResetError, "/reset_error",
+            self._reset_error_cb, callback_group=cb_group,
+        )
+        self.create_service(
+            QueueTrajPoint, "/motoman_gp8_controller/queue_traj_point",
+            self._queue_point_cb, callback_group=cb_group,
+        )
+        # Play queued points back in real time (100 Hz).
+        self._q_timer = self.create_timer(0.01, self._drive_queue)
+
         self.get_logger().info(
             "Mock robot ready: /joint_states_urdf, "
             "/motoman_gp8_controller/follow_joint_trajectory, "
-            "/write_single_io, /robot_enable"
+            "/write_single_io, /robot_enable, point-queue mode "
+            "(/start_point_queue_mode, /motoman_gp8_controller/queue_traj_point, ...)"
         )
 
     # ------------------------------------------------------------------
@@ -180,6 +222,85 @@ class MockRobot(Node):
         response.success = True
         response.message = "Mock robot enabled"
         return response
+
+    # ------------------------------------------------------------------
+    # Point Queue Mode (the path the app actually uses for pick/throw/push)
+    # ------------------------------------------------------------------
+
+    def _start_queue_cb(self, request, response):
+        """start_point_queue_mode: enter queue mode, clear any stale points."""
+        with self._q_lock:
+            self._queue_mode = True
+            self._q = []
+            self._batch_t0 = time.time()
+        response.result_code.value = 1   # READY / SUCCESS
+        response.message = "queue mode ready"
+        return response
+
+    def _start_traj_cb(self, request, response):
+        """start_traj_mode: leave queue mode (used on shutdown)."""
+        with self._q_lock:
+            self._queue_mode = False
+            self._q = []
+        response.result_code.value = 1
+        response.message = "trajectory mode"
+        return response
+
+    def _stop_traj_cb(self, request, response):
+        """stop_traj_mode (Trigger): required before every mode switch."""
+        response.success = True
+        response.message = "stopped"
+        return response
+
+    def _reset_error_cb(self, request, response):
+        """reset_error: the app auto-calls this on recoverable alarms."""
+        response.result_code.value = 1
+        response.message = "cleared"
+        return response
+
+    def _queue_point_cb(self, request, response):
+        """queue_traj_point: append one waypoint to the playback queue.
+
+        time_from_start is per-batch-relative; a fresh batch begins whenever the
+        queue has drained, so the first point (time ~ 0, == current pose) is
+        rebased to start now.
+        """
+        now = time.time()
+        d = request.point.time_from_start
+        t = d.sec + d.nanosec * 1e-9
+        vel = list(request.point.velocities) if request.point.velocities else [0.0] * 6
+        with self._q_lock:
+            if (not self._q) or (now >= self._q[-1][0]):
+                self._batch_t0 = now
+                self._q = []
+            self._q.append((self._batch_t0 + t, list(request.point.positions), vel))
+        response.result_code.value = 1   # SUCCESS (never BUSY in the mock)
+        response.message = "queued"
+        return response
+
+    def _drive_queue(self) -> None:
+        """Interpolate joint positions along the queued points in real time."""
+        now = time.time()
+        with self._q_lock:
+            q = self._q
+            if not q:
+                return
+            if now <= q[0][0]:
+                pos = q[0][1]
+            elif now >= q[-1][0]:
+                pos = q[-1][1]            # hold final pose until the next batch
+            else:
+                pos = q[-1][1]
+                for i in range(len(q) - 1):
+                    t0, p0, _ = q[i]
+                    t1, p1, _ = q[i + 1]
+                    if t0 <= now <= t1:
+                        a = (now - t0) / max(1e-6, t1 - t0)
+                        pos = [p0[j] + a * (p1[j] - p0[j]) for j in range(len(p0))]
+                        break
+        with self._lock:
+            self._joint_positions = list(pos)
+            self._joint_velocities = [0.0] * 6
 
 
 def main():
