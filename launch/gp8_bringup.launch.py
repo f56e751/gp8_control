@@ -92,15 +92,21 @@ def generate_launch_description():
         "robot_ip", default_value="192.168.255.1",
         description="Yaskawa controller IP address",
     )
+    # NOTE: app default set to FULL speed (factor 1.0) per operator request. The
+    # 1.0 velocity ceiling + comm-loss stopping (3.4 cm EE @ ~1 m/s) + throw/push
+    # motion paths were validated this session, BUT the graduated §4.3 drill set
+    # (E-stop mid-move + comm-loss) was NOT run at every step 0.5/0.75/1.0, and
+    # suction (TCP 50242) + throw release-timing calibration are still pending.
+    # Override to go slow:  axis_increment_factor:=0.1 axis_acceleration_factor:=0.01
     inc_factor_arg = DeclareLaunchArgument(
-        "axis_increment_factor", default_value="0.1",
-        description="Per-cycle increment (velocity) factor [0..1]. LOW commissioning "
-                    "default; raise only via DEPLOYMENT.md §4.4 after the drills pass.",
+        "axis_increment_factor", default_value="1.0",
+        description="Per-cycle increment (velocity) factor [0..1]. Default FULL speed (1.0) "
+                    "per operator request; pass 0.1 to fall back to LOW commissioning speed.",
     )
     acc_factor_arg = DeclareLaunchArgument(
-        "axis_acceleration_factor", default_value="0.01",
-        description="Per-cycle acceleration factor [0..1]. LOW commissioning default "
-                    "(hardware-validated up to 0.02; higher unneeded — throw needs ~0.005).",
+        "axis_acceleration_factor", default_value="0.02",
+        description="Per-cycle acceleration factor [0..1]. 0.02 = hardware-validated max "
+                    "(sync-fix holds); throw needs only ~0.005, so this is ample headroom.",
     )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
