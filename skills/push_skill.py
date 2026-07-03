@@ -152,11 +152,11 @@ class PushSkill(ManipulationSkill):
       2. **WAITING** — ``wait_for_arrival_and_suction`` blocks until the object
          arrives.  (Suction fires but is immediately turned off since push is
          contact-based.)
-      3. **PUSHING** — re-enter queue mode, compute push target, dispatch the
-         descent + push stroke + chain trajectory.
+      3. **PUSHING** — compute push target, dispatch the descent + push stroke +
+         chain trajectory. (adv4ncr 250Hz stream: no queue mode to re-enter.)
 
-    Public planning/build methods mirror ``ThrowSkill`` so external code
-    (e.g. the legacy moving strategy in ``app.py``) can reuse push logic.
+    Public planning/build methods mirror ``ThrowSkill`` so external code can
+    reuse push logic.
     """
 
     name = "push"
@@ -177,14 +177,14 @@ class PushSkill(ManipulationSkill):
 
         Push has NO suction to forgive a late hit (unlike throw, whose object is
         already cup-held), so this lead must equal the FULL post-wait latency —
-        queue re-entry + scan + dispatch + the stroke's retreat->contact pre-travel
-        — NOT throw's small forgiving base (cfg.ACTION_START_LEAD). Empirically
-        ~0.8 s on hardware (feature/push, which timed correctly); the merge cut it
-        to throw's 0.2 s and push started hitting behind the object. That 0.8
-        ALREADY includes the retreat pre-travel, so it is NOT composed on top of
-        the base (no double-count). If the merge's extra scan_next_intercept still
-        leaves the hit trailing, bump FIXED_DELAY_PUSH or move the scan off the
-        contact path.
+        scan + dispatch + the stroke's retreat->contact pre-travel — NOT throw's
+        small forgiving base (cfg.ACTION_START_LEAD). Empirically ~0.8 s on hardware
+        (feature/push, which timed correctly); the merge cut it to throw's 0.2 s and
+        push started hitting behind the object. That 0.8 ALREADY includes the retreat
+        pre-travel, so it is NOT composed on top of the base (no double-count).
+        (adv4ncr stream: the old ~0.4 s point-queue re-entry that 0.8 partly covered
+        is gone — HW-recalibrate FIXED_DELAY_PUSH.) If the hit still trails, bump
+        FIXED_DELAY_PUSH or move the scan off the contact path.
         """
         return FIXED_DELAY_PUSH
 
@@ -196,22 +196,24 @@ class PushSkill(ManipulationSkill):
         not where the bare positioning estimate lands. The real budget from "arm
         starts moving" to "stroke contacts the object" is::
 
-            T_setup#1 (enter_queue_mode before POSITIONING, push_skill.py:262)
+            T_setup#1 (dispatch before POSITIONING)
           + T_position (move_through_via: rise to aim hover + descend to retreat)
-          + T_setup#2 (enter_queue_mode before the stroke, push_skill.py:292)
+          + T_setup#2 (dispatch before the stroke)
           + T_contact_offset (stroke travels grasp_retreat -> contact line)
 
-        The two queue re-entries (~0.4 s EACH) and the retreat->contact pre-travel
-        are exactly what the old ``move_time * factor`` omitted — why the arm aimed
-        upstream of where the can actually was and struck the next object. T_setup
-        is the controller's MEASURED rolling average; T_position is opt_time scaled
-        by OPT_TIME_TO_REAL; T_contact_offset = PUSH_RETREAT_DISTANCE / PUSH_SPEED.
+        The dispatch overhead and the retreat->contact pre-travel are exactly what
+        the old ``move_time * factor`` omitted — why the arm aimed upstream of where
+        the can actually was and struck the next object. On the adv4ncr 250Hz stream
+        driver the old ~0.4 s point-queue re-entry is gone, so T_setup is now just the
+        per-dispatch overhead (``qmode_ms_avg``, ~tens of ms) — HW-calibrate; the 2x
+        conservatively budgets the positioning + stroke dispatches. T_position is
+        opt_time scaled by OPT_TIME_TO_REAL; T_contact_offset = PUSH_RETREAT_DISTANCE / PUSH_SPEED.
         """
         ctx = self.ctx
-        t_setup = ctx.traj_ctrl.qmode_ms_avg / 1000.0          # one queue re-entry (measured)
+        t_setup = ctx.traj_ctrl.qmode_ms_avg / 1000.0          # per-dispatch overhead (stream)
         t_position = move_time * ctx.cfg.OPT_TIME_TO_REAL
         t_pre_travel = PUSH_RETREAT_DISTANCE / max(PUSH_SPEED, 1e-6)
-        return 2.0 * t_setup + t_position + t_pre_travel        # setup#1 + setup#2
+        return 2.0 * t_setup + t_position + t_pre_travel        # dispatch(pos) + dispatch(stroke)
 
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
@@ -219,15 +221,15 @@ class PushSkill(ManipulationSkill):
     def execute(self, request: "PickRequest") -> SkillResult:
         """Pre-position (with retreat), wait for arrival, then push.
 
-        Follows the same flow as ``ThrowSkill.execute``:
+        Follows the same flow as ``ThrowSkill.execute`` (adv4ncr 250Hz stream —
+        no point-queue mode to (re)enter):
 
-        1. ``enter_queue_mode`` → ``move_through(current, aim, wait_joint)``
-           (POSITIONING).  ``wait_joint`` is the retreat pose — offset
-           behind T_grasp opposite to the push direction, at aim height.
+        1. ``move_through(current, aim, wait_joint)`` (POSITIONING). ``wait_joint``
+           is the retreat pose — offset behind T_grasp opposite to the push
+           direction, at aim height.
         2. ``wait_for_arrival_and_suction`` (WAITING) — blocks until the
            object reaches the intercept line.
-        3. ``enter_queue_mode`` → dispatch descent + push stroke + chain
-           trajectory (PUSHING).
+        3. Dispatch descent + push stroke + chain trajectory (PUSHING).
         4. Cleanup.
         """
         ctx = self.ctx
@@ -299,9 +301,9 @@ class PushSkill(ManipulationSkill):
         # ---- 2. WAITING: block until the object arrives ----
         # End the wait arrival_lead() s before arrival. Push has no suction to
         # forgive a late hit, so the lead must equal the FULL post-wait latency
-        # (queue re-entry + scan + dispatch + stroke retreat->contact pre-travel) —
-        # ~0.8 s (FIXED_DELAY_PUSH), NOT throw's small forgiving base. See
-        # PushSkill.arrival_lead().
+        # (scan + dispatch + stroke retreat->contact pre-travel) — ~0.8 s
+        # (FIXED_DELAY_PUSH, HW-recalibrate for stream), NOT throw's small forgiving
+        # base. See PushSkill.arrival_lead().
         ctx.set_status("WAITING", target.class_name)
         ctx.wait_for_arrival(target, T_grasp[1, 3], offset=self.arrival_lead())
 

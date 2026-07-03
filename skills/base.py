@@ -70,11 +70,12 @@ class ManipulationSkill(ABC):
         """Seconds before the object's predicted arrival to END the WAITING block.
 
         The wait helpers (``ctx.position_and_prime`` / ``ctx.wait_for_arrival``)
-        stop ``arrival_lead()`` seconds early so the post-wait queue-mode re-entry
-        + trajectory dispatch overlap the object's final approach and the action
-        lands ON arrival. Default: the shared
-        :attr:`~gp8_control.app.Config.ACTION_START_LEAD` budget (queue re-entry +
-        dispatch) common to all skills. Override to ADD a skill-specific lead —
+        stop ``arrival_lead()`` seconds early so the post-wait trajectory dispatch
+        overlaps the object's final approach and the action lands ON arrival.
+        Default: the shared
+        :attr:`~gp8_control.config.Config.ACTION_START_LEAD` dispatch budget common
+        to all skills (adv4ncr 250Hz stream: ~10-20 ms; the old ~0.4 s point-queue
+        re-entry is gone). Override to ADD a skill-specific lead —
         mirrors :meth:`can_handle` / :meth:`idle_target` (base default + per-skill
         override). E.g. push waits BEHIND the contact line, so it overrides this to
         add its stroke's retreat->contact pre-travel.
