@@ -78,6 +78,9 @@ setup(
             "measure_fjt_floor = gp8_control.tests.measure_fjt_floor:main",
             # Same, via the QUEUE path (re-entry + per-point push + startup).
             "measure_queue_floor = gp8_control.tests.measure_queue_floor:main",
+            # Standalone keyboard suction toggle for the adv4ncr driver (TCP 50242
+            # Simple Message IoServer; no ROS service needed). Run supervised.
+            "suction_keys = gp8_control.tests.suction_keys:main",
         ],
     },
 )
