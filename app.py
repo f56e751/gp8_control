@@ -349,26 +349,9 @@ class GP8App:
         caught anywhere in the workspace before it passes the downstream reach
         edge. ``None`` is the only drop reason. Returns a ``PickRequest`` for the
         first catchable head, or ``None`` if none is catchable this epoch. The
-        selected head is popped and recorded as the active target. If the prior
-        throw committed a return object, that commitment is honored directly (no
-        re-scan / re-judgment) via ``_committed_pick_request``.
+        selected head is popped and recorded as the active target.
         """
         v = self.conveyor.current
-        # The object the prior throw's return swing committed to. The chain
-        # ALREADY judged it catchable — once, in scan_next_intercept, gated on
-        # throw_time + move_time — and flew the arm to its grasp. Picking and
-        # throwing that object is ONE committed set, so use it DIRECTLY: no
-        # re-scan, no second feasibility judgment. (Re-judging the same camera
-        # data would only let "catchable" flip to "not" for no real reason.) If
-        # the grab later misses, that's a timing-calibration problem, not a
-        # reason to re-decide the target here.
-        committed = self.ctx.committed_next if self.ctx is not None else None
-        committed_it = self.ctx.committed_intercept if self.ctx is not None else None
-        if self.ctx is not None:
-            self.ctx.committed_next = None
-            self.ctx.committed_intercept = None
-        if committed is not None and committed_it is not None:
-            return self._committed_pick_request(committed, committed_it, current_joint)
 
         # Walk from the head (most downstream = most urgent). Take the FIRST object
         # the arm can still catch in its workspace: earliest_reachable_intercept
@@ -421,45 +404,6 @@ class GP8App:
             aim_joint=target_it.aim_joint,
             grasp_joint=target_it.grasp_joint,
             secondary=secondary,
-            # Fresh-scan path (no commitment) — always drives.
-            prepositioned=False,
-        )
-
-    def _committed_pick_request(
-        self, obj: TrackedObject, it: "Intercept", current_joint: np.ndarray
-    ) -> PickRequest:
-        """Build the PickRequest for the throw's committed return object directly,
-        REUSING the intercept ``scan_next_intercept`` already computed for it.
-
-        The catchable judgment + dynamic intercept Y were decided ONCE at commit
-        time and the return swing parked the arm at ``it.grasp_joint``; we reuse
-        ``it`` verbatim — no re-scan, no re-judgment, no recompute, so the parked
-        pose and the pick pose are identical. ``prepositioned=True`` so the pick
-        skips the re-drive / mode-stop.
-        """
-        # Drop it from the queue (it stays the active target); the next front
-        # object becomes the throw's secondary (post-throw chain target).
-        # Remove by IDENTITY, not ==: TrackedObject is a dataclass with numpy
-        # fields, so `obj in list` / `list.remove(obj)` invoke __eq__ → numpy
-        # array truth-value is ambiguous → epoch crash whenever the committed
-        # object isn't the first element compared. Filter by `is` instead.
-        self.queue._objects = [o for o in self.queue._objects if o is not obj]
-        secondary = self.queue.head() if self.queue else None
-        self._active_target = obj
-        self._node.get_logger().info(
-            f"Committed pick: id={obj.track_id} {obj.class_name} (conf {obj.conf:.2f}) "
-            f"@ x={float(it.T_grasp[0, 3]):+.3f} "
-            f"y={it.intercept_y:+.3f} (prepositioned; reusing chain's judgment)"
-        )
-        return PickRequest(
-            target=obj,
-            current_joint=current_joint,
-            T_aim=it.T_aim,
-            T_grasp=it.T_grasp,
-            aim_joint=it.aim_joint,
-            grasp_joint=it.grasp_joint,
-            secondary=secondary,
-            prepositioned=True,
         )
 
     # ------------------------------------------------------------------
@@ -546,21 +490,6 @@ class GP8App:
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
-    def _release_orphan_suction(self) -> None:
-        """Release a return-primed suction that no pick will consume this epoch.
-
-        The throw's return (chain) primes the NEXT pick's vacuum speculatively;
-        only that pick's throw release turns it off. If the pick does not happen
-        (object passed during the throw, queue drained, none feasible), the
-        vacuum would otherwise run indefinitely — turn it off here.
-        """
-        if self.ctx is not None and self.ctx.suction_primed_for_pick:
-            self._node.get_logger().info(
-                "No pick this epoch — releasing orphaned primed suction."
-            )
-            self.traj_ctrl.suction_off()
-            self.ctx.suction_primed_for_pick = False
-
     def run_epoch(self, epoch: int) -> None:
         # The background MTE keeps joint_states / detections / conveyor fresh
         # continuously now (no per-epoch spin). Yield briefly so idle epochs
@@ -582,7 +511,6 @@ class GP8App:
         self.queue.update(now, self.conveyor.current)
         if not self.queue:
             self.frame_gate.reset()
-            self._release_orphan_suction()
             time.sleep(self.cfg.TIME_STEP)
             return
 
@@ -601,10 +529,6 @@ class GP8App:
             # diagnostic motion CSV (no-op unless GP8_MOTION_LOG_DIR is set).
             self.traj_ctrl.set_motion_op(skill.name)
             skill.execute(request)
-        else:
-            # No feasible pick this epoch — don't leave a return-primed
-            # vacuum running with nothing to turn it off.
-            self._release_orphan_suction()
 
     def run(self) -> None:
         self.setup()

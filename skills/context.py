@@ -43,10 +43,6 @@ class PickRequest:
     aim_joint: np.ndarray
     grasp_joint: np.ndarray
     secondary: "Optional[TrackedObject]" = None
-    # True when this object IS the previous throw's committed return target — the
-    # swing already streamed the arm to its grasp pose, so the pick must not re-drive
-    # (it is already there); just wait + grab.
-    prepositioned: bool = False
 
 
 # Fixed-point convergence for earliest_reachable_intercept (intercept-Y <-> move-time
@@ -117,19 +113,6 @@ class SkillContext:
     # motion) keeps the return folded into each skill's single chained trajectory,
     # so no extra dispatch (which would chop the swing).
     idle_joint: np.ndarray
-    # Set True by the prior throw's return (chain) when it already primed the
-    # NEXT pick's suction (vacuum ON). The upcoming pick then must NOT re-prime
-    # or clear it; it is reset to False once that pick consumes it.
-    suction_primed_for_pick: bool = False
-    # The object the throw's return swing was committed to (sent to its intercept).
-    # The next selection marks its request ``prepositioned`` iff it picks THIS same
-    # object — so "already at the grasp" is decided by object identity, not a
-    # distance guess. Consumed (cleared) by the next selection.
-    committed_next: "Optional[TrackedObject]" = None
-    # The dynamic intercept (Y + grasp/aim poses + joints) chosen for ``committed_next``
-    # at commit time. The catchable judgment is made ONCE here; the next selection
-    # REUSES this instead of recomputing, so the parked pose and the pick pose agree.
-    committed_intercept: "Optional[Intercept]" = None
 
     @property
     def log(self):
@@ -379,7 +362,6 @@ class SkillContext:
         grasp_joint: np.ndarray,
         target: "TrackedObject",
         intercept_y: float,
-        skip_move: bool = False,
         start_lead: "Optional[float]" = None,
     ) -> bool:
         """Drive to the grasp pose, priming suction SUCTION_LEAD before arrival.
@@ -395,11 +377,6 @@ class SkillContext:
         how long positioning takes, so a borderline pick keeps its lead. Returns
         once the object has reached the intercept (caller then lifts/throws).
         """
-        # If the prior throw's return (chain) already primed THIS object's
-        # suction (vacuum ON), don't re-prime — just drive to grasp and wait.
-        already_primed = self.suction_primed_for_pick
-        self.suction_primed_for_pick = False
-
         now = time.time()
         v = self.conveyor.current
         obj_y = self.object_y_now(target, now, v)
@@ -407,37 +384,24 @@ class SkillContext:
         t_arrival = now + eta
         t_suction = t_arrival - self.cfg.SUCTION_LEAD     # absolute; may be <= now
         self.log.info(
-            f"Ambush: {'suction PRE-primed on return; ' if already_primed else ''}"
-            f"prime {self.cfg.SUCTION_LEAD:.2f}s before arrival, arrival/lift in "
-            f"{eta:.2f}s (dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s)"
+            f"Ambush: prime {self.cfg.SUCTION_LEAD:.2f}s before arrival, arrival/lift "
+            f"in {eta:.2f}s (dist {obj_y - intercept_y:.3f} m / belt {v:.3f} m/s)"
         )
 
         zero = np.zeros_like(self.M1)
-        if skip_move:
-            # Arm already AT the grasp pose (the return swing parked it here) — no
-            # drive, no mode switch. Just prime (if not already on) and wait, so
-            # the return swing flows straight into the grab without a bobble.
-            if not already_primed:
-                self.sleep_until(t_suction)
-                self.traj_ctrl.suction_on()
-        else:
-            traj, vel, ts = trajectory(
-                current_joint, zero, grasp_joint, zero,
-                self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
-            )
-            if already_primed:
-                # Vacuum already on (primed during the return chain) — just drive in.
-                self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
-            else:
-                # Fire suction the instant t_suction passes — mid-move when the
-                # object is already within SUCTION_LEAD by the time we get there.
-                fired = self.traj_ctrl.send_trajectory_queue_timed_suction(
-                    traj, vel, ts, final_joint=grasp_joint, suction_on_at=t_suction,
-                )
-                if not fired:
-                    # t_suction still ahead -> park until it, then prime.
-                    self.sleep_until(t_suction)
-                    self.traj_ctrl.suction_on()
+        traj, vel, ts = trajectory(
+            current_joint, zero, grasp_joint, zero,
+            self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
+        )
+        # Fire suction the instant t_suction passes — mid-move when the object is
+        # already within SUCTION_LEAD by the time we get there.
+        fired = self.traj_ctrl.send_trajectory_queue_timed_suction(
+            traj, vel, ts, final_joint=grasp_joint, suction_on_at=t_suction,
+        )
+        if not fired:
+            # t_suction still ahead -> park until it, then prime.
+            self.sleep_until(t_suction)
+            self.traj_ctrl.suction_on()
         self.set_status("WAITING", getattr(target, "class_name", ""))
         # End the wait `start_lead` s before predicted arrival so the post-wait
         # trajectory dispatch overlaps the object's final approach and the lift lands
@@ -468,85 +432,3 @@ class SkillContext:
         q = np.asarray(q, dtype=float)
         q[-1] = 0.0
         return q
-
-    def scan_next_intercept(
-        self, from_joint: np.ndarray, throw_time: float,
-    ) -> "tuple[Optional[np.ndarray], Optional[float]]":
-        """Re-poll the queue for the next object the pick will ACTUALLY complete,
-        and the absolute wall-clock instant to prime its suction.
-
-        Uses the SAME feasibility gate as ``_select_ambush_target`` so the throw's
-        return (chain) only commits to — and primes — an object the next pick can
-        finish: the arm must reach that intercept before the object arrives. The
-        arm gets there only after it finishes the current throw, so the gate adds
-        ``throw_time``; ``opt_time`` over-estimates the move ~2x so it is scaled
-        by PICK_FEASIBILITY_FACTOR:
-
-            feasible iff  eta >= throw_time + move_time * factor
-
-        This is what makes "went there => will pick it" hold: without it the chain
-        flies to an intercept the pick gate then rejects (= "went but never
-        picked"). ``from_joint`` is the move-estimate reference (the current
-        pick's grasp, where the swing lifts from). Returns
-        ``(next_intercept_joint, suction_on_at)`` for the first feasible object,
-        else ``(None, None)`` — then the throw just returns to the current
-        intercept and the next pick is chosen fresh. ``suction_on_at`` =
-        (that object's arrival - SUCTION_LEAD), primed during the chain.
-        """
-        now = time.time()
-        v = self.conveyor.current if self.conveyor is not None else 0.0
-        self.queue.update(now, v)
-        # Walk from the head (most downstream = most urgent) and commit to the
-        # FIRST object the next pick can actually complete. earliest_reachable_intercept
-        # does the same dynamic-Y feasibility as _select_ambush_target, but with
-        # pre_delay=throw_time (the arm only starts moving after this throw finishes),
-        # so "catchable" already accounts for the throw + move. The chosen intercept
-        # is judged ONCE here and stored (committed_intercept) for the next selection
-        # to reuse — no re-judgment.
-        for cand in list(self.queue._objects):
-            # GATE BEFORE judging catchability: if the most-downstream remaining
-            # candidate routes to a DIFFERENT skill (e.g. a can -> push), STOP the
-            # chain here. This must come BEFORE the catchability test: judging the can
-            # with its (larger) push budget + pre_delay=throw_time can mark it
-            # uncatchable-after-throw and `continue` PAST it, committing an upstream
-            # PET — which then bypasses the can next epoch via the committed path and
-            # STARVES it, even though the IMMEDIATE pick (pre_delay=0) might still
-            # catch it. Stopping first guarantees the can is re-evaluated fresh next
-            # epoch. (This chain only ever pre-positions a THROW grasp; a non-throw
-            # next does its OWN skill's approach fresh — one set per skill.)
-            if self.skill_for(cand) != "throw":
-                self.log.info(
-                    f"Chain stop: next id={cand.track_id} {cand.class_name} routes to "
-                    f"'{self.skill_for(cand)}', not throw — no throw pre-position"
-                )
-                return None, None
-            # cand routes to throw here; judge catchability with its timeline (== the
-            # legacy budget, since throw doesn't override t_to_contact).
-            cand_skill = self.skill_obj_for(cand)
-            it = self.earliest_reachable_intercept(
-                cand, from_joint, v, now, pre_delay=throw_time,
-                t_to_contact_fn=cand_skill.t_to_contact,
-            )
-            if it is None:
-                self.log.info(
-                    f"Chain skip id={cand.track_id} {cand.class_name}: not catchable "
-                    f"after throw ({throw_time:.2f}s) + move"
-                )
-                continue
-            # Prime the NEXT object's suction during the return CHAIN, NEVER during
-            # this throw. Catching the next object upstream (+y_b) makes its eta
-            # small, which would otherwise fire the prime mid-throw and RE-GRAB the
-            # object we just released (it'd be carried to the next pick). Clamp to
-            # >= throw end so the prime always lands after the release, on the chain.
-            suction_on_at = max(
-                now + it.eta - self.cfg.SUCTION_LEAD, now + throw_time,
-            )
-            self.committed_next = cand
-            self.committed_intercept = it
-            self.log.info(
-                f"Chain target: id={cand.track_id} {cand.class_name} at "
-                f"x={float(it.T_grasp[0, 3]):+.3f} y={it.intercept_y:+.3f} "
-                f"(prime in {max(0.0, suction_on_at - now):.2f}s, arrival {it.eta:.2f}s)"
-            )
-            return it.grasp_joint, suction_on_at
-        return None, None

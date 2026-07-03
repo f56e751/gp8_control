@@ -19,7 +19,6 @@ Trajectory segments (all concatenated into one dispatch):
 Shared primitives live on ``self.ctx`` (a ``SkillContext``):
   * ``ctx.robot`` (FK/IK), ``ctx.traj_ctrl``, ``ctx.M1``/``ctx.M2``, ``ctx.cfg``
   * ``ctx.move_through`` / ``ctx.wait_for_arrival``
-  * ``ctx.scan_next_intercept``
   * ``ctx.set_status(status, detail)``, ``ctx.set_active_target(None)``
 """
 
@@ -346,42 +345,13 @@ class PushSkill(ManipulationSkill):
         # Per-class stroke distance (falls back to PUSH_DISTANCE).
         push_distance = PUSH_DISTANCE_MAP.get(target.class_name, PUSH_DISTANCE)
 
-        # Chain: pre-position the NEXT object ONLY when it is a THROW pick.
-        # scan_next_intercept returns (grasp_joint, _) and commits the object iff
-        # the next routes to throw; a push/none next -> (None, None). When
-        # throw-next, the stroke chains straight to that grasp and the committed
-        # throw primes suction THERE next cycle — so a throw after a push no longer
-        # cold-starts from push_end and fires suction mid-transit ("suction at the
-        # floor"). push_time is the stroke duration the arm is busy BEFORE the chain
-        # move starts (the gate's pre_delay).
-        push_time = push_distance / PUSH_SPEED
-        # Estimate the chain move from the arm's ACTUAL departure pose — the stroke
-        # END (push_end, near the bin) — NOT grasp_retreat. push_end sits
-        # ~push_distance farther toward the bin, so estimating the haul back to the
-        # next pick from grasp_retreat UNDER-counted it: the arm then arrived LATE
-        # and the throw after a push slid back (timing "밀림"). earliest_reachable_-
-        # intercept uses from_joint only for the move-time estimate (the grasp/aim
-        # poses come from the object), so this just makes that estimate honest;
-        # the committed intercept Y is then chosen for when the arm REALLY arrives.
-        # IK the push_end pose; fall back to grasp_retreat if IK fails.
-        T_push_end = self._push_end_pose(T_grasp_retreat, T_aim2, push_distance)
-        push_end_q = ctx.robot.inverse_kinematics(T_push_end, q_init=grasp_retreat_joint)
-        from_joint = (
-            np.asarray(push_end_q, dtype=float)
-            if push_end_q is not None else grasp_retreat_joint
-        )
-        next_intercept_joint, _ = ctx.scan_next_intercept(from_joint, push_time)
-
         # Build & dispatch: STROKE ONLY (append_descent=False) — the arm already
-        # descended to grasp_retreat during POSITIONING and waited there. ALWAYS
-        # append a chain (one queued trajectory, same as ThrowSkill): to the next
-        # throw's grasp when there is one, else to the shared idle/standby pose
-        # (build_push_trajectory's fallback) so the arm parks HIGH instead of low
-        # at push_end — which is what made the next throw cold-start by sweeping
-        # the belt up from the bin.
+        # descended to grasp_retreat during POSITIONING and waited there. Append a
+        # chain to a safe lifted-standby / idle park (uniform flow: the next pick is
+        # selected + driven fresh next epoch, no cross-object pre-position) so the arm
+        # parks HIGH instead of low at push_end.
         self.build_push_trajectory(
             grasp_retreat_joint, grasp_retreat_joint, T_grasp_retreat, T_aim2, theta,
-            next_intercept_joint=next_intercept_joint,
             append_chain=True,
             append_descent=False, push_distance=push_distance,
         )
@@ -516,7 +486,6 @@ class PushSkill(ManipulationSkill):
         T_grasp: np.ndarray,
         T_aim2: np.ndarray,
         theta: float,
-        next_intercept_joint: "Optional[np.ndarray]" = None,
         append_chain: bool = True,
         append_descent: bool = True,
         push_distance: float = PUSH_DISTANCE,
@@ -646,23 +615,16 @@ class PushSkill(ManipulationSkill):
             # standby — push_end raised to home Z, so the arm clears the belt without
             # the wasted home round-trip. copy() so ctx.idle_joint is never mutated
             # by the wrist write below.
-            if next_intercept_joint is not None:
-                chain_target = np.asarray(next_intercept_joint, dtype=float)
-                chain_dest = "next intercept"
-            elif not ctx.queue:
+            if not ctx.queue:
                 chain_target = self.idle_target().copy()
                 chain_dest = "home/idle (queue empty)"
             else:
                 chain_target = ctx.lifted_standby_joint(push_end_q)
-                chain_dest = "lifted standby (uncommitted next)"
-            # Wrist (joint 6) at the chain end = 0 either way:
-            #  - throw next: the throw arc starts with joint 6 = 0 (ThrowSkill
-            #    zeroes it), and the committed throw uses skip_move so it does NOT
-            #    re-orient the wrist — parking the chain anywhere else would flip
-            #    joint 6 on the throw's first segment -> Yaskawa alarm 4414.
-            #  - idle: the standby pose already has joint 6 = 0.
+                chain_dest = "lifted standby"
+            # Wrist (joint 6) at the chain end = 0 (the standby/idle pose already has
+            # joint 6 = 0; parking it elsewhere would flip joint 6 -> Yaskawa alarm 4414).
             chain_target[5] = 0.0
-            chained_to_next = next_intercept_joint is not None
+            chained_to_next = False
 
             traj_chain, vel_chain, ts_chain = trajectory(
                 push_end_q, push_end_dq,
@@ -868,30 +830,6 @@ class PushSkill(ManipulationSkill):
         cb, sb = np.cos(-PUSH_JOINT6_ANGLE), np.sin(-PUSH_JOINT6_ANGLE)
         side, facing = cb * side + sb * facing, -sb * side + cb * facing
         return np.column_stack((approach, side, facing))
-
-    def _push_end_pose(
-        self,
-        T_grasp_retreat: np.ndarray,
-        T_aim2: np.ndarray,
-        push_distance: float,
-    ) -> np.ndarray:
-        """Cartesian pose where the push stroke ENDS — the arm's actual departure
-        point for the chain to the next pick.
-
-        Mirrors the LAST waypoint of :meth:`_build_push_stroke`: the stroke start
-        (``T_grasp_retreat``) advanced ``push_distance`` along the push direction,
-        at ``PUSH_HEIGHT``, with the stroke-end swing orientation. execute() IKs
-        this and feeds it to ``scan_next_intercept`` as the move-time reference, so
-        the chain travel is estimated from push_end (where the arm really leaves
-        from) instead of grasp_retreat (~push_distance too close to the bin).
-        """
-        push_dir = self._compute_push_direction(T_grasp_retreat, T_aim2)
-        T_end = T_grasp_retreat.copy()
-        T_end[:3, :3] = self._push_orientation(push_dir, self._swing_at(1.0))
-        T_end[0, 3] += push_distance * push_dir[0]
-        T_end[1, 3] += push_distance * push_dir[1]
-        T_end[2, 3] = PUSH_HEIGHT
-        return T_end
 
     def _build_push_stroke(
         self,

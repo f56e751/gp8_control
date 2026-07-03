@@ -95,28 +95,14 @@ class ThrowSkill(ManipulationSkill):
             )
             mode = PickWaitMode.WAIT_AT_GRASP
 
-        # Start clean — but NOT if the prior throw's return already primed this
-        # pick's suction (vacuum intentionally ON); clearing it would re-open the
-        # back-to-back blind gap we just closed.
-        if not ctx.suction_primed_for_pick:
-            ctx.traj_ctrl.suction_off()
+        # Start clean (uniform per-object flow: no cross-cycle suction hand-off).
+        ctx.traj_ctrl.suction_off()
 
-        # Is this object the previous throw's committed return target? If so the
-        # return swing already streamed the arm to its grasp pose, so we must NOT
-        # re-drive (same spot) — just wait + grab. Only drive when the arm actually
-        # needs to move there (first pick, a different object). Decided by object
-        # identity upstream (PickRequest.prepositioned), not a distance guess.
-        # (adv4ncr 250Hz stream: there is no point-queue mode to (re)enter, so the
-        # old ~0.4s re-entry and the persistent-queue workaround it needed are gone.)
-        prepositioned = request.prepositioned
-
-        # WAIT_AT_GRASP: drive to the grasp pose (unless already there) and prime
-        # suction SUCTION_LEAD before the object's arrival. Returns once the
-        # object has reached the intercept.
+        # WAIT_AT_GRASP: drive to the grasp pose and prime suction SUCTION_LEAD before
+        # the object's arrival. Returns once the object has reached the intercept.
         ctx.set_status("POSITIONING", target.class_name)
         ctx.position_and_prime(
             current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
-            skip_move=prepositioned,
             start_lead=self.arrival_lead(),
         )
 
@@ -153,31 +139,12 @@ class ThrowSkill(ManipulationSkill):
             aim_joint2, T_aim2 = aim_joint, T_aim
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
-        # Decode the throw first so the chain selection below knows how long the
-        # swing takes (the arm can't start chaining to the next object until the
-        # throw finishes).
         params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
-
-        # Chain target for the throw's post-release motion: the next object the
-        # pick will ACTUALLY complete — same feasibility gate as the main pick,
-        # plus the throw_time the arm must finish first. So the arm only flies to
-        # an intercept it will then pick (no "went there but never picked"), and
-        # ``next_suction_at`` primes THAT object's vacuum during the return chain.
-        next_intercept_joint, next_suction_at = ctx.scan_next_intercept(
-            grasp_joint, float(params.T),
-        )
-        primed_next = self.build_throw_trajectory(
-            grasp_joint, aim_joint2, params,
-            next_intercept_joint=next_intercept_joint,
-            next_suction_at=next_suction_at,
-        )
-        # If the return chain primed the next pick's suction (vacuum ON), hand
-        # that off to the next cycle instead of clearing it. Otherwise it's a
-        # safety release in case the throw push failed with suction still on.
-        if primed_next:
-            ctx.suction_primed_for_pick = True
-        else:
-            ctx.traj_ctrl.suction_off()
+        # Throw, then chain the follow-through to a safe lifted-standby / idle park.
+        # (Uniform flow: the next pick is selected + driven fresh next epoch — no
+        # cross-object pre-position, so throw<->push handoffs stay symmetric.)
+        self.build_throw_trajectory(grasp_joint, aim_joint2, params)
+        ctx.traj_ctrl.suction_off()   # release the object after the throw
         self._log_throw_cycle(target)
         ctx.set_active_target(None)
         ctx.set_status("IDLE", "")
@@ -230,27 +197,17 @@ class ThrowSkill(ManipulationSkill):
         grasp_joint: np.ndarray,
         aim_joint2: np.ndarray,
         params,
-        next_intercept_joint: "Optional[np.ndarray]" = None,
-        next_suction_at: "Optional[float]" = None,
-    ) -> bool:
+    ) -> None:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
         The NN throw arc (grasp → release → aim_joint2) is generated and
         velocity-clamped exactly as the trained swing, so the motion UP TO the
         release sample is identical to the original throw — same path, same
-        velocity, same release timing. Only the post-release tail differs,
-        depending on whether a next pick is known:
-
-          - ``next_intercept_joint`` supplied -> CUT the arc at the release
-            sample and fly straight to that intercept via a time-optimal move
-            that STARTS FROM THE ACTUAL RELEASE STATE (position + the large
-            throw velocity). The follow-through release→aim_joint2 is dropped
-            (wasted motion once the object is gone), so the arm heads to the
-            next pick immediately instead of parking at the 8 cm hover first.
-          - no next pick -> keep the full arc up to aim_joint2 (8 cm hover,
-            dq(T)=0) and chain to the shared idle/standby pose
-            (``idle_target()``) from rest, so the arm parks high instead of at
-            this object's grasp.
+        velocity, same release timing. After the release the full arc is
+        kept up to aim_joint2 (8 cm hover, dq(T)=0) and chained from rest to a
+        safe park — a lifted-standby, or the shared idle pose when the queue is
+        empty — so the arm parks high; the next pick is then selected and driven
+        fresh next epoch (no cross-object pre-position).
 
         The timed suction release still fires at ``release_idx``
         (= eta_idx - lead_steps); in the cut case that is the last arc
@@ -307,39 +264,23 @@ class ThrowSkill(ManipulationSkill):
         # Either branch then appends one fresh time-optimal trajectory() from
         # (start_q5, start_dq5) to chain_target — only the start state / target
         # differ, so the concat/dispatch code below stays shared.
-        if next_intercept_joint is not None:
-            cut = release_idx
-            traj_pre_5 = traj_ext[:cut + 1].T         # arc up to (incl.) release
-            vel_pre_5 = vel_ext[:cut + 1].T
-            ts_pre = ts_ext[:cut + 1]
-            start_q5 = traj_ext[cut]                   # release-sample pose
-            # Release-sample velocity is large (mid-swing). Clip to the joint
-            # speed limit so opt_time/_trajectory_1d stay in their feasible
-            # region; affects only the appended move's start, never the throw.
-            start_dq5 = np.clip(vel_ext[cut], -ctx.M1[:5], ctx.M1[:5])
-            chain_target = np.asarray(next_intercept_joint, dtype=float)
-            chained_to_next = True
-            chain_dest = "next intercept"
+        # Uniform flow: always keep the FULL arc to aim_joint2 (8 cm hover, at rest) and
+        # chain the follow-through to a safe park — home/idle when the queue is EMPTY, else
+        # a lifted-standby near the last pose so the next pick approaches fresh from near the
+        # belt (no wasted home round-trip). No cut-at-release / pre-position of a next object
+        # (that throw-only chaining is what tangled push<->throw alternation). copy() so the
+        # shared ctx.idle_joint is never mutated.
+        traj_pre_5 = traj_ext.T                    # (5, n_steps+1) full arc
+        vel_pre_5 = vel_ext.T
+        ts_pre = ts_ext
+        start_q5 = traj_ext[-1]                     # aim_joint2 at rest
+        start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
+        if not ctx.queue:
+            chain_target = self.idle_target().copy()
+            chain_dest = "home/idle (queue empty)"
         else:
-            traj_pre_5 = traj_ext.T                    # (5, n_steps+1) full arc
-            vel_pre_5 = vel_ext.T
-            ts_pre = ts_ext
-            start_q5 = traj_ext[-1]                     # aim_joint2 at rest
-            start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
-            # No committed next pick. Only trek all the way to the home/standby pose
-            # when the queue is EMPTY (no next object detected yet, ①a). When a next
-            # object DOES exist but wasn't committed (different skill, or unreachable
-            # after the throw — ①b/②), don't go home: lift the follow-through
-            # (aim_joint2) to home Z and park there, so the next skill approaches
-            # fresh from near the belt instead of after a wasted home round-trip.
-            # copy() so the shared ctx.idle_joint is never mutated.
-            if not ctx.queue:
-                chain_target = self.idle_target().copy()
-                chain_dest = "home/idle (queue empty)"
-            else:
-                chain_target = ctx.lifted_standby_joint(aim_joint2)
-                chain_dest = "lifted standby (uncommitted next)"
-            chained_to_next = False
+            chain_target = ctx.lifted_standby_joint(aim_joint2)
+            chain_dest = "lifted standby"
 
         zero5 = np.zeros(5)
         traj_chain_5, vel_chain_5, ts_chain = trajectory(
@@ -377,21 +318,18 @@ class ThrowSkill(ManipulationSkill):
         ctx.log.info(
             f"Throw T={params.T:.3f}s eta={params.eta:.3f} -> release step "
             f"{release_idx}/{traj_throw.shape[1] - 1} (eta step {eta_idx}, "
-            f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, "
-            f"{'cut@release' if chained_to_next else 'full arc'}->{chain_dest})"
+            f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, full arc->{chain_dest})"
         )
 
-        primed_next = ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
+        ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=final_joint,
             release_index=release_idx,
-            suction_on_at=next_suction_at,
         )
         self._last_throw_meta = {
             "T": params.T, "eta": params.eta,
             "release_idx": release_idx, "n_steps": n_steps,
         }
-        return primed_next
 
     # ------------------------------------------------------------------
     # Per-cycle timing log
