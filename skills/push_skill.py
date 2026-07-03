@@ -133,7 +133,9 @@ FIXED_DELAY_PUSH = float(os.environ.get("GP8_FIXED_DELAY_PUSH", "0.4"))
 # wrist singularity — 0.06 clears it as long as the forward swing end stays ≲ +5°
 # (see SWING_BIAS). HW-calibrate against the measured belt height before fast runs.
 # HEIGHT_OFFSET = 0.05
-PUSH_HEIGHT = 0.06
+# 0.07: raised from 0.06, which sat ~2 mm UNDER belt GRASP_Z=0.062 and grazed the
+# belt. Keep the forward swing end ≲ +5° (SWING_BIAS) so it still clears joint-5.
+PUSH_HEIGHT = 0.07
 
 # Swing push *half-amplitude* (rad). During the stroke the TCP tilts
 # progressively about the horizontal axis perpendicular to the push direction,

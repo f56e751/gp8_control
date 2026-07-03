@@ -506,32 +506,7 @@ class GP8App:
         try:
             self._cam_latest = json.loads(msg.data)
         except (ValueError, TypeError):
-            return
-        self._log_latency_correction(self._cam_latest)
-
-    def _log_latency_correction(self, snap: dict) -> None:
-        """Throttled INFO so the bringup console shows how much perception-latency
-        back-projection camera_debug is applying: the EMA-estimated camera FPS, the
-        frame-acquisition-age term it implies, and the total correction expressed as
-        the belt-Y distance the detection is advanced downstream. Lets you watch the
-        FPS-delay correction live under ``gp8_bringup.launch.py`` (the camera_debug
-        TUI only shows in its own terminal)."""
-        applied = snap.get("applied_delay_s")
-        if applied is None:
-            return  # camera_debug without the latency fields (not rebuilt) — nothing to log
-        v = float(snap.get("belt_mps", 0.0))
-        elapsed = float(snap.get("perception_delay_s", 0.0))
-        frame_age = float(snap.get("frame_age_s", 0.0))
-        extra = float(applied) - elapsed - frame_age            # residual transport term
-        est_fps = snap.get("est_fps")
-        fps_str = f"{est_fps:.1f}" if est_fps is not None else "…"
-        self._node.get_logger().info(
-            f"[latency-corr] est_fps={fps_str} applied={applied * 1000:.0f}ms "
-            f"(elapsed {elapsed * 1000:.0f} + frame_age {frame_age * 1000:.0f} "
-            f"+ extra {extra * 1000:.0f}) -> back-proj {applied * v * 100:+.1f} cm "
-            f"@ belt {v:.3f} m/s",
-            throttle_duration_sec=2.0,
-        )
+            pass
 
     # ------------------------------------------------------------------
     # Main loop
