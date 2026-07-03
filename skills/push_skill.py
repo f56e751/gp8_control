@@ -18,7 +18,7 @@ Trajectory segments (all concatenated into one dispatch):
 
 Shared primitives live on ``self.ctx`` (a ``SkillContext``):
   * ``ctx.robot`` (FK/IK), ``ctx.traj_ctrl``, ``ctx.M1``/``ctx.M2``, ``ctx.cfg``
-  * ``ctx.move_through`` / ``ctx.wait_for_arrival_and_suction``
+  * ``ctx.move_through`` / ``ctx.wait_for_arrival``
   * ``ctx.scan_next_intercept``
   * ``ctx.set_status(status, detail)``, ``ctx.set_active_target(None)``
 """
@@ -149,9 +149,8 @@ class PushSkill(ManipulationSkill):
 
       1. **POSITIONING** — ``move_through(current, aim, grasp)`` to drive to
          the grasp pose and park there.
-      2. **WAITING** — ``wait_for_arrival_and_suction`` blocks until the object
-         arrives.  (Suction fires but is immediately turned off since push is
-         contact-based.)
+      2. **WAITING** — ``wait_for_arrival`` blocks until the object arrives. (Push
+         is contact-based, so no suction is fired; any leftover vacuum is cleared.)
       3. **PUSHING** — compute push target, dispatch the descent + push stroke +
          chain trajectory. (adv4ncr 250Hz stream: no queue mode to re-enter.)
 
@@ -227,8 +226,8 @@ class PushSkill(ManipulationSkill):
         1. ``move_through(current, aim, wait_joint)`` (POSITIONING). ``wait_joint``
            is the retreat pose — offset behind T_grasp opposite to the push
            direction, at aim height.
-        2. ``wait_for_arrival_and_suction`` (WAITING) — blocks until the
-           object reaches the intercept line.
+        2. ``wait_for_arrival`` (WAITING) — blocks until the object reaches the
+           intercept line.
         3. Dispatch descent + push stroke + chain trajectory (PUSHING).
         4. Cleanup.
         """
@@ -377,8 +376,8 @@ class PushSkill(ManipulationSkill):
         )
 
         # ---- 4. Cleanup ----
-        # Safety: turn suction off in case wait_for_arrival_and_suction
-        # left it on (push is contact-based, no suction needed).
+        # Safety: turn suction off in case a prior action left it on
+        # (push is contact-based, no suction needed).
         ctx.traj_ctrl.suction_off()
         self._log_push_cycle(target)
         ctx.set_active_target(None)

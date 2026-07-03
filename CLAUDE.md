@@ -79,8 +79,9 @@ logic lives in `skills/`, not the app.** Each epoch:
 1. `_select_ambush_target` walks the tracked-object queue, drops un-catchable
    heads, and returns a `PickRequest` (target + intercept geometry).
 2. `ActionSelector.select(request)` (`planning/action_selector.py`) routes the
-   object to a `ManipulationSkill` — rule-based today (always `throw`); this is
-   the seam meant to be replaced by an RL policy later.
+   object to a `ManipulationSkill` — rule-based today (per-class via
+   `Config.SKILL_BY_CLASS`: `metal`→push, `transparent`→throw); this is the seam
+   meant to be replaced by an RL policy later.
 3. `skill.execute(request)` runs the whole manipulation.
 
 Skills (`skills/base.py::ManipulationSkill`) never reach back into `GP8App`.
@@ -91,16 +92,18 @@ loop-owned callbacks (`intake`, `publish_state`, `set_status`,
 the injected `SkillContext` (`skills/context.py`). **Adding a skill = one new
 file + one entry in the `ActionSelector` list in `GP8App._build_skills`.** Keep
 it that way; this decoupling is intentional (see memory: skill-architecture
-direction). `ThrowSkill` is the real one; `PushSkill` is a debug stub
-(`can_handle` returns `False`, only runs when forced).
+direction). Both `ThrowSkill` and `PushSkill` are active — routing sends
+`metal`→push and `transparent`→throw (`Config.SKILL_BY_CLASS`), and each skill's
+`can_handle` gates the classes it accepts (`PushSkill` accepts `PUSH_CLASSES`).
 
 ### Pick strategies
 
-Every object goes through the **ambush** path: park at a fixed intercept line
-(`GRASP_INTERCEPT_Y`), fire suction on arrival, and let the selected
-`ManipulationSkill` run the manipulation. (An older predictive "moving" strategy
-and its support code — `lock_or_drop_head`, `_execute_cycle`, `PICK_STRATEGY` —
-have been removed.)
+Every object goes through the **ambush** path: `_select_ambush_target` picks a
+**dynamic** grasp intercept (`Intercept.intercept_y`, NOT the old fixed
+`GRASP_INTERCEPT_Y` line), the arm waits there and grabs on arrival, and the
+selected `ManipulationSkill` runs the manipulation. (An older predictive "moving"
+strategy and its support code — `lock_or_drop_head`, `_execute_cycle`,
+`PICK_STRATEGY` — have been removed.)
 
 ### Two-process bridge — `bridge.py` is mandatory
 

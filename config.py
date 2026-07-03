@@ -45,7 +45,8 @@ class Config:
     MAX_PICK_LEAD: float = 1.2
 
     # Test override for the push/throw ActionSelector. Empty = normal routing
-    # (every object -> throw today). Set to a skill name ("throw" or "push")
+    # (per-class via SKILL_BY_CLASS: metal -> push, transparent -> throw). Set to a
+    # skill name ("throw" or "push")
     # to pin EVERY object to that one skill, bypassing per-class routing and
     # the skill's can_handle() — handy for driving one skill in isolation
     # (e.g. testing the push path before it's fully wired). Prefer the CLI flag
