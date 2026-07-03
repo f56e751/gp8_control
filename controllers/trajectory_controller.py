@@ -301,6 +301,16 @@ class TrajectoryController:
                 from scipy.interpolate import CubicHermiteSpline
                 samples = np.column_stack(
                     [CubicHermiteSpline(times, arr[j], varr[j])(grid) for j in range(n_joints)])
+                # SAFETY: cubic-Hermite can OVER/UNDERSHOOT beyond the knot values — a descent
+                # decelerating to belt contact dips BELOW the final pose. JGPC is a POSITION
+                # controller, so a below-surface command drives the tool INTO the belt -> shock
+                # (alarm 4315). Clamp each sample to the envelope of its two bracketing knots:
+                # keeps the cubic velocity shape WITHIN bounds but never past a commanded waypoint
+                # (linear never overshoots; this makes cubic equally floor-safe).
+                seg = np.clip(np.searchsorted(times, grid, side="right") - 1, 0, len(times) - 2)
+                lo = np.minimum(arr[:, seg], arr[:, seg + 1]).T   # (n_grid, n_joints)
+                hi = np.maximum(arr[:, seg], arr[:, seg + 1]).T
+                samples = np.clip(samples, lo, hi)
             except Exception:
                 samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
         else:
