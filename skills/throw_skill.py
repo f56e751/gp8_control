@@ -25,21 +25,10 @@ if TYPE_CHECKING:
 # Throw policy (was app-level policy in app.py)
 # =========================================================================
 
-# Class-specific throw-plane angle (radians, rotation about +Z). Keys are
-# SAM class names; classes not listed here throw at theta=0. This connects
-# perception output to throw geometry — it lives with the throw skill so the
-# throw owner edits it without touching app.py.
-THETA_MAP = {
-    "transparent": -np.pi / 12.0,
-    "metal":       -np.pi * 25.0 / 180.0,
-}
-
 # Throw target bin (base-frame XY, m). The throw HEADING (theta) is computed PER
 # OBJECT as the bearing from that object's grasp to this bin, so the swing re-aims
-# from any grab position — replacing the old fixed per-class THETA_MAP angle, which
-# only matched when grabbing on the y=0 line. Y is downstream-negative (belt -Y).
-# Tune to the measured bin centre. (THETA_MAP is still used by the legacy "moving"
-# strategy in app.py.)
+# from any grab position. Y is downstream-negative (belt -Y). Tune to the measured
+# bin centre.
 THROW_BIN_X: float = 1.1
 THROW_BIN_Y: float = -0.25
 
@@ -75,9 +64,8 @@ class ThrowSkill(ManipulationSkill):
 
     ``execute`` runs the full ambush cycle (position → wait → suction → throw →
     chain to next intercept). The individual stages —
-    :meth:`plan_throw_landing`, :meth:`solve_keyframe_joints`,
-    :meth:`build_throw_trajectory` — are also public so the legacy "moving"
-    pick strategy in ``app.py`` can reuse the same throw code.
+    :meth:`plan_throw_landing`, :meth:`build_throw_trajectory` — are public so
+    external code can reuse the throw planning.
     """
 
     name = "throw"
@@ -136,9 +124,9 @@ class ThrowSkill(ManipulationSkill):
         ctx.set_status("THROWING", target.class_name)
 
         # Throw heading = bearing from THIS object's grasp to the fixed bin,
-        # recomputed per object so the swing re-aims from any grab position (the
-        # old fixed per-class THETA_MAP angle only matched a y=0 grasp). theta then
-        # tilts the throw swing toward the bin. See THROW_BIN_X/Y.
+        # recomputed per object so the swing re-aims from any grab position (a
+        # fixed per-class angle only matched a y=0 grasp). theta then tilts the
+        # throw swing toward the bin. See THROW_BIN_X/Y.
         theta = float(np.arctan2(
             THROW_BIN_Y - T_grasp[1, 3], THROW_BIN_X - T_grasp[0, 3],
         ))
@@ -196,7 +184,7 @@ class ThrowSkill(ManipulationSkill):
         return SkillResult(True, "throw complete")
 
     # ------------------------------------------------------------------
-    # Throw planning (shared with the legacy "moving" pick strategy)
+    # Throw planning
     # ------------------------------------------------------------------
     def plan_throw_landing(
         self,
@@ -233,15 +221,6 @@ class ThrowSkill(ManipulationSkill):
         if infeasible:
             return T_aim1_fallback.copy()
         return T_aim2
-
-    def solve_keyframe_joints(
-        self,
-        T_aim1: np.ndarray,
-        T_grasp1: np.ndarray,
-        T_aim2: np.ndarray,
-    ):
-        """IK for the aim/grasp/aim2 keyframes; wrist (joint 6) zeroed. None on IK fail."""
-        return self._ik_keyframes((T_aim1, T_grasp1, T_aim2), wrist=0.0)
 
     # ------------------------------------------------------------------
     # Throw trajectory build + dispatch

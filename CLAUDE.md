@@ -172,7 +172,7 @@ and `package_dir` there, or the colcon install won't import it. Always import as
 
 ## Configuration
 
-Most tunables are dataclass fields on `Config` in `app.py` (extensive inline
+Most tunables are dataclass fields on `Config` in `config.py` (extensive inline
 comments explain each). Calibration/extrinsics that must match the `camera_debug`
 node live in `perception/extrinsics.py` and `config/*.yaml` — keep them in sync.
 Real infra IPs/URLs go in a gitignored `.env` (template: `.env.example`); the

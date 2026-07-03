@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 
 # =========================================================================
-# Push policy (mirrors throw_skill's THETA_MAP / THROW_BIN_TARGET_MAP)
+# Push policy (mirrors throw_skill's THROW_BIN_TARGET_MAP)
 # =========================================================================
 
 # Classes this skill ACCEPTS (PushSkill.can_handle). The ActionSelector routes
@@ -497,23 +497,6 @@ class PushSkill(ManipulationSkill):
         return T_aim2
 
     # ------------------------------------------------------------------
-    # Keyframe IK solver (mirrors throw_skill.solve_keyframe_joints)
-    # ------------------------------------------------------------------
-    def solve_keyframe_joints(
-        self,
-        T_aim1: np.ndarray,
-        T_grasp1: np.ndarray,
-        T_aim2: np.ndarray,
-    ):
-        """IK for aim, grasp, and push-target keyframes; wrist (joint 6) faces the push
-        direction (forward == PUSH_JOINT6_ANGLE).
-
-        Returns ``(aim_joint, grasp_joint, push_target_joint)`` or ``None`` on IK failure.
-        """
-        j6 = self._facing_joint6(self._compute_push_direction(T_grasp1, T_aim2))
-        return self._ik_keyframes((T_aim1, T_grasp1, T_aim2), wrist=j6)
-
-    # ------------------------------------------------------------------
     # Push trajectory build + dispatch
     # ------------------------------------------------------------------
     def build_push_trajectory(
@@ -817,27 +800,6 @@ class PushSkill(ManipulationSkill):
             # Degenerate case: push along +X as a safe default.
             return np.array([1.0, 0.0, 0.0])
         return delta / norm
-
-    @staticmethod
-    def _facing_joint6(push_dir: np.ndarray) -> float:
-        """Joint-6 angle that points the TCP straight along ``push_dir``.
-
-        In the default grasp orientation (``_R_GRASP_DEFAULT`` in
-        perception/detection_intake.py) the
-        tool's facing axis is base **+X**, and the wrist is "facing forward"
-        when joint 6 == ``PUSH_JOINT6_ANGLE`` (NOT 0). Rotating the push
-        direction away from +X by ``yaw`` (its angle in the XY belt plane)
-        therefore needs the same ``yaw`` added on top of ``PUSH_JOINT6_ANGLE``
-        so the TCP keeps looking straight down the push line.
-
-        When ``push_dir`` == +X, ``yaw`` == 0 → joint 6 == ``PUSH_JOINT6_ANGLE``
-        (forward), as required.
-
-        NOTE: flip the sign of ``yaw`` here if the wrist turns the *wrong* way
-        on hardware — it depends on the joint-6 rotation axis direction.
-        """
-        yaw = float(np.arctan2(push_dir[1], push_dir[0]))
-        return PUSH_JOINT6_ANGLE + yaw
 
     @staticmethod
     def _swing_at(alpha: float) -> float:

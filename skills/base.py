@@ -8,9 +8,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 if TYPE_CHECKING:
+    import numpy as np
+
     from gp8_control.skills.context import SkillContext, PickRequest
     from gp8_control.tracking import TrackedObject
 
@@ -91,7 +91,7 @@ class ManipulationSkill(ABC):
         ``move_time`` is the solver's per-iteration ``opt_time`` positioning
         estimate (passed in so this stays a cheap scalar inside the fixed point —
         no re-planning). The full decomposition is
-        ``T_setup (queue re-entry) + T_position + T_contact_offset``; a skill whose
+        ``T_setup (dispatch) + T_position + T_contact_offset``; a skill whose
         contact is timing-critical overrides this to add its real terms.
 
         Base default = the LEGACY estimate ``move_time * PICK_FEASIBILITY_FACTOR``,
@@ -107,22 +107,6 @@ class ManipulationSkill(ABC):
     # ------------------------------------------------------------------
     # Shared helpers (used by concrete skills)
     # ------------------------------------------------------------------
-    def _ik_keyframes(self, transforms, wrist: float = 0.0):
-        """Solve IK for each keyframe ``transforms`` and set joint 6 (wrist) to
-        ``wrist``. Returns a tuple of joint arrays (one per transform), or ``None``
-        (after a warning) if any IK fails. Shared by ThrowSkill/PushSkill
-        ``solve_keyframe_joints`` — throw passes ``wrist=0``, push a push-facing angle."""
-        joints = []
-        for T in transforms:
-            q = self.ctx.robot.inverse_kinematics(T)
-            if q is None:
-                self.ctx.log.warn("IK failed for a keyframe; aborting")
-                return None
-            q = np.asarray(q, dtype=float)
-            q[-1] = wrist
-            joints.append(q)
-        return tuple(joints)
-
     def _abort(self, detail: str) -> "SkillResult":
         """Shared execute() failure cleanup: release suction, clear the active target,
         go IDLE, and return a failed ``SkillResult(detail)``. The caller logs the
