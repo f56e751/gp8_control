@@ -96,11 +96,11 @@ direction). `ThrowSkill` is the real one; `PushSkill` is a debug stub
 
 ### Pick strategies
 
-`Config.PICK_STRATEGY` selects between `"ambush"` (default — park at a fixed
-intercept line `GRASP_INTERCEPT_Y`, fire suction on arrival; skill-based path)
-and `"moving"` (legacy predictive intercept via `lock_or_drop_head` +
-`_execute_cycle`, still in `run_epoch`). New work goes through ambush + skills;
-the moving path reuses `ThrowSkill`'s public planning methods.
+Every object goes through the **ambush** path: park at a fixed intercept line
+(`GRASP_INTERCEPT_Y`), fire suction on arrival, and let the selected
+`ManipulationSkill` run the manipulation. (An older predictive "moving" strategy
+and its support code — `lock_or_drop_head`, `_execute_cycle`, `PICK_STRATEGY` —
+have been removed.)
 
 ### Two-process bridge — `bridge.py` is mandatory
 
@@ -114,25 +114,19 @@ negative-seconds stamp before its clock syncs, which makes `rclcpp::Time` throw
 and SIGABRT-kills every C++ consumer (move_group, robot_state_publisher) — do
 not remove that re-stamp.
 
-### MotoROS2 Point Queue Mode gotchas (`controllers/trajectory_controller.py`)
+### Control path (`controllers/trajectory_controller.py`)
 
-The robot runs in **Point Queue Mode**, not plain FJT, to avoid
-`INIT_TRAJ_INVALID_STARTING_POS`. Two hard rules, both already handled but easy
-to break:
-
-- **Re-enter queue mode before *every* trajectory.** MotoROS2 silently leaves
-  queue mode once a trajectory's queue drains; the next push is rejected with
-  "Must call start_point_queue_mode". This is why `ThrowSkill.execute` and
-  `PushSkill.execute` call `enter_queue_mode()` before each segment (pick, then
-  throw). Skip it and only the first object works.
-- **First queued point must equal the measured current position** (code 204).
-  `_build_queue_waypoints` overwrites `positions[0]` with `current_joints` to
-  satisfy this — even though it looks like it sends a "planned" start.
-
-`enter_queue_mode()` auto-calls `/reset_error` once on recoverable alarms
-(101/102/112, e.g. 4414 excessive segment velocity) and retries; hardware/major
-alarms still need the pendant. Always `exit_queue_mode()` on shutdown or the
-next run's FJT goals get rejected.
+This branch runs the **adv4ncr 250 Hz stream** driver: `trajectory_controller`
+resamples each trajectory onto a 4 ms grid and publishes joint targets to
+`/JointGroupPositionController/commands` (Float64MultiArray), and drives suction
+via a Simple-Message TCP call (port 50242). There is **no MotoROS2 Point Queue
+Mode** here: the old per-cycle `enter_queue_mode()` re-entry (and the
+persistent-queue workaround built for its ~0.4 s cost) were removed —
+`enter_queue_mode`/`exit_queue_mode`/`pq_*` remain only as one-time, no-op
+lifecycle shims. Skills just dispatch trajectories; they no longer manage queue
+mode per segment. (The prior MotoROS2 queue contract — re-enter before every
+trajectory, first queued point == measured current position for code 204 — lives
+on the pre-migration `main` branch, not here.)
 
 ### Throw trajectory (`skills/throw_skill.py` + `trajectory/`)
 
@@ -147,7 +141,8 @@ queue and IO are independent services), not after the whole push — the old
 "push all, then release" path released too late. The full NN arc (including
 follow-through to `aim_joint2`) is kept, then a chain segment to the next pick's
 intercept (or current grasp) is appended so the arm flows between picks instead
-of parking high. Per-class throw angles live in `THETA_MAP`.
+of parking high. The throw heading is computed per-object as the bearing from the
+grasp to the fixed bin (`THROW_BIN_X`/`THROW_BIN_Y`).
 
 ### Perception / tracking data path
 
