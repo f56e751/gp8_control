@@ -222,7 +222,7 @@ class GP8App:
         changes — which keeps push/throw work from colliding.
         """
         # Default standby pose for the idle chain: the same boot/initial pose
-        # _move_to_initial_pose uses (cfg.INITIAL_R/T), wrist zeroed. Computed
+        # _move_to_initial_pose uses (cfg.INITIAL_R/T), wrist at PICK_WRIST_J6. Computed
         # once here so a skill's post-action chain can return to it when no next
         # object is queued (ManipulationSkill.idle_target -> ctx.idle_joint),
         # instead of parking low at the belt (e.g. a push's push_end).
@@ -231,7 +231,7 @@ class GP8App:
         if idle_joint is None:
             raise RuntimeError("IK failed for idle/initial pose (cfg.INITIAL_R/T).")
         idle_joint = np.asarray(idle_joint, dtype=float)
-        idle_joint[-1] = 0.0
+        idle_joint[-1] = self.cfg.PICK_WRIST_J6   # shared wrist baseline
 
         self.ctx = SkillContext(
             cfg=self.cfg,
@@ -320,7 +320,7 @@ class GP8App:
 
         current_joint = np.array(self.traj_ctrl.current_joints)
         initial_joint = np.array(initial_joint)
-        initial_joint[-1] = 0.0
+        initial_joint[-1] = self.cfg.PICK_WRIST_J6   # shared wrist baseline
         zero = np.zeros_like(self.M1)
         traj, vel, timestep = trajectory(
             current_joint, zero,

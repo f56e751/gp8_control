@@ -244,8 +244,12 @@ class SkillContext:
             aj = self.robot.inverse_kinematics(T_aim)
             if gj is None or aj is None:
                 return None
-            gj = np.asarray(gj, dtype=float); gj[-1] = 0.0
-            aj = np.asarray(aj, dtype=float); aj[-1] = 0.0
+            # Wrist baseline: J6 is a free DOF for pick/throw (symmetric cup,
+            # 5-DOF throw NN), so park it where PUSH will want it — the
+            # push-facing mean (cfg.PICK_WRIST_J6, was 0) — to kill the
+            # ~90 deg J6 round-trips between cycles.
+            gj = np.asarray(gj, dtype=float); gj[-1] = cfg.PICK_WRIST_J6
+            aj = np.asarray(aj, dtype=float); aj[-1] = cfg.PICK_WRIST_J6
             move_time = (
                 opt_time(current_joint, zero, aj, zero, self.M1, self.M2)
                 + opt_time(aj, zero, gj, zero, self.M1, self.M2)
@@ -528,7 +532,7 @@ class SkillContext:
             self.log.warn("lifted-standby IK failed; parking at home/idle pose")
             return self.idle_joint
         q = np.asarray(q, dtype=float)
-        q[-1] = 0.0
+        q[-1] = self.cfg.PICK_WRIST_J6   # shared wrist baseline (see config)
         return q
 
     def next_chain_target(self, from_joint: np.ndarray, action_time: float):
@@ -537,8 +541,10 @@ class SkillContext:
         throughput the plain-standby park lost). Reuses ``earliest_reachable_intercept``
         with ``pre_delay=action_time`` (the arm frees up only after this action) — its
         fixed-point loop resolves the move-time <-> object-position circularity. Returns
-        the first feasible object's grasp joints (wrist=0), or ``None`` (no next / none
-        catchable) so the caller parks at lifted_standby. Works for ANY next skill
+        ``(grasp_joint, candidate)`` for the first feasible object (wrist at
+        cfg.PICK_WRIST_J6), or ``None`` (no next / none catchable) so the caller parks at
+        lifted_standby. The candidate lets the caller pick a chain WRIST for the next
+        object's skill (push keeps its push-facing wrist). Works for ANY next skill
         (symmetric). NO commitment: the next epoch still SELECTS + DRIVES fresh from this
         closer pose, so the handoff stays stateless (no committed/prepositioned/skip_move)."""
         now = time.time()
@@ -556,5 +562,5 @@ class SkillContext:
                     f"Chain toward next: id={cand.track_id} {cand.class_name} @ "
                     f"y={it.intercept_y:+.3f} (arrival {it.eta:.2f}s, pre_delay {action_time:.2f}s)"
                 )
-                return it.grasp_joint
+                return it.grasp_joint, cand
         return None

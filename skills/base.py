@@ -66,6 +66,22 @@ class ManipulationSkill(ABC):
         """
         return self.ctx.idle_joint
 
+    def chain_park_joint(
+        self, next_grasp: "np.ndarray", next_cand: "TrackedObject"
+    ) -> "np.ndarray | None":
+        """Where the PREVIOUS action's chain should park the arm when THIS
+        skill will handle ``next_cand`` next.
+
+        Called on the NEXT object's skill by whichever skill is finishing its
+        chain. Return a full 6-DOF joint pose to park at this skill's own
+        action-start attitude (e.g. push returns its backswing pose, lifted
+        slightly), or None (default) to accept the caller's generic
+        lifted-standby park over ``next_grasp``. Best-effort pre-position
+        only — the next epoch still selects and plans fresh (stateless
+        handoff), so a stale park just costs a normal repositioning.
+        """
+        return None
+
     def arrival_lead(self) -> float:
         """Seconds before the object's predicted arrival to END the WAITING block.
 

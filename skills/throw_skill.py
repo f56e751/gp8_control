@@ -157,15 +157,30 @@ class ThrowSkill(ManipulationSkill):
         if aim_joint2 is None:
             ctx.log.warn("Throw IK failed after grab; lifting in place")
             aim_joint2, T_aim2 = aim_joint, T_aim
-        aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
+        # Hold the pick wrist through the throw — the NN drives joints 1-5
+        # only, so J6 just parks wherever the grasp left it (PICK_WRIST_J6
+        # baseline) instead of snapping to 0 and back around every throw.
+        aim_joint2 = np.asarray(aim_joint2, dtype=float)
+        aim_joint2[-1] = float(grasp_joint[-1])
 
         params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
         # Chain the follow-through toward the NEXT object's grasp (best-effort) so the arm
         # OVERLAPS the next approach with this throw instead of parking far and re-driving
         # serially. Symmetric + stateless: the next epoch still SELECTS + DRIVES fresh from
         # this closer pose (no commit/preposition). None -> lifted-standby park.
-        next_grasp = ctx.next_chain_target(grasp_joint, float(params.T))
-        self.build_throw_trajectory(grasp_joint, aim_joint2, params, next_grasp=next_grasp)
+        nxt = ctx.next_chain_target(grasp_joint, float(params.T))
+        next_grasp, next_cand = nxt if nxt is not None else (None, None)
+        # Chain PARK: ask the NEXT object's skill where to park (push → its
+        # backswing pose; default None → lifted standby over the grasp).
+        chain_park = None
+        if next_cand is not None:
+            chain_park = ctx.skill_obj_for(next_cand).chain_park_joint(
+                next_grasp, next_cand
+            )
+        self.build_throw_trajectory(
+            grasp_joint, aim_joint2, params,
+            next_grasp=next_grasp, chain_park=chain_park,
+        )
         ctx.traj_ctrl.suction_off()   # release the object after the throw
         self._log_throw_cycle(target)
         ctx.set_active_target(None)
@@ -220,6 +235,7 @@ class ThrowSkill(ManipulationSkill):
         aim_joint2: np.ndarray,
         params,
         next_grasp: "Optional[np.ndarray]" = None,
+        chain_park: "Optional[np.ndarray]" = None,
     ) -> None:
         """Build and dispatch throw trajectory using already-decoded ThrowParams.
 
@@ -298,11 +314,17 @@ class ThrowSkill(ManipulationSkill):
         ts_pre = ts_ext
         start_q5 = traj_ext[-1]                     # aim_joint2 at rest
         start_dq5 = vel_ext[-1]                     # ~0 (NN boundary condition)
-        if next_grasp is not None:
+        if chain_park is not None:
+            # The NEXT object's skill supplied its own action-start park (push:
+            # its backswing pose + clearance). Full 6-DOF pose, wrist included.
+            chain_target = np.asarray(chain_park, dtype=float).copy()
+            chain_dest = "next action-start park"
+        elif next_grasp is not None:
             # Park OVER the next grasp (its XY raised to home Z), NOT at belt height. A
             # belt-height chain endpoint would leave the arm low, and the next epoch's
             # drive to a different-lane grasp would sweep the TCP low across the belt
-            # (floor-dip / grazing). lifted_standby_joint keeps the XY, raises Z, wrist=0.
+            # (floor-dip / grazing). lifted_standby_joint keeps the XY, raises Z, and
+            # parks the wrist at the shared PICK_WRIST_J6 baseline.
             chain_target = ctx.lifted_standby_joint(next_grasp)
             chain_dest = "over next grasp"
         elif not ctx.queue:
@@ -312,37 +334,44 @@ class ThrowSkill(ManipulationSkill):
             chain_target = ctx.lifted_standby_joint(aim_joint2)
             chain_dest = "lifted standby"
 
-        zero5 = np.zeros(5)
-        traj_chain_5, vel_chain_5, ts_chain = trajectory(
-            start_q5, start_dq5,
-            chain_target[:5], zero5,
-            ctx.M1[:5], ctx.M2[:5], hertz=ctx.cfg.TRAJ_HZ,
+        # 6-DOF chain: the ARC is 5-DOF (the NN drives joints 1-5; J6 stays
+        # parked at the pick wrist), but the chain must be able to ROTATE the
+        # wrist toward the park target (e.g. the next push's backswing J6) —
+        # so it runs on all six joints, starting from the arc end with J6 at
+        # the held wrist and zero wrist velocity.
+        held_wrist = float(grasp_joint[-1])
+        start_q6 = np.append(start_q5, held_wrist)
+        start_dq6 = np.append(start_dq5, 0.0)
+        zero6 = np.zeros(6)
+        traj_chain, vel_chain, ts_chain = trajectory(
+            start_q6, start_dq6,
+            chain_target[:6], zero6,
+            ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
         )
-        # Drop the chain's first column — it's start_q5 (the last sample of the
-        # kept arc: release pose when cut, else aim_joint2), so it would be a
-        # duplicate. Slice traj/vel/ts the SAME way so the three stay equal
-        # length: if the chain degenerates to a single sample (chain_target ≈
-        # start_q5 -> opt_time ≈ 0) all three become empty and only the arc
-        # remains. (Slicing ts alone would
-        # leave traj/vel one column longer, and zip() in _build_queue_waypoints
-        # would then silently drop a waypoint and bind final_joint to the wrong
-        # timestamp.)
-        traj_chain_5 = traj_chain_5[:, 1:]
-        vel_chain_5 = vel_chain_5[:, 1:]
+        # Drop the chain's first column — it's start_q6 (the last sample of the
+        # kept arc: aim_joint2 + held wrist), so it would be a duplicate. Slice
+        # traj/vel/ts the SAME way so the three stay equal length: if the chain
+        # degenerates to a single sample (chain_target ≈ start_q6 -> opt_time ≈
+        # 0) all three become empty and only the arc remains. (Slicing ts alone
+        # would leave traj/vel one column longer, and zip() in
+        # _build_queue_waypoints would then silently drop a waypoint and bind
+        # final_joint to the wrong timestamp.)
+        traj_chain = traj_chain[:, 1:]
+        vel_chain = vel_chain[:, 1:]
         ts_chain_shifted = ts_chain[1:] + ts_pre[-1]
 
-        traj_full_5 = np.concatenate((traj_pre_5, traj_chain_5), axis=1)   # (5, total)
-        vel_full_5 = np.concatenate((vel_pre_5, vel_chain_5), axis=1)
-        ts_full = np.concatenate((ts_pre, ts_chain_shifted))
-        assert traj_full_5.shape[1] == vel_full_5.shape[1] == ts_full.shape[0], (
+        # Pad the ARC to 6-DOF (J6 held at the pick wrist, zero velocity —
+        # zero-POSITION padding would snap the wrist to 0 at the throw start),
+        # then append the 6-DOF chain.
+        traj_pre_6 = pad(traj_pre_5.T, fill=held_wrist).T
+        vel_pre_6 = pad(vel_pre_5.T).T
+        traj_throw = np.concatenate((traj_pre_6, traj_chain), axis=1)   # (6, total)
+        vel_throw = np.concatenate((vel_pre_6, vel_chain), axis=1)
+        timestep_throw = np.concatenate((ts_pre, ts_chain_shifted))
+        assert traj_throw.shape[1] == vel_throw.shape[1] == timestep_throw.shape[0], (
             f"throw traj/vel/timestep length mismatch: "
-            f"{traj_full_5.shape[1]}/{vel_full_5.shape[1]}/{ts_full.shape[0]}"
+            f"{traj_throw.shape[1]}/{vel_throw.shape[1]}/{timestep_throw.shape[0]}"
         )
-
-        # Pad to 6-dof, reorient to (6, total) as the queue expects.
-        traj_throw = pad(traj_full_5.T).T
-        vel_throw = pad(vel_full_5.T).T
-        timestep_throw = ts_full
         final_joint = chain_target
 
         ctx.log.info(
