@@ -81,6 +81,9 @@ setup(
             # Standalone keyboard suction toggle for the adv4ncr driver (TCP 50242
             # Simple Message IoServer; no ROS service needed). Run supervised.
             "suction_keys = gp8_control.tests.suction_keys:main",
+            # Static-object suction pick check: park at GRASP_Z, suction + hold,
+            # lift 10 cm (no torch; system python OK). Conveyor stopped.
+            "suction_lift_debug = gp8_control.tests.suction_lift_debug:main",
         ],
     },
 )

@@ -1,81 +1,104 @@
-"""GP8 debug launch file (ROS 2).
+"""GP8 debug launch file (ROS 2) — adv4ncr hardened RT driver.
 
-Minimal launch for robot debugging — no camera, no SAM server, no perception.
-Only launches:
-  1. Name bridge (MotoROS2 raw names <-> URDF S/L/U/R/B/T names)
-  2. Robot state publisher (URDF -> TF), consuming bridge's /joint_states_urdf
-  3. MoveIt 2 (move_group)
+`gp8_bringup.launch.py` MINUS the app: brings up the IDENTICAL robot stack the
+app runs on, so interactive debug scripts (suction_lift_debug, terminal_debug,
+queue_test, ...) run against exactly the same environment — then run the debug
+script in a second terminal instead of `gp8_manager`.
 
-MotoROS2 runs on the robot controller firmware — no node needed here.
-It provides: /joint_states (raw names), /follow_joint_trajectory, /write_single_io.
-The bridge translates those to the URDF convention used by everything else.
+Launches (same pieces, same defaults as gp8_bringup):
+  1. adv4ncr ros2_control stack (ros2_control_node + motoman_hardware +
+     joint_state_broadcaster + JointGroupPositionController ACTIVE) +
+     robot_state_publisher — via motoman_bringup/gp8.launch.py.
+  2. joint_trajectory_controller spawned INACTIVE — its FollowJointTrajectory
+     action server must exist for TrajectoryController.wait_for_servers()
+     even in the default "stream" backend; inactive so it never claims the
+     command interface from the active JGPC.
+  3. MoveIt 2 (move_group).
+
+No camera, no perception, no app. Requires the motoman_ROS2 workspace overlaid
+(its install/setup.bash sourced) so motoman_bringup resolves — same requirement
+as gp8_bringup. Pendant in REMOTE with no alarms; suction IO goes over TCP
+50242 directly.
 
 Usage:
   ros2 launch gp8_control debug_robot.launch.py
+  # low commissioning speed:
+  ros2 launch gp8_control debug_robot.launch.py \\
+      axis_increment_factor:=0.1 axis_acceleration_factor:=0.01
 """
 
-import os
-import subprocess
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
-from launch_ros.actions import Node, SetRemap
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
 
-    xacro_path = os.path.join(
-        get_package_share_directory("motoman_gp8_support"),
-        "urdf", "gp8.xacro",
+    # Same launch arguments + defaults as gp8_bringup.launch.py (keep in sync).
+    robot_ip_arg = DeclareLaunchArgument(
+        "robot_ip", default_value="192.168.255.1",
+        description="Yaskawa controller IP address",
     )
-    robot_description = subprocess.check_output(["xacro", xacro_path], text=True)
+    inc_factor_arg = DeclareLaunchArgument(
+        "axis_increment_factor", default_value="1.0",
+        description="Per-cycle increment (velocity) factor [0..1]. Same default "
+                    "as gp8_bringup; pass 0.1 for LOW commissioning speed.",
+    )
+    acc_factor_arg = DeclareLaunchArgument(
+        "axis_acceleration_factor", default_value="0.02",
+        description="Per-cycle acceleration factor [0..1] (hardware-validated max).",
+    )
 
     # =====================================================================
-    # 1. Name bridge (MotoROS2 raw names <-> URDF names)
+    # 1. adv4ncr driver stack (ros2_control) + robot_state_publisher —
+    #    the VALIDATED motoman_bringup/gp8.launch.py, exactly as gp8_bringup
+    #    includes it.
     # =====================================================================
-    name_bridge = Node(
-        package="gp8_control",
-        executable="name_bridge",
-        name="motoros2_name_bridge",
+    adv4ncr_stack = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare("motoman_bringup"), "launch", "gp8.launch.py",
+            ])
+        ]),
+        launch_arguments={
+            "robot_ip": LaunchConfiguration("robot_ip"),
+            "axis_increment_factor": LaunchConfiguration("axis_increment_factor"),
+            "axis_acceleration_factor": LaunchConfiguration("axis_acceleration_factor"),
+        }.items(),
+    )
+
+    # =====================================================================
+    # 2. joint_trajectory_controller INACTIVE (see gp8_bringup §2b: action
+    #    server up for wait_for_servers, command interface unclaimed).
+    # =====================================================================
+    jtc_spawner_inactive = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["joint_trajectory_controller", "--inactive",
+                   "--controller-manager", "/controller_manager"],
         output="screen",
     )
 
     # =====================================================================
-    # 2. Robot state publisher (URDF -> TF)
-    #    Remap /joint_states -> /joint_states_urdf so TF uses bridge output.
+    # 3. MoveIt 2 — /joint_states straight from joint_state_broadcaster.
     # =====================================================================
-    robot_state_publisher = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        parameters=[{"robot_description": robot_description}],
-        remappings=[("joint_states", "joint_states_urdf")],
-        output="screen",
+    moveit_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            PathJoinSubstitution([
+                FindPackageShare("motoman_gp8_moveit_config"),
+                "launch", "move_group.launch.py",
+            ])
+        ]),
     )
 
-    # =====================================================================
-    # 3. MoveIt 2 — scoped remap so move_group reads bridge output.
-    # =====================================================================
-    moveit_launch = GroupAction([
-        SetRemap(src="/joint_states", dst="/joint_states_urdf"),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource([
-                PathJoinSubstitution([
-                    FindPackageShare("motoman_gp8_moveit_config"),
-                    "launch", "move_group.launch.py",
-                ])
-            ]),
-        ),
-    ])
-
-    # =====================================================================
-    # Assemble
-    # =====================================================================
     return LaunchDescription([
-        name_bridge,
-        robot_state_publisher,
+        robot_ip_arg,
+        inc_factor_arg,
+        acc_factor_arg,
+        adv4ncr_stack,
+        jtc_spawner_inactive,
         moveit_launch,
     ])

@@ -12,6 +12,10 @@
   <!-- ROS 2 dependencies -->
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
   <depend>trajectory_msgs</depend>
   <depend>control_msgs</depend>
   <depend>builtin_interfaces</depend>
@@ -19,6 +23,7 @@
   <depend>image_proc</depend>
 
   <!-- External ROS 2 packages -->
+  <exec_depend>xacro</exec_depend>
   <depend>motoros2_interfaces</depend>
   <depend>apriltag_ros</depend>
   <depend>realsense2_camera</depend>
