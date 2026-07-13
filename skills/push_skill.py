@@ -73,18 +73,21 @@ PUSH_BIN_TARGET_MAP: dict[str, tuple] = {
 # TCP cruise speed during the push stroke (m/s). The stroke ACCELERATES from
 # rest at PUSH_ACCEL over the retreat run-up and cruises at this speed from
 # (before) contact to the stroke end. Tune to balance impact force vs. control
-# stability; too fast may exceed joint velocity limits.
-PUSH_SPEED: float = 3.0
+# stability; too fast may exceed joint velocity limits. Env-overridable
+# (GP8_PUSH_SPEED / GP8_PUSH_ACCEL) for the step-up tracking-limit test —
+# see tests/analyze_push_tracking.py.
+PUSH_SPEED: float = float(os.environ.get("GP8_PUSH_SPEED", "2.0"))
 
 # TCP acceleration limit (m/s^2) for the stroke run-up (rest → PUSH_SPEED).
 # The old constant-speed stroke demanded PUSH_SPEED instantly from rest, which
 # was physically impossible — the servo lagged and the actual contact speed was
 # uncontrolled. To reach FULL speed by contact this must satisfy
-# PUSH_ACCEL >= PUSH_SPEED^2 / (2 * retreat run-up). NOTE with 3.0 / 15 the
-# needed run-up is 0.225 m > PUSH_RETREAT_DISTANCE 0.2 — contact happens at
-# sqrt(2*20*0.2) ~= 2.83 m/s while still accelerating; 3.0 is reached
-# 2.5 cm into the follow-through (logged at build as contact@...).
-PUSH_ACCEL: float = 20.0
+# PUSH_ACCEL >= PUSH_SPEED^2 / (2 * retreat run-up); 2.0/12 needs 0.167 m.
+# DO NOT raise casually: 3.0/20 was tried 2026-07-13 and the servo could not
+# track it — hits went WEAK (actual speed far below commanded) and the EE
+# gouged the belt (per-joint increment clamping bends the chase path BELOW
+# the planned scoop). Measure tracking headroom (GP8_MOTION_LOG_DIR) first.
+PUSH_ACCEL: float = float(os.environ.get("GP8_PUSH_ACCEL", "12.0"))
 
 # Waypoint sampling rate (Hz) for the push stroke ONLY. Descent/chain stay at
 # cfg.TRAJ_HZ (20) — they are plain joint moves the 250 Hz stream resampler
