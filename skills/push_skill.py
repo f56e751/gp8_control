@@ -63,7 +63,7 @@ PUSH_CLASSES: set[str] = {
 # push aims at a fixed bin/chute location instead of computing from secondary.
 PUSH_BIN_TARGET_MAP: dict[str, tuple] = {
     "transparent": (1.2, -0.30, 0.0),  
-    "metal":       (1.2,  0.60, 0.0),
+    "metal":       (0.95,  0.60, 0.0),
 }
 
 
@@ -74,16 +74,17 @@ PUSH_BIN_TARGET_MAP: dict[str, tuple] = {
 # rest at PUSH_ACCEL over the retreat run-up and cruises at this speed from
 # (before) contact to the stroke end. Tune to balance impact force vs. control
 # stability; too fast may exceed joint velocity limits.
-PUSH_SPEED: float = 2.0
+PUSH_SPEED: float = 3.0
 
 # TCP acceleration limit (m/s^2) for the stroke run-up (rest → PUSH_SPEED).
 # The old constant-speed stroke demanded PUSH_SPEED instantly from rest, which
 # was physically impossible — the servo lagged and the actual contact speed was
 # uncontrolled. To reach FULL speed by contact this must satisfy
-# PUSH_ACCEL >= PUSH_SPEED^2 / (2 * retreat run-up); with PUSH_SPEED=2.0 and
-# PUSH_RETREAT_DISTANCE=0.2 the minimum is 10.0. When the min-X clamp shortens
-# the run-up, contact happens at sqrt(2*a*s_hit) instead (logged at build).
-PUSH_ACCEL: float = 12.0
+# PUSH_ACCEL >= PUSH_SPEED^2 / (2 * retreat run-up). NOTE with 3.0 / 15 the
+# needed run-up is 0.225 m > PUSH_RETREAT_DISTANCE 0.2 — contact happens at
+# sqrt(2*20*0.2) ~= 2.83 m/s while still accelerating; 3.0 is reached
+# 2.5 cm into the follow-through (logged at build as contact@...).
+PUSH_ACCEL: float = 20.0
 
 # Waypoint sampling rate (Hz) for the push stroke ONLY. Descent/chain stay at
 # cfg.TRAJ_HZ (20) — they are plain joint moves the 250 Hz stream resampler
@@ -113,6 +114,14 @@ PUSH_CHAIN_PARK_LIFT: float = 0.0
 # the arm up-and-over right after the chain had just descended into the park
 # — the observed double up-down bob at push start.
 PUSH_APPROACH_VIA_XY: float = 0.30
+
+# Safe transit height (m, absolute TCP Z) for the chain when it parks at the
+# NEXT push's backswing (a LOW pose). The chain is a JOINT-space
+# interpolation; between two belt-height endpoints its Cartesian Z sags
+# BELOW both ends mid-transit (and the paddle edge dips further while the
+# wrist swings follow-through→back-lean) — observed belt strikes. The chain
+# therefore rises to this height over the park and drops vertically onto it.
+PUSH_CHAIN_TRANSIT_Z: float = 0.10
 
 # ---- Dynamic follow-through (execute() path) --------------------------------
 # Follow-through (m) PAST the contact point scales with how far the bin is
@@ -965,12 +974,28 @@ class PushSkill(ManipulationSkill):
             # standby — push_end raised to home Z, so the arm clears the belt without
             # the wasted home round-trip. copy() so ctx.idle_joint is never mutated
             # by the wrist write below.
+            chain_via = None
             if chain_park is not None:
                 # The NEXT object's skill supplied its own action-start park —
                 # for push: the next backswing pose + PUSH_CHAIN_PARK_LIFT.
                 # Full 6-DOF IK pose, wrist included — no overwrites.
                 chain_target = np.asarray(chain_park, dtype=float).copy()
                 chain_dest = "next action-start park"
+                # LOW park → route the transit through the park RAISED to
+                # PUSH_CHAIN_TRANSIT_Z (same XY/orientation), then descend
+                # vertically. A direct low-to-low joint interpolation sags
+                # below its endpoints mid-belt (observed floor strikes).
+                T_hi = ctx.robot.forward_kinematics(chain_target[:6])
+                T_hi[2, 3] = PUSH_CHAIN_TRANSIT_Z
+                q_via = ctx.robot.inverse_kinematics(
+                    T_hi, q_init=chain_target[:6]
+                )
+                if q_via is not None:
+                    chain_via = np.asarray(q_via, dtype=float)
+                else:
+                    ctx.log.warn(
+                        "Chain transit via IK failed; direct low chain"
+                    )
             elif next_grasp is not None:
                 # Generic park OVER the next grasp (raised Z, PICK_WRIST_J6
                 # baseline from lifted_standby_joint) — a belt-height chain
@@ -987,11 +1012,25 @@ class PushSkill(ManipulationSkill):
                 chain_dest = "lifted standby"
             chained_to_next = False
 
-            traj_chain, vel_chain, ts_chain = trajectory(
-                push_end_q, push_end_dq,
-                chain_target[:6], zero6,
-                ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
-            )
+            if chain_via is not None:
+                traj_chain, vel_chain, ts_chain = trajectory_3points(
+                    push_end_q, push_end_dq,
+                    chain_via[:6], zero6,
+                    chain_target[:6], zero6,
+                    ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
+                )
+                # Drop zero-gap duplicate knots at the via (see the approach
+                # segment) so the stream's Hermite resampler stays active.
+                keep = np.concatenate(([True], np.diff(ts_chain) > 1e-9))
+                traj_chain = traj_chain[:, keep]
+                vel_chain = vel_chain[:, keep]
+                ts_chain = ts_chain[keep]
+            else:
+                traj_chain, vel_chain, ts_chain = trajectory(
+                    push_end_q, push_end_dq,
+                    chain_target[:6], zero6,
+                    ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
+                )
             # Drop chain's first sample (duplicate of stroke's last), shift ts.
             stroke_end_t = seg_ts[-1][-1] if len(seg_ts[-1]) > 0 else desc_end_t
             traj_chain = traj_chain[:, 1:]
