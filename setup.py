@@ -81,6 +81,10 @@ setup(
             # Standalone keyboard suction toggle for the adv4ncr driver (TCP 50242
             # Simple Message IoServer; no ROS service needed). Run supervised.
             "suction_keys = gp8_control.tests.suction_keys:main",
+            # EE-line IK streaming validation (stroke-style Cartesian control
+            # for descent/chain). Sim: stream_sim.launch.py first. Needs scipy;
+            # if system python lacks it, run via .venv/bin/python -m.
+            "line_stream_test = gp8_control.tests.line_stream_test:main",
         ],
     },
 )

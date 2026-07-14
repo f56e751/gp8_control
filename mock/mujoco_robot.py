@@ -299,6 +299,7 @@ class MujocoRobot(MockRobot):
             msg.velocity = list(self._measured_vel)
         msg.effort = [0.0] * 6
         self._js_pub.publish(msg)
+        self._js_pub_raw.publish(msg)   # adv4ncr stream stack reads /joint_states
 
     def _drive_queue(self) -> None:
         """Same real-time queue playback as MockRobot, but also exposes the
