@@ -49,7 +49,7 @@ ros2 launch gp8_control suction_lift_preview.launch.py
 - pick: `(x=0.55, y=0.0, z=Config.GRASP_Z)`
 - lift: `0.10 m`
 - bin: `(x=1.5, y=0.0, z=pick_z + 0.10)`
-- release: `(x=pick_x + 0.10, y=pick_y, z=pick_z + 0.33)`
+- release: `pick→bin 방향 0.10 m, z=pick_z + 0.33` (실패 시 거리/Z adaptive)
 - extra tool offset: `0.0 m`
 - preview rate: `60 Hz`
 - preview playback: `0.25x` 슬로모션
@@ -61,7 +61,7 @@ ros2 launch gp8_control suction_lift_preview.launch.py
 ros2 launch gp8_control suction_lift_preview.launch.py \
   x:=0.55 y:=0.0 \
   bin_x:=1.50 bin_y:=0.0 bin_z_offset:=0.10 \
-  release_x_offset:=0.10 release_z_offset:=0.33 \
+  release_distance:=0.10 release_z_offset:=0.33 \
   tool_offset:=0.0 \
   preview_rate:=60.0 preview_speed:=0.25 \
   preview_domain_id:=42
@@ -160,10 +160,15 @@ pick = (0.55, 0.0, Config.GRASP_Z)
 bin  = (1.50, 0.0, Config.GRASP_Z + 0.10)
 ```
 
-기본 release는 pick에서 world +X 10 cm, world +Z 33 cm이다. release에서
+기본 release는 pick→bin 선분 방향 10 cm, world +Z 33 cm이다. release에서
 bin까지의 수평거리와 높이차를 이용해 진공 탄도의 필요 속도가 최소가
 되는 발사각과 속도를 계산한다. release 툴 +X축은 투척 전방에서
 아래로 30° 기울인다.
+
+기준 release가 관절 위치/속도/가속도 제한을 만족하지 못하면
+pick→bin 방향 거리 `10~25 cm`(간격 5 cm), release Z offset
+`20~60 cm`(간격 2 cm)를 자동 탐색한다. 기준 `10 cm / 33 cm`에
+가장 가까운 유효 후보를 선택한다.
 
 TCP 위치에 원호를 강제하지 않는다. release에서 필요한 TCP 선속도와
 투척 평면 내 각속도를 spatial Jacobian으로 release 관절속도로 바꿘 뒤,
@@ -180,8 +185,10 @@ release에서 가속도가 0으로 연속이다. 전 관절의 위치는 하드 
 
 ```text
 BIN_Z_OFFSET_DEFAULT = 0.10
-RELEASE_X_OFFSET_DEFAULT = 0.10
+RELEASE_DISTANCE_DEFAULT = 0.10
 RELEASE_Z_OFFSET_DEFAULT = 0.33
+RELEASE_DISTANCE_MIN/MAX/STEP = 0.10 / 0.25 / 0.05
+RELEASE_Z_OFFSET_MIN/MAX/STEP = 0.20 / 0.60 / 0.02
 TOOL_OFFSET_DEFAULT = 0.0
 THROW_ACCEL_LIMITS = [10, 10, 10, 15, 15, 20]
 THROW_ACCEL_SCALE = 0.90
@@ -285,7 +292,7 @@ ros2 run gp8_control suction_lift_debug \
 --vel-scale          pick/lift 등 저속 이동 scale
 --bin-x, --bin-y     bin XY [m]
 --bin-z-offset       bin z = pick z + offset [m]
---release-x-offset   release x = pick x + offset [m]
+--release-distance   pick→bin 방향 release 기준 거리 [m]
 --release-z-offset   release z = pick z + offset [m]
 --tool-offset        flange +X 방향 tool offset [m]
 --release-lead       release knot 대비 석션 OFF timing 보정 [s]

@@ -4,8 +4,9 @@
 throw_skill 이 ambush 대기에 쓰는 그 그랩 높이)로 내려가 파킹 → 석션 ON(기본
 1초 홀드, 진공 형성) → 10 cm 리프트. 이후 선택적으로 **throw**:
 
-  * release XY = pick에서 world +X 10 cm, release Z = pick +33 cm.
-    이 오프셋은 --release-x-offset/--release-z-offset으로 바꿀 수 있다.
+  * release XY = pick→bin 방향 10 cm, release Z = pick +33 cm을 우선
+    사용한다. 계획이 실패하면 거리 10~25 cm, Z 20~60 cm에서
+    제한을 만족하는 가장 가까운 release를 자동 선택한다.
   * release→bin 포물선은 두 지점을 연결하는 최소 속도 탄도를 계산한다.
     release에서 툴 축은 투척 전방 기준 아래 30°다.
   * 스윙은 TCP에 원호를 강제하지 않는다. release pose와 탄도 선속도,
@@ -32,8 +33,8 @@ app.py / 카메라 / 컨베이어 / torch 의존 없음. 로봇 드라이버 bri
   --vel-scale   저속 이동 속도 스케일 (기본 0.3)
   --bin-x/--bin-y  bin XY 위치 [m] (기본 1.5, 0.0)
   --bin-z-offset   bin 목표 높이 = 그랩 높이 + offset [m] (기본 0.10)
-  --release-x-offset release X = pick X + offset [m] (기본 0.10)
-  --release-z-offset release Z = pick Z + offset [m] (기본 0.33)
+  --release-distance pick→bin 방향 release 기준 거리 [m] (기본 0.10)
+  --release-z-offset release Z 기준 offset [m] (기본 0.33)
   --tool-offset     gp8.py EE/TCP 위에 추가 적용할 offset [m] (기본 0.0;
                    일반적으로 사용하지 않음)
   --release-lead   석션 off 를 release knot 보다 이만큼 일찍 발화 [s] (기본 0.0;
@@ -80,8 +81,14 @@ JOINT_LIMIT_MARGIN = np.radians(2.0)  # 전 관절 하드 리미트 안쪽 안�
 WRIST_BRANCH_JUMP_MAX = np.radians(90.0)  # J4/J6 180° 반대 IK 해 금지
 THROW_TOOL_PITCH = np.radians(-30.0)  # 투척 전방 기준 툴 축 pitch (아래가 음수)
 THROW_DT = 0.01            # throw 구간 knot 간격 [s] (스트림이 4ms 로 리샘플)
-RELEASE_X_OFFSET_DEFAULT = 0.10  # release X = pick X + offset [m]
+RELEASE_DISTANCE_DEFAULT = 0.10  # release XY = pick XY + distance * unit(pick→bin)
 RELEASE_Z_OFFSET_DEFAULT = 0.33  # release Z = pick Z + offset [m]
+RELEASE_DISTANCE_MIN = 0.10
+RELEASE_DISTANCE_MAX = 0.25
+RELEASE_DISTANCE_STEP = 0.05
+RELEASE_Z_OFFSET_MIN = 0.20
+RELEASE_Z_OFFSET_MAX = 0.60
+RELEASE_Z_OFFSET_STEP = 0.02
 # MoveIt joint_limits.yaml의 max_acceleration. 10% 안전 여유를 둔다.
 THROW_ACCEL_LIMITS = np.array([10.0, 10.0, 10.0, 15.0, 15.0, 20.0])
 THROW_ACCEL_SCALE = 0.90
@@ -125,12 +132,12 @@ def _flange_origin_from_tool(tool_pos, R_flange, tool_offset: float) -> np.ndarr
 # =====================================================================
 def plan_parabola_throw(
     grasp_xyz, bin_xy, bin_z_offset: float = BIN_Z_OFFSET_DEFAULT,
-    release_x_offset: float = RELEASE_X_OFFSET_DEFAULT,
+    release_distance: float = RELEASE_DISTANCE_DEFAULT,
     release_z_offset: float = RELEASE_Z_OFFSET_DEFAULT,
 ) -> dict:
     """release 지점과 release→bin 최소속도 탄도를 계산한다.
 
-    release X/Y는 ``(pick X + release_x_offset, pick Y)``이고 Z는
+    release XY는 ``pick XY + release_distance * unit(pick→bin)``이고 Z는
     ``pick Z + release_z_offset``이다. release→bin의 수평거리 ``R``과
     높이차 ``dz``에 대해 진공 탄도의 필요 초기속도가 최소가 되는 해를 쓴다.
 
@@ -144,8 +151,20 @@ def plan_parabola_throw(
     bin_xy = np.asarray(bin_xy, dtype=float)
     z_g = float(G[2])
     z_bin = z_g + float(bin_z_offset)
+    pick_to_bin = bin_xy - G[:2]
+    D = float(np.linalg.norm(pick_to_bin))
+    if D < 0.05:
+        raise ValueError(f"bin이 pick과 너무 가깝습니다 ({D:.3f} m)")
+    release_distance = float(release_distance)
+    if release_distance <= 0.0 or release_distance >= D - 0.05:
+        raise ValueError(
+            f"release 거리가 pick→bin 거리에 맞지 않습니다 "
+            f"(release={release_distance:.3f}, pick→bin={D:.3f} m)"
+        )
+    pick_to_bin_unit = pick_to_bin / D
     release_pos = np.array([
-        G[0] + float(release_x_offset), G[1],
+        G[0] + release_distance * pick_to_bin_unit[0],
+        G[1] + release_distance * pick_to_bin_unit[1],
         z_g + float(release_z_offset),
     ])
     d_fly_xy = bin_xy - release_pos[:2]
@@ -206,8 +225,7 @@ def plan_parabola_throw(
         grasp=G, bin_xy=np.asarray(bin_xy, dtype=float),
         bin_xyz=np.array([bin_xy[0], bin_xy[1], z_bin], dtype=float),
         z_g=z_g, z_bin=z_bin, bin_z_offset=float(bin_z_offset),
-        D=float(np.linalg.norm(bin_xy - G[:2])), R=R_fly,
-        release_x_offset=float(release_x_offset),
+        D=D, R=R_fly, release_distance=release_distance,
         release_z_offset=float(release_z_offset),
         release_pos=release_pos, v_rel=v_rel, speed=speed, u3=u3, u_xy=u_xy,
         vx=vx, launch_angle=float(np.arctan2(vz_rel, vx)),
@@ -397,7 +415,7 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
     q_release = np.asarray(q_release, dtype=float)
     J_release = gp8.jacobian(q_release)
     n_plane = np.array([-plan["u_xy"][1], plan["u_xy"][0], 0.0])
-    best = None
+    kinematic_candidates = []
     reject_counts = {"velocity": 0, "position": 0, "wrist": 0, "floor": 0}
 
     for omega_mag in np.arange(
@@ -426,12 +444,12 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
         ))
         if half_duration <= 1e-6:
             continue
-        traj, velj, ts, i_rel, q_start, q_end = _joint_swing_profile(
-            q_release, qd_release, half_duration, THROW_DT,
-        )
+        q_start = q_release - 0.5 * qd_release * half_duration
+        q_end = q_release + 0.5 * qd_release * half_duration
+        q_bounds = np.column_stack([q_start, q_release, q_end])
         if (
-            np.any(traj < soft_lower[:, None] - 1e-9)
-            or np.any(traj > soft_upper[:, None] + 1e-9)
+            np.any(q_bounds < soft_lower[:, None] - 1e-9)
+            or np.any(q_bounds > soft_upper[:, None] + 1e-9)
         ):
             reject_counts["position"] += 1
             continue
@@ -443,6 +461,36 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
             reject_counts["wrist"] += 1
             continue
 
+        accel_peak = np.abs(qd_release) / (
+            half_duration * (1.0 - THROW_JERK_RAMP_FRACTION)
+        )
+        score = (half_duration, -float(np.min(np.minimum(
+            q_bounds - joint_limits[:, 0, None],
+            joint_limits[:, 1, None] - q_bounds,
+        ))))
+        kinematic_candidates.append(dict(
+            score=score,
+            q_start=q_start, q_release=q_release.copy(), q_end=q_end,
+            qd_release=qd_release, omega_release=omega_release,
+            release_omega=float(omega_mag), vel_ratio=vel_ratio,
+            accel_peak=accel_peak,
+            accel_ratio=float(np.max(accel_peak / THROW_ACCEL_LIMITS)),
+            wrist_branch_jump=wrist_jump,
+        ))
+
+    if not kinematic_candidates:
+        raise ValueError(
+            "release constraint를 만족하는 관절 스윙을 만들 수 없습니다 "
+            f"(제외: {reject_counts}) — release Z를 높이거나 bin을 가깝게 하세요"
+        )
+
+    best = None
+    # 관절 조건으로 정렬한 뒤 상위 후보부터 FK를 계산한다. 기존처럼
+    # 모든 omega 후보에 전체 FK를 반복하지 않아 adaptive 탐색 시간을 줄인다.
+    for candidate in sorted(kinematic_candidates, key=lambda c: c["score"]):
+        traj, velj, ts, i_rel, q_start, q_end = _joint_swing_profile(
+            q_release, candidate["qd_release"], candidate["score"][0], THROW_DT,
+        )
         swing_pos = np.zeros((traj.shape[1], 3), dtype=float)
         swing_R = np.zeros((traj.shape[1], 3, 3), dtype=float)
         for k in range(traj.shape[1]):
@@ -453,31 +501,18 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
         if z_min < plan["z_g"] + FLOOR_CLEARANCE:
             reject_counts["floor"] += 1
             continue
-
-        accel_peak = np.abs(qd_release) / (
-            half_duration * (1.0 - THROW_JERK_RAMP_FRACTION)
-        )
-        score = (half_duration, -float(np.min(np.minimum(
-            traj - joint_limits[:, 0, None],
-            joint_limits[:, 1, None] - traj,
-        ))))
-        candidate = dict(
-            score=score, traj=traj, vel=velj, ts=ts, release_idx=i_rel,
-            q_start=q_start, q_release=q_release.copy(), q_end=q_end,
-            qd_release=qd_release, omega_release=omega_release,
-            release_omega=float(omega_mag), vel_ratio=vel_ratio,
-            accel_peak=accel_peak,
-            accel_ratio=float(np.max(accel_peak / THROW_ACCEL_LIMITS)),
-            wrist_branch_jump=wrist_jump, swing_pos=swing_pos,
+        candidate.update(
+            traj=traj, vel=velj, ts=ts, release_idx=i_rel,
+            q_start=q_start, q_end=q_end, swing_pos=swing_pos,
             swing_R=swing_R, z_min=z_min,
         )
-        if best is None or candidate["score"] < best["score"]:
-            best = candidate
+        best = candidate
+        break
 
     if best is None:
         raise ValueError(
-            "release constraint를 만족하는 관절 스윙을 만들 수 없습니다 "
-            f"(제외: {reject_counts}) — release Z를 높이거나 bin을 가깝게 하세요"
+            "관절 제한을 만족하는 후보가 모두 바닥 클리어런스를 위반합니다 "
+            f"(제외: {reject_counts})"
         )
 
     Jr = gp8.jacobian(best["q_release"])
@@ -504,6 +539,82 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
     return best
 
 
+def _adaptive_release_candidates(preferred_distance: float, preferred_z: float):
+    """기준 release에 가까운 순서로 (수평거리, Z offset) 후보를 만든다."""
+    distances = list(np.arange(
+        RELEASE_DISTANCE_MIN,
+        RELEASE_DISTANCE_MAX + 0.5 * RELEASE_DISTANCE_STEP,
+        RELEASE_DISTANCE_STEP,
+    ))
+    z_offsets = list(np.arange(
+        RELEASE_Z_OFFSET_MIN,
+        RELEASE_Z_OFFSET_MAX + 0.5 * RELEASE_Z_OFFSET_STEP,
+        RELEASE_Z_OFFSET_STEP,
+    ))
+    distances.append(float(preferred_distance))
+    z_offsets.append(float(preferred_z))
+    distances = sorted({round(float(v), 6) for v in distances})
+    z_offsets = sorted({round(float(v), 6) for v in z_offsets})
+    candidates = [(d, z) for d in distances for z in z_offsets]
+    candidates.sort(key=lambda c: (
+        abs(c[0] - preferred_distance) / RELEASE_DISTANCE_STEP
+        + abs(c[1] - preferred_z) / RELEASE_Z_OFFSET_STEP,
+        abs(c[0] - preferred_distance),
+        abs(c[1] - preferred_z),
+        c[1],
+    ))
+    return candidates
+
+
+def plan_and_build_adaptive_throw(
+    gp8: GP8, grasp_xyz, bin_xy, bin_z_offset: float, q_seed, vel_limits,
+    preferred_distance: float = RELEASE_DISTANCE_DEFAULT,
+    preferred_z_offset: float = RELEASE_Z_OFFSET_DEFAULT,
+    tool_offset: float = TOOL_OFFSET_DEFAULT,
+):
+    """release 거리/Z를 adaptive 탐색해 ``(plan, built)``를 반환한다.
+
+    기준값을 먼저 시도하고, 실패할 때만 pick→bin 방향 10~25 cm,
+    pick Z +20~60 cm 격자를 기준값에 가까운 순서로 탐색한다.
+    """
+    errors = []
+    candidates = _adaptive_release_candidates(
+        float(preferred_distance), float(preferred_z_offset),
+    )
+    for index, (distance, z_offset) in enumerate(candidates, start=1):
+        try:
+            plan = plan_parabola_throw(
+                grasp_xyz, bin_xy, bin_z_offset=bin_z_offset,
+                release_distance=distance, release_z_offset=z_offset,
+            )
+            built = build_throw(
+                gp8, plan, q_seed=q_seed, vel_limits=vel_limits,
+                tool_offset=tool_offset,
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        plan.update(
+            adaptive_release=(
+                abs(distance - preferred_distance) > 1e-9
+                or abs(z_offset - preferred_z_offset) > 1e-9
+            ),
+            preferred_release_distance=float(preferred_distance),
+            preferred_release_z_offset=float(preferred_z_offset),
+            release_candidates_tested=index,
+            release_candidates_total=len(candidates),
+        )
+        return plan, built
+
+    last_error = errors[-1] if errors else "후보 없음"
+    raise ValueError(
+        f"adaptive release 계획 실패: {len(candidates)}개 후보가 모두 불가 "
+        f"(거리 {RELEASE_DISTANCE_MIN:.2f}~{RELEASE_DISTANCE_MAX:.2f} m, "
+        f"Z {RELEASE_Z_OFFSET_MIN:.2f}~{RELEASE_Z_OFFSET_MAX:.2f} m); "
+        f"마지막 원인: {last_error}"
+    )
+
+
 def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
     p, b = plan, built
     rp, v = p["release_pos"], p["v_rel"]
@@ -512,10 +623,14 @@ def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
     print(f"  grasp→bin : D={p['D']:.3f} m, "
           f"bin=({p['bin_xyz'][0]:+.3f}, {p['bin_xyz'][1]:+.3f}, {p['bin_xyz'][2]:+.3f}) "
           f"(grasp z +{p['bin_z_offset'] * 100:.1f} cm)")
-    print(f"  release   : pick X +{p['release_x_offset'] * 100:.1f} cm, "
+    mode = "adaptive" if p.get("adaptive_release", False) else "preferred"
+    print(f"  release   : pick→bin {p['release_distance'] * 100:.1f} cm, "
           f"pick Z +{p['release_z_offset'] * 100:.1f} cm, "
           f"pos=({rp[0]:+.3f}, {rp[1]:+.3f}, {rp[2]:+.3f}) m "
           f"(그랩 높이 +{(rp[2] - p['z_g']) * 100:.1f} cm, 신전율 {p['r_extension'] * 100:.0f}%)")
+    print(f"              selection={mode}, "
+          f"candidate {p.get('release_candidates_tested', 1)}/"
+          f"{p.get('release_candidates_total', 1)}")
     print(f"              v=({v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f}) m/s, "
           f"|v|={p['speed']:.3f} m/s, {ang:.2f}°  "
           f"(툴 pitch {np.degrees(THROW_TOOL_PITCH):+.0f}°)")
@@ -586,14 +701,11 @@ def _move_cart_slerp(ctrl, gp8: GP8, p0, p1, R0, R1, q_seed,
 # 사이클
 # =====================================================================
 def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, vel_limits) -> None:
-    plan = plan_parabola_throw(
-        grasp_xyz, (args.bin_x, args.bin_y),
-        bin_z_offset=args.bin_z_offset,
-        release_x_offset=args.release_x_offset,
-        release_z_offset=args.release_z_offset,
-    )
-    built = build_throw(
-        gp8, plan, q_seed=lift_q, vel_limits=vel_limits,
+    plan, built = plan_and_build_adaptive_throw(
+        gp8, grasp_xyz, (args.bin_x, args.bin_y), args.bin_z_offset,
+        q_seed=lift_q, vel_limits=vel_limits,
+        preferred_distance=args.release_distance,
+        preferred_z_offset=args.release_z_offset,
         tool_offset=args.tool_offset,
     )
     print_throw_plan(plan, built, args.release_lead)
@@ -700,14 +812,11 @@ def plan_only(gp8: GP8, args, z: float, vel_limits) -> None:
         print("lift 자세 IK 실패 — 그랩 지점을 확인하세요.")
         return
     try:
-        plan = plan_parabola_throw(
-            grasp_xyz, (args.bin_x, args.bin_y),
-            bin_z_offset=args.bin_z_offset,
-            release_x_offset=args.release_x_offset,
-            release_z_offset=args.release_z_offset,
-        )
-        built = build_throw(
-            gp8, plan, q_seed=q_seed, vel_limits=vel_limits,
+        plan, built = plan_and_build_adaptive_throw(
+            gp8, grasp_xyz, (args.bin_x, args.bin_y), args.bin_z_offset,
+            q_seed=q_seed, vel_limits=vel_limits,
+            preferred_distance=args.release_distance,
+            preferred_z_offset=args.release_z_offset,
             tool_offset=args.tool_offset,
         )
     except ValueError as e:
@@ -784,14 +893,11 @@ def _build_rviz_preview(gp8: GP8, args, z: float, vel_limits):
     if lift_q is None:
         raise ValueError(f"lift IK 실패: ({args.x:+.3f}, {args.y:+.3f}, {z + args.lift:+.3f})")
 
-    plan = plan_parabola_throw(
-        grasp_xyz, (args.bin_x, args.bin_y),
-        bin_z_offset=args.bin_z_offset,
-        release_x_offset=args.release_x_offset,
-        release_z_offset=args.release_z_offset,
-    )
-    built = build_throw(
-        gp8, plan, q_seed=lift_q, vel_limits=vel_limits,
+    plan, built = plan_and_build_adaptive_throw(
+        gp8, grasp_xyz, (args.bin_x, args.bin_y), args.bin_z_offset,
+        q_seed=lift_q, vel_limits=vel_limits,
+        preferred_distance=args.release_distance,
+        preferred_z_offset=args.release_z_offset,
         tool_offset=args.tool_offset,
     )
 
@@ -1047,8 +1153,10 @@ def main() -> None:
     parser.add_argument("--bin-z-offset", type=float, default=BIN_Z_OFFSET_DEFAULT,
                         help="bin 목표 높이 = grasp Z + offset [m] (기본 0.10)")
     parser.add_argument(
-        "--release-x-offset", type=float, default=RELEASE_X_OFFSET_DEFAULT,
-        help="release X = grasp X + offset [m] (기본 0.10)",
+        "--release-distance", "--release-x-offset", dest="release_distance",
+        type=float, default=RELEASE_DISTANCE_DEFAULT,
+        help="pick→bin 방향 release 기준 거리 [m] (기본 0.10; "
+             "--release-x-offset은 하위 호환 별칭)",
     )
     parser.add_argument(
         "--release-z-offset", type=float, default=RELEASE_Z_OFFSET_DEFAULT,
@@ -1081,10 +1189,6 @@ def main() -> None:
 
     if args.rviz_preview:
         rviz_preview(gp8, args, z, vel_limits)
-        return
-
-    if float(np.hypot(args.x, args.y)) > cfg.MAX_REACH:
-        print(f"지점 ({args.x:+.3f}, {args.y:+.3f}) 이 MAX_REACH {cfg.MAX_REACH} m 밖입니다.")
         return
 
     import rclpy
@@ -1137,9 +1241,6 @@ def main() -> None:
                     args.x, args.y = float(parts[0]), float(parts[1])
                 except ValueError:
                     print("  좌표 해석 실패 — 종료합니다.")
-                    break
-                if float(np.hypot(args.x, args.y)) > cfg.MAX_REACH:
-                    print(f"  ({args.x:+.3f}, {args.y:+.3f}) 은 MAX_REACH 밖 — 종료합니다.")
                     break
                 continue
             break

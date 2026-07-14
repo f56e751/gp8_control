@@ -30,7 +30,7 @@ def generate_launch_description():
     bin_x = LaunchConfiguration("bin_x")
     bin_y = LaunchConfiguration("bin_y")
     bin_z_offset = LaunchConfiguration("bin_z_offset")
-    release_x_offset = LaunchConfiguration("release_x_offset")
+    release_distance = LaunchConfiguration("release_distance")
     release_z_offset = LaunchConfiguration("release_z_offset")
     tool_offset = LaunchConfiguration("tool_offset")
     vel_scale = LaunchConfiguration("vel_scale")
@@ -52,8 +52,8 @@ def generate_launch_description():
                               description="target bin Y [m]"),
         DeclareLaunchArgument("bin_z_offset", default_value="0.10",
                               description="target bin height offset from grasp z [m]"),
-        DeclareLaunchArgument("release_x_offset", default_value="0.10",
-                              description="release X offset from pick X [m]"),
+        DeclareLaunchArgument("release_distance", default_value="0.10",
+                              description="preferred release distance along pick-to-bin [m]"),
         DeclareLaunchArgument("release_z_offset", default_value="0.33",
                               description="release Z offset from pick Z [m]"),
         DeclareLaunchArgument("tool_offset", default_value="0.0",
@@ -112,7 +112,7 @@ def generate_launch_description():
         "--bin-x", bin_x,
         "--bin-y", bin_y,
         "--bin-z-offset", bin_z_offset,
-        "--release-x-offset", release_x_offset,
+        "--release-distance", release_distance,
         "--release-z-offset", release_z_offset,
         "--tool-offset", tool_offset,
         "--vel-scale", vel_scale,
