@@ -16,12 +16,21 @@ Prereqs (adv4ncr stream stack, NO app):
      pendant REMOTE + no alarms.)
   3. Run this tool with the venv python::
 
-       PYTHONPATH=$HOME/ros2_ws/src \
+       source /opt/ros/humble/setup.bash   # rclpy
+       PYTHONPATH=$HOME/ros2_ws/src:$PYTHONPATH \
          ~/ros2_ws/src/gp8_control/.venv/bin/python \
-         -m gp8_control.tests.push_height_test [--x 0.55] [--y 0.0]
+         -m gp8_control.tests.push_height_test [--x 0.55] [--y 0.0] \
+             [--start-lifted | --z 0.02]
 
 Place a can at (--x, --y). Default push direction points at the metal bin
 (PUSH_BIN_TARGET_MAP), like a real metal push.
+
+``--start-lifted`` starts at PUSH_HEIGHT + PUSH_START_LIFT (the parked
+backswing TCP height) instead of PUSH_HEIGHT — with NEUTRAL swing (rod
+vertical), to verify the parked clearance: expect ~START_LIFT of air under
+the paddle; pressing ``1`` (back-lean) at the same height should just about
+close that gap (the tilt→dip lever, PUSH_PAD_FORE). ``--z`` sets any
+explicit start height. The final 5 cm of the descent runs extra slow.
 
 Keys:
   -/+ (or =)  height down/up 5 mm        j/u  height down/up 1 mm
@@ -50,6 +59,7 @@ from gp8_control.robots.gp8 import GP8
 from gp8_control.skills.push_skill import (
     PUSH_BIN_TARGET_MAP,
     PUSH_HEIGHT,
+    PUSH_START_LIFT,
     SWING_ANGLE,
     SWING_BIAS,
     PushSkill,
@@ -63,6 +73,8 @@ STROKE_LEN = 0.12       # mini-stroke length (m)
 STROKE_SPEED = 0.15     # mini-stroke TCP speed (m/s) — slow, watch the contact
 JOG_HZ = 50.0           # knot rate for jog trajectories (stream resamples to 4 ms)
 SPEED_SCALE = 0.15      # fraction of joint velocity limits for ALL moves here
+SLOW_FINAL_DZ = 0.05    # last part of the descent (m) runs extra slow ...
+SLOW_SCALE = 0.3        # ... at this fraction of the (already slow) M1
 
 SWING_BACK = SWING_BIAS - SWING_ANGLE     # stroke-start lean (parked/wait pose)
 SWING_NEUTRAL = 0.0                       # contact-instant pose (impact-synced)
@@ -83,7 +95,8 @@ def get_key() -> str:
 
 
 class HeightTuner:
-    def __init__(self, node: Node, x: float, y: float, bin_xy: tuple) -> None:
+    def __init__(self, node: Node, x: float, y: float, bin_xy: tuple,
+                 z0: float = PUSH_HEIGHT) -> None:
         self.node = node
         self.robot = GP8()
         self.ctrl = TrajectoryController(node)
@@ -92,7 +105,7 @@ class HeightTuner:
         self.xy = np.array([x, y], dtype=float)
         d = np.array([bin_xy[0] - x, bin_xy[1] - y, 0.0])
         self.push_dir = d / np.linalg.norm(d)
-        self.z = float(PUSH_HEIGHT)
+        self.z = float(z0)
         self.swing = SWING_NEUTRAL
 
     # ---------------- pose / motion ----------------
@@ -108,7 +121,7 @@ class HeightTuner:
         cj = self.ctrl.current_joints
         return None if cj is None else np.asarray(cj, dtype=float)
 
-    def _goto(self, T: np.ndarray) -> bool:
+    def _goto(self, T: np.ndarray, m_scale: float = 1.0) -> bool:
         cur = self._current()
         if cur is None:
             print("  !! no /joint_states yet")
@@ -119,7 +132,8 @@ class HeightTuner:
             return False
         zero = np.zeros(6)
         traj, vel, ts = trajectory(cur, zero, np.asarray(q, float), zero,
-                                   self.M1, self.M2, hertz=JOG_HZ)
+                                   self.M1 * m_scale, self.M2 * m_scale,
+                                   hertz=JOG_HZ)
         self.ctrl.send_trajectory(traj, vel, ts)   # blocks while streaming
         return True
 
@@ -151,8 +165,13 @@ class HeightTuner:
         print(f"  hover over ({self.xy[0]:+.3f}, {self.xy[1]:+.3f}) ...")
         if not self._goto(self._pose(HOVER_Z, self.swing)):
             raise RuntimeError("cannot reach hover pose")
-        print(f"  descending to z={self.z:.4f} ...")
-        self._goto(self._pose(self.z, self.swing))
+        mid = self.z + SLOW_FINAL_DZ
+        if HOVER_Z > mid:
+            print(f"  descending to z={mid:.3f} ...")
+            self._goto(self._pose(mid, self.swing))
+        print(f"  slow final approach to z={self.z:.4f} "
+              f"({SPEED_SCALE * SLOW_SCALE * 100:.1f}% joint speed) ...")
+        self._goto(self._pose(self.z, self.swing), m_scale=SLOW_SCALE)
         self.status()
 
     def nudge(self, dz: float) -> None:
@@ -202,7 +221,8 @@ class HeightTuner:
     def status(self) -> None:
         print(
             f"  >>> z = {self.z:.4f} m   swing {np.degrees(self.swing):+.0f}°   "
-            f"(current PUSH_HEIGHT constant: {PUSH_HEIGHT})"
+            f"(PUSH_HEIGHT={PUSH_HEIGHT}, parked="
+            f"{PUSH_HEIGHT + PUSH_START_LIFT:.3f})"
         )
 
 
@@ -210,7 +230,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--x", type=float, default=0.55, help="test point base X (m)")
     ap.add_argument("--y", type=float, default=0.0, help="test point base Y (m)")
+    ap.add_argument("--z", type=float, default=None,
+                    help="explicit start TCP height (m); default PUSH_HEIGHT")
+    ap.add_argument("--start-lifted", action="store_true",
+                    help="start at PUSH_HEIGHT + PUSH_START_LIFT (parked "
+                         "backswing height), NEUTRAL swing (rod vertical)")
     args = ap.parse_args()
+
+    z0 = PUSH_HEIGHT + PUSH_START_LIFT if args.start_lifted else PUSH_HEIGHT
+    if args.z is not None:
+        z0 = args.z
 
     rclpy.init()
     node = Node("push_height_test")
@@ -220,7 +249,8 @@ def main() -> None:
     spin.start()
 
     tuner = HeightTuner(node, args.x, args.y,
-                        PUSH_BIN_TARGET_MAP.get("metal", (1.2, 0.5, 0.0)))
+                        PUSH_BIN_TARGET_MAP.get("metal", (1.2, 0.5, 0.0)),
+                        z0=z0)
 
     print(__doc__.split("Keys:")[1].split("All motion")[0])
     print(f"test point ({args.x:+.3f}, {args.y:+.3f}), dir "
