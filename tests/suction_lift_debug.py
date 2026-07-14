@@ -41,7 +41,8 @@ app.py / 카메라 / 컨베이어 / torch 의존 없음. 로봇 드라이버 bri
   --vel-scale   저속 이동 속도 스케일 (기본 0.3)
   --bin-x/--bin-y  bin XY 위치 [m] (기본 1.0, 0.0)
   --bin-z-offset   bin 목표 높이 = 그랩 높이 + offset [m] (기본 0.10)
-  --tool-offset     suction_tool = flange + flange +X * offset [m] (기본 0.24)
+  --tool-offset     gp8.py EE/TCP 위에 추가 적용할 offset [m] (기본 0.0;
+                   일반적으로 사용하지 않음)
   --release-lead   석션 off 를 release knot 보다 이만큼 일찍 발화 [s] (기본 0.0;
                    IO/배기 지연 보정용, 음수 = 늦게)
   --rviz-preview    로봇에 명령을 보내지 않고 RViz용 marker/path/joint_states publish
@@ -92,7 +93,7 @@ PREMOVE_SPEED = 0.20       # 와인드업 위치로 하강/복귀 카르테시�
 PREMOVE_ACCEL = 1.0        # 그 가속도 [m/s^2]
 PREMOVE_DT = 0.02          # 그 knot 간격 [s]
 BIN_Z_OFFSET_DEFAULT = 0.10      # bin 목표 높이 = grasp z + 이 값 [m]
-TOOL_OFFSET_DEFAULT = 0.24       # suction_tool = flange + flange 로컬 +X * 이 거리 [m]
+TOOL_OFFSET_DEFAULT = 0.0        # gp8.py EE는 MuJoCo grip_site/TCP와 일치하므로 추가 offset 없음.
 TOOL_FRAME = "suction_tool"
 
 # GP8 기하 (robots/gp8.py 스크류 정의): 어깨(J2) 위치와 링크 도달 한계.
@@ -102,14 +103,17 @@ TOOL_LEN = 0.325                 # 손목중심→기구학 EE 원점 [m]
 
 
 def _flange_origin_from_tool(tool_pos, R_flange, tool_offset: float) -> np.ndarray:
-    """suction_tool 목표점 → flange 원점.
+    """suction_tool/TCP 목표점 → gp8.py EE 목표점.
 
-    실제 툴 frame 은 flange 에 rigid 하게 붙어 있고, 자세는 flange 와 동일하다.
-    시작 자세에서 아래를 보는 축은 flange +X 이므로 24cm 막대는 flange local +X
-    방향으로 둔다.
+    gp8.py 의 FK/IK end-effector 는 MuJoCo `grip_site` 와 일치한다
+    (link6 +X 0.325m, ROS URDF flange 기준 +X 0.245m). 따라서 기본값
+    tool_offset=0.0 에서는 목표점을 그대로 IK 에 넣는다.
 
-      suction_tool = flange_origin + R_flange[:, 0] * tool_offset
-      flange_origin = suction_tool_target - R_flange[:, 0] * tool_offset
+    tool_offset 은 gp8.py EE/TCP 보다 더 앞쪽의 임시 점을 테스트할 때만 쓰는
+    추가 offset 이다.
+
+      external_tool = gp8_ee + R_ee[:, 0] * tool_offset
+      gp8_ee_target = external_tool_target - R_ee[:, 0] * tool_offset
     """
     return np.asarray(tool_pos, dtype=float) - np.asarray(R_flange, dtype=float)[:, 0] * float(tool_offset)
 
@@ -746,72 +750,17 @@ def _publish_rviz_static(pub_markers, pub_path, preview, frame_id: str, stamp):
     pub_path.publish(path)
 
 
-def _publish_tool_marker(pub_markers, tool_offset: float, stamp):
-    """flange 기준 +X 방향 24cm 실제 툴을 빨간 막대와 tool 중심 구로 표시."""
-    from geometry_msgs.msg import Point
-    from visualization_msgs.msg import Marker, MarkerArray
-
-    def point(xyz):
-        p = Point()
-        p.x, p.y, p.z = map(float, xyz)
-        return p
-
-    rod = Marker()
-    rod.header.frame_id = "flange"
-    rod.header.stamp = stamp
-    rod.ns = "suction_tool_geometry"
-    rod.id = 0
-    rod.type = Marker.LINE_STRIP
-    rod.action = Marker.ADD
-    rod.pose.orientation.w = 1.0
-    rod.scale.x = 0.018
-    rod.color.r = 1.0
-    rod.color.g = 0.0
-    rod.color.b = 0.0
-    rod.color.a = 0.95
-    rod.points = [point([0.0, 0.0, 0.0]), point([float(tool_offset), 0.0, 0.0])]
-
-    center = Marker()
-    center.header.frame_id = "flange"
-    center.header.stamp = stamp
-    center.ns = "suction_tool_geometry"
-    center.id = 1
-    center.type = Marker.SPHERE
-    center.action = Marker.ADD
-    center.pose.orientation.w = 1.0
-    center.pose.position = point([float(tool_offset), 0.0, 0.0])
-    center.scale.x = center.scale.y = center.scale.z = 0.045
-    center.color.r = 1.0
-    center.color.g = 0.0
-    center.color.b = 0.0
-    center.color.a = 0.95
-
-    pub_markers.publish(MarkerArray(markers=[rod, center]))
-
-
 def rviz_preview(gp8: GP8, args, z: float, vel_limits) -> None:
     """RViz에서 marker/path와 RobotModel 애니메이션으로 throw 계획을 미리 본다."""
     import rclpy
     from rclpy.node import Node
-    from geometry_msgs.msg import TransformStamped
     from sensor_msgs.msg import JointState
-    from tf2_ros import StaticTransformBroadcaster
 
     preview = _build_rviz_preview(gp8, args, z, vel_limits)
     print_throw_plan(preview["plan"], preview["built"], args.release_lead)
 
     rclpy.init()
     node = Node("suction_lift_debug_rviz_preview")
-    static_tf = StaticTransformBroadcaster(node)
-    tool_tf = TransformStamped()
-    tool_tf.header.stamp = node.get_clock().now().to_msg()
-    tool_tf.header.frame_id = "flange"
-    tool_tf.child_frame_id = TOOL_FRAME
-    tool_tf.transform.translation.x = float(args.tool_offset)
-    tool_tf.transform.translation.y = 0.0
-    tool_tf.transform.translation.z = 0.0
-    tool_tf.transform.rotation.w = 1.0
-    static_tf.sendTransform(tool_tf)
     pub_js = node.create_publisher(JointState, "/joint_states", 10)
     pub_js_urdf = node.create_publisher(JointState, "/joint_states_urdf", 10)
     pub_markers = node.create_publisher(
@@ -833,7 +782,7 @@ def rviz_preview(gp8: GP8, args, z: float, vel_limits) -> None:
     print("  joint_states : /joint_states and /joint_states_urdf")
     print("  markers      : /suction_lift_debug/markers")
     print("  path         : /suction_lift_debug/path")
-    print(f"  tool frame   : flange -> {TOOL_FRAME} (+X {args.tool_offset:.3f} m, same orientation)")
+    print(f"  tool frame   : URDF {TOOL_FRAME} (MuJoCo grip_site/TCP); extra offset {args.tool_offset:+.3f} m")
     print(f"  fixed frame  : {frame_id}")
     print("Ctrl-C 로 종료. 실제 로봇 명령은 보내지 않습니다.")
 
@@ -852,7 +801,6 @@ def rviz_preview(gp8: GP8, args, z: float, vel_limits) -> None:
 
         # late RViz subscribers를 위해 marker/path도 계속 재발행.
         _publish_rviz_static(pub_markers, pub_path, preview, frame_id, now)
-        _publish_tool_marker(pub_markers, args.tool_offset, now)
 
     node.create_timer(1.0 / float(args.preview_rate), tick)
     try:
@@ -892,7 +840,7 @@ def main() -> None:
     parser.add_argument("--bin-z-offset", type=float, default=BIN_Z_OFFSET_DEFAULT,
                         help="bin 목표 높이 = grasp Z + offset [m] (기본 0.10)")
     parser.add_argument("--tool-offset", type=float, default=TOOL_OFFSET_DEFAULT,
-                        help="suction_tool = flange + flange +X * offset [m] (기본 0.24)")
+                        help="gp8.py/MuJoCo TCP보다 +X 앞의 추가 offset [m] (기본 0.0)")
     parser.add_argument("--release-lead", type=float, default=0.0,
                         help="석션 off 를 release 보다 이만큼 일찍 [s] (음수=늦게)")
     parser.add_argument("--plan-only", action="store_true",

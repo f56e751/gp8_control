@@ -48,8 +48,8 @@ def generate_launch_description():
                               description="target bin Y [m]"),
         DeclareLaunchArgument("bin_z_offset", default_value="0.10",
                               description="target bin height offset from grasp z [m]"),
-        DeclareLaunchArgument("tool_offset", default_value="0.24",
-                              description="suction_tool offset along flange +X [m]"),
+        DeclareLaunchArgument("tool_offset", default_value="0.0",
+                              description="extra offset beyond gp8.py/MuJoCo TCP [m]"),
         DeclareLaunchArgument("vel_scale", default_value="0.3",
                               description="low-speed move velocity scale"),
         DeclareLaunchArgument("preview_rate", default_value="30.0",
@@ -67,7 +67,9 @@ def generate_launch_description():
     )
 
     xacro_path = os.path.join(
-        get_package_share_directory("motoman_gp8_support"), "urdf", "gp8.xacro",
+        get_package_share_directory("gp8_control"),
+        "urdf",
+        "gp8_mujoco_suction_tool.xacro",
     )
     robot_description = subprocess.check_output(["xacro", xacro_path], text=True)
 

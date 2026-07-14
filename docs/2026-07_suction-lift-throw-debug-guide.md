@@ -49,7 +49,7 @@ ros2 launch gp8_control suction_lift_preview.launch.py
 - pick: `(x=0.55, y=0.0, z=Config.GRASP_Z)`
 - lift: `0.10 m`
 - bin: `(x=1.0, y=0.0, z=pick_z + 0.10)`
-- tool offset: `0.24 m`
+- extra tool offset: `0.0 m`
 - preview rate: `30 Hz`
 
 파라미터를 바꿔서 실행하는 예:
@@ -58,7 +58,7 @@ ros2 launch gp8_control suction_lift_preview.launch.py
 ros2 launch gp8_control suction_lift_preview.launch.py \
   x:=0.55 y:=0.0 \
   bin_x:=0.95 bin_y:=0.0 bin_z_offset:=0.10 \
-  tool_offset:=0.24 \
+  tool_offset:=0.0 \
   preview_rate:=30.0
 ```
 
@@ -78,7 +78,7 @@ RViz fixed frame은 `base_link` 기준이다.
 - `/joint_states_urdf`: URDF 표시용 joint states
 - `/suction_lift_debug/markers`: pick/bin/release/tool/path marker
 - `/suction_lift_debug/path`: tool frame 기준 preview path
-- `/tf`: `flange -> suction_tool` static transform 포함
+- `/tf`: URDF의 `flange -> suction_tool` fixed transform 포함
 
 마커 의미:
 
@@ -90,24 +90,25 @@ RViz fixed frame은 `base_link` 기준이다.
 | 파란 sphere | bin 최종 목표 위치 |
 | 노란 sphere | throw runup 시작점 |
 | 자홍 sphere | follow-through 끝점 |
-| 노란 line | 로봇 tool frame이 따라가는 preview path |
+| 노란 line | preview joint trajectory를 FK해서 얻은 실제 `suction_tool` 원점 path |
 | 하늘색 line | release 후 물체가 날아가는 탄도 궤적 |
-| 빨간 막대 | 실제 24 cm 툴 시각화. `flange` 원점에서 `suction_tool` 원점까지 |
+| 빨간 막대 | MuJoCo `grip_site`와 맞춘 TCP 시각화. `flange` 원점에서 `suction_tool` 원점까지 |
 | 빨간 작은 sphere | `suction_tool` frame 원점 |
 
-빨간 막대는 추가 툴이 아니라 실제 로봇에 달린 24 cm 석션 툴 자체를 나타낸다.
+빨간 막대는 marker가 아니라 RViz RobotModel에 포함된 URDF visual이다.
 
 ## 5. Tool frame 정의
 
-현재 모델은 다음을 기준으로 한다.
+현재 모델은 MuJoCo `combined_test.xml`의 `grip_site`를 기준으로 한다.
 
 ```text
-suction_tool = flange + flange local +X * tool_offset
-tool_offset 기본값 = 0.24 m
-tool frame 자세 = flange frame 자세와 동일
+MuJoCo link6 -> grip_site = link6 local +X * 0.325 m
+ROS URDF link_6_t -> flange = link_6_t local +X * 0.080 m
+따라서 URDF flange -> suction_tool = flange local +X * 0.245 m
+suction_tool 자세 = flange 자세와 동일
 ```
 
-즉 `flange`와 `suction_tool`은 rigid하게 붙어 있고 회전 오프셋은 없다. translation만 flange frame 기준 `+X` 방향으로 24 cm다.
+`gp8_control.robots.gp8.forward_kinematics()`의 EE는 이미 MuJoCo `grip_site`/TCP와 일치한다. 따라서 `suction_lift_debug.py`의 기본 `--tool-offset`은 `0.0`이고, IK/FK에는 추가 24 cm를 더하지 않는다.
 
 시작 pick 자세의 축 방향은 다음과 같다.
 
@@ -117,10 +118,11 @@ flange +Y = world +Y
 flange +Z = world +X
 ```
 
-따라서 시작 자세에서 24 cm 툴은 flange에서 아래 방향으로 내려간다. throw 궤적의 위치 constraint는 flange가 아니라 `suction_tool` 원점 기준이다. 내부 IK는 아래 식으로 flange 목표점을 역산한다.
+따라서 시작 자세에서 URDF의 빨간 TCP 막대는 flange에서 아래 방향으로 내려간다. throw 궤적의 위치 constraint는 `gp8.py` EE, 즉 MuJoCo `grip_site`/`suction_tool` 원점 기준이다.
 
 ```text
-flange_origin = suction_tool_target - R_flange[:, 0] * tool_offset
+gp8_ee_target = suction_tool_target
+tool_offset 기본값 0.0
 ```
 
 ## 6. Throw geometry 기본값
@@ -145,7 +147,7 @@ bin  = (1.00, 0.0, Config.GRASP_Z + 0.10)
 P_RATIO_FROM_GRASP = 0.6
 RELEASE_FRACTION_FROM_P = 0.3
 BIN_Z_OFFSET_DEFAULT = 0.10
-TOOL_OFFSET_DEFAULT = 0.24
+TOOL_OFFSET_DEFAULT = 0.0
 ```
 
 기본 조건에서 plan-only 검증 시 대표적으로 아래 값이 나온다.
@@ -176,7 +178,7 @@ ros2 run gp8_control suction_lift_debug --plan-only \
   --x 0.55 --y 0.0 \
   --bin-x 0.95 --bin-y 0.0 \
   --bin-z-offset 0.10 \
-  --tool-offset 0.24
+  --tool-offset 0.0
 ```
 
 여기서 IK 실패, 속도 초과, reach 초과가 뜨면 실제 로봇 실행 전에 먼저 파라미터를 조정해야 한다.
@@ -218,7 +220,7 @@ ros2 run gp8_control suction_lift_debug \
   --lift 0.10 \
   --bin-x 0.95 --bin-y 0.0 \
   --bin-z-offset 0.10 \
-  --tool-offset 0.24 \
+  --tool-offset 0.0 \
   --vel-scale 0.3
 ```
 
@@ -288,11 +290,11 @@ RViz display를 확인한다.
 
 ```text
 flange -> suction_tool
-translation = (tool_offset, 0, 0) in flange frame
+translation = (0.245, 0, 0) in flange frame
 rotation = identity
 ```
 
-즉 툴은 flange frame 기준 `+X` 방향 24 cm이고, tool frame 자세는 flange와 같다. RViz의 빨간 막대는 이 관계를 표시한다.
+즉 RViz의 `suction_tool`은 MuJoCo `grip_site`와 맞춘 frame이고, flange frame 기준 `+X` 방향 24.5 cm다. 자세는 flange와 같다.
 
 ### plan-only에서 reach / IK 실패
 
@@ -300,9 +302,9 @@ rotation = identity
 
 1. `bin_x`를 줄여 bin을 가깝게 둔다.
 2. `bin_z_offset`을 너무 크게 두지 않는다.
-3. 실제 툴 길이를 다시 잰 경우에만 `tool_offset`을 바꾼다.
+3. `tool_offset`은 기본 `0.0`으로 둔다. 이 값은 MuJoCo/gp8.py TCP보다 더 앞의 임시 점을 테스트할 때만 바꾼다.
 
-`tool_offset`은 튜닝 파라미터가 아니라 실제 장착된 툴 길이 모델이다.
+실제 TCP 길이 모델은 URDF의 `flange -> suction_tool = +X 0.245 m`와 `gp8.py`의 EE convention에 들어있다.
 
 ## 11. 권장 작업 순서
 
@@ -311,4 +313,3 @@ rotation = identity
 3. 빨간 막대가 실제 툴 방향/길이와 맞는지 확인
 4. bin을 가까운 위치로 두고 실제 로봇 저위험 조건에서 테스트
 5. release timing이 늦거나 빠르면 `--release-lead`로 IO 지연만 보정
-
