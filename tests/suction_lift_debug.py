@@ -595,6 +595,16 @@ def _concat_joint_segments(segments):
     return np.concatenate(q_parts, axis=1), np.concatenate(t_parts)
 
 
+def _tool_path_from_joint_traj(gp8: GP8, traj, tool_offset: float) -> np.ndarray:
+    """관절 궤적을 실제 suction_tool 원점 path(base_link 기준)로 FK 변환."""
+    traj = np.asarray(traj, dtype=float)
+    pts = np.zeros((traj.shape[1], 3), dtype=float)
+    for i in range(traj.shape[1]):
+        T = gp8.forward_kinematics(traj[:, i])
+        pts[i] = T[:3, 3] + T[:3, 0] * float(tool_offset)
+    return pts
+
+
 def _build_rviz_preview(gp8: GP8, args, z: float, vel_limits):
     """RViz preview 용 전체 joint trajectory + marker geometry 를 생성."""
     grasp_xyz = np.array([args.x, args.y, z], dtype=float)
@@ -637,11 +647,13 @@ def _build_rviz_preview(gp8: GP8, args, z: float, vel_limits):
         (built["traj"], built["ts"]),
         (ret_traj, ret_ts),
     ])
+    tool_path = _tool_path_from_joint_traj(gp8, preview_traj, args.tool_offset)
 
     return dict(
         plan=plan, built=built,
         grasp_xyz=grasp_xyz, lift_pos=lift_pos,
         preview_traj=preview_traj, preview_ts=preview_ts,
+        tool_path=tool_path,
         ee_path=np.vstack([
             lift_pos[None, :], plan["start_pos"][None, :],
             plan["release_pos"][None, :], plan["end_pos"][None, :],
@@ -695,11 +707,11 @@ def _publish_rviz_static(pub_markers, pub_path, preview, frame_id: str, stamp):
         color(m, rgba)
         markers.append(m)
 
-    # pick/lift/start/release/end path line
+    # 실제 RobotModel preview trajectory 를 FK 한 suction_tool 원점 path.
     stroke = marker_base(10, "ee_preview_path", Marker.LINE_STRIP)
     stroke.scale.x = 0.01
     color(stroke, (1.0, 0.85, 0.05, 0.95))
-    stroke.points = [point(p) for p in preview["ee_path"]]
+    stroke.points = [point(p) for p in preview["tool_path"]]
     markers.append(stroke)
 
     # ballistic arc after release
@@ -725,7 +737,7 @@ def _publish_rviz_static(pub_markers, pub_path, preview, frame_id: str, stamp):
     path = Path()
     path.header.frame_id = frame_id
     path.header.stamp = stamp
-    for xyz in preview["ee_path"]:
+    for xyz in preview["tool_path"]:
         ps = PoseStamped()
         ps.header = path.header
         ps.pose.position = point(xyz)
