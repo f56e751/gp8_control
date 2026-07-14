@@ -120,18 +120,33 @@ PUSH_CHAIN_PARK_LIFT: float = 0.0
 # — the observed double up-down bob at push start.
 PUSH_APPROACH_VIA_XY: float = 0.30
 
-# Pre-position mode (execute() path). When ON (default) the approach
+# Pre-position mode (execute() path). When ON the approach
 # (current → [aim hover via] → stroke start) is dispatched as its OWN
 # blocking move as soon as the cycle is planned (status POSITIONING) and the
 # FIRED trajectory contains only stroke + chain — t_contact becomes
 # stroke-only (~0.18 s run-up at the full retreat), a short,
 # geometry-independent fire horizon, and ``wait_for_arrival`` re-estimates
 # the ETA AFTER positioning so any positioning overrun is absorbed instead
-# of shifting the hit. Set GP8_PUSH_PREPOSITION=0 to A/B back to FLOW mode
-# (the operator-validated 19:30 2026-07-06 shape: the approach rides inside
-# the fired trajectory and the lead must cover its full geometry-dependent
-# duration) without editing code.
-PUSH_PREPOSITION: bool = os.environ.get("GP8_PUSH_PREPOSITION", "1") != "0"
+# of shifting the hit.
+# DEFAULT OFF (HW 2026-07-14): the serialized pipeline (position → settle →
+# fire) raises the minimum catchable ETA ~0.1–0.2 s over flow's overlapped
+# approach — at the 0.48 m/s belt that whiffed tightly spaced cans BEHIND —
+# and with a steady belt the accuracy gain reduces to execution
+# repeatability only. Flow's approach is floor-gated too (shared
+# _build_gated_approach), so flow no longer belt-strikes. Set
+# GP8_PUSH_PREPOSITION=1 to re-enable for slow-belt / sparse lines.
+PUSH_PREPOSITION: bool = os.environ.get("GP8_PUSH_PREPOSITION", "0") != "0"
+
+# ---- Intercept-placement budget (t_to_contact) -------------------------------
+# Model-side twins of the FIRE-side lead terms. An accurate fire lead cannot
+# save an intercept the arm was never going to be ready at: if the PLACEMENT
+# model under-budgets the pipeline, the planner parks the ambush too far
+# upstream and the stroke fires late no matter how good the lead is (HW
+# 2026-07-14: the missing ~0.2 s residual alone is ~10 cm at 0.48 m/s —
+# exactly the observed late whiffs on tightly spaced cans).
+PUSH_BUILD_BUDGET: float = 0.04   # ARM build (stroke ~30 IK solves + chain synthesis)
+PUSH_PREPOS_TAIL: float = 0.05    # positioning dispatch's final_joint tail knot (stream)
+PUSH_SETTLE_BUDGET: float = 0.03  # settle-guard poll on a healthy stack (~15 ms servo lag)
 
 # Safe transit height (m, absolute TCP Z) for the chain when it parks at the
 # NEXT push's backswing (a LOW pose). The chain is a JOINT-space
@@ -379,9 +394,11 @@ class PushSkill(ManipulationSkill):
     """Time one continuous swing so the paddle meets the object on arrival.
 
     ``execute`` runs the push cycle in one of two shapes, selected by
-    ``PUSH_PREPOSITION`` (env ``GP8_PUSH_PREPOSITION``, default ON):
+    ``PUSH_PREPOSITION`` (env ``GP8_PUSH_PREPOSITION``, default OFF — see the
+    constant's comment for the HW rationale):
 
-    **PRE-POSITION MODE** (default) — the approach is its own dispatch:
+    **PRE-POSITION MODE** (``GP8_PUSH_PREPOSITION=1``, opt-in) — the
+    approach is its own dispatch:
 
       1. **ARM** — build stroke + chain only (``append_descent=False``);
          ``t_contact`` off the built timestamps is stroke-only (~0.18 s
@@ -392,9 +409,10 @@ class PushSkill(ManipulationSkill):
          positioning overrun is absorbed instead of shifting the hit.
       4. **PUSHING** — fire the pre-built stroke + chain.
 
-    **FLOW MODE** (``GP8_PUSH_PREPOSITION=0``) — the operator-validated
-    19:30 2026-07-06 configuration, kept as the A/B escape hatch. No
-    backswing parking:
+    **FLOW MODE** (default) — the operator-validated 19:30 2026-07-06
+    configuration; the approach overlaps the object's travel, giving the
+    lowest minimum catchable ETA (matters for tightly spaced objects). Its
+    approach segment is floor-gated too. No backswing parking:
 
       1. **ARM** — compose the ENTIRE motion up front (approach → backswing →
          run-up stroke → chain) and read the exact contact time off the built
@@ -451,30 +469,49 @@ class PushSkill(ManipulationSkill):
 
         Push contact is an ACTIVE, timed sweep with NO suction forgiveness, so the
         intercept MUST be placed where the object will be at the REAL strike time,
-        not where the bare positioning estimate lands. The real budget from "arm
-        starts moving" to "stroke contacts the object" is::
+        not where the bare positioning estimate lands.
 
-            T_setup#1 (dispatch before POSITIONING)
-          + T_position (move_through_via: rise to aim hover + descend to retreat)
-          + T_setup#2 (dispatch before the stroke)
-          + T_contact_offset (stroke travels grasp_retreat -> contact line)
+        The budget mirrors the FIRE-side lead term by term — the placement /
+        fire asymmetry (residual & serial costs in the lead but not here) is
+        what aimed tightly spaced cans too far upstream and produced the late
+        whiffs (HW 2026-07-14, 0.48 m/s belt)::
 
-        The dispatch overhead and the retreat->contact pre-travel are exactly what
-        the old ``move_time * factor`` omitted — why the arm aimed upstream of where
-        the can actually was and struck the next object. On the adv4ncr 250Hz stream
-        driver the old ~0.4 s point-queue re-entry is gone, so T_setup is now just the
-        per-dispatch overhead (``qmode_ms_avg``, ~tens of ms) — HW-calibrate; the 2x
-        conservatively budgets the positioning + stroke dispatches. T_position is
-        opt_time scaled by OPT_TIME_TO_REAL; T_contact_offset = the run-up
-        profile's time to cover PUSH_RETREAT_DISTANCE (``_stroke_time_to`` —
-        accelerating from rest, NOT the old constant-speed d/v which understated
-        the pre-travel by ~80 ms).
+            T_build                  ARM build before any motion (PUSH_BUILD_BUDGET)
+          + n_disp × T_setup         stream dispatch overhead (qmode_ms_avg);
+                                     1 dispatch in flow, 2 in pre-position
+          + T_position               approach: opt_time × OPT_TIME_TO_REAL
+          [+ T_tail + T_settle]      pre-position only: positioning final-knot
+                                     tail + settle-guard poll
+          + T_pre_travel             run-up rest→contact (``_stroke_time_to`` —
+                                     accelerating from rest, NOT constant-speed
+                                     d/v which understated it by ~80 ms)
+          + PUSH_LEAD_RESIDUAL       servo lag + perception bias — the SAME
+                                     knob the fire lead adds
+
+        A bigger budget only slides the intercept downstream (the planner's
+        fixed-point loop re-solves where the object will be); objects whose
+        downstream slide leaves the workspace are dropped as uncatchable
+        instead of being whiffed into the next can.
+
+        With GP8_FIXED_DELAY_PUSH set, the fire lead is overridden wholesale
+        and the placement budget mirrors that (the fixed lead already covers
+        pre-travel + residual + the fire dispatch).
         """
         ctx = self.ctx
         t_setup = ctx.traj_ctrl.qmode_ms_avg / 1000.0          # per-dispatch overhead (stream)
         t_position = move_time * ctx.cfg.OPT_TIME_TO_REAL
-        t_pre_travel = self._stroke_time_to(PUSH_RETREAT_DISTANCE)
-        return 2.0 * t_setup + t_position + t_pre_travel        # dispatch(pos) + dispatch(stroke)
+        if _FIXED_DELAY_PUSH_ENV is not None:
+            t = PUSH_BUILD_BUDGET + t_setup + t_position \
+                + float(_FIXED_DELAY_PUSH_ENV)
+        else:
+            t_pre_travel = self._stroke_time_to(PUSH_RETREAT_DISTANCE)
+            t = (PUSH_BUILD_BUDGET + t_setup + t_position
+                 + t_pre_travel + PUSH_LEAD_RESIDUAL)
+        if PUSH_PREPOSITION:
+            # Second (positioning) dispatch + its tail knot + settle poll —
+            # the serial extras flow mode does not pay.
+            t += t_setup + PUSH_PREPOS_TAIL + PUSH_SETTLE_BUDGET
+        return t
 
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
@@ -482,21 +519,22 @@ class PushSkill(ManipulationSkill):
     def execute(self, request: "PickRequest") -> SkillResult:
         """Arm the motion, sleep to the fire time, then fire.
 
-        PRE-POSITION MODE (``PUSH_PREPOSITION``, default): build stroke +
-        chain (``append_descent=False``, so ``t_contact`` is stroke-only),
+        PRE-POSITION MODE (``GP8_PUSH_PREPOSITION=1``, opt-in): build stroke
+        + chain (``append_descent=False``, so ``t_contact`` is stroke-only),
         dispatch the floor-gated approach NOW as its own blocking move
         (status POSITIONING) parking at the built stroke's first knot, then
         WAIT and fire.
 
-        FLOW MODE (``GP8_PUSH_PREPOSITION=0``): build approach + stroke +
-        chain as ONE trajectory (dispatch=False) with the full approach
-        inside ``t_contact``, WAIT, then fire the whole motion.
+        FLOW MODE (default): build approach + stroke + chain as ONE
+        trajectory (dispatch=False) with the full approach inside
+        ``t_contact``, WAIT, then fire the whole motion.
 
         Both modes: WAITING — ``wait_for_arrival(offset = t_contact +
         dispatch + residual)``; the stale-stroke guard runs before firing;
         cleanup after.
         """
         ctx = self.ctx
+        _t_exec0 = time.time()   # pipeline diagnostic (see the [pipeline] log)
         target = request.target
         current_joint = request.current_joint
         aim_joint = request.aim_joint
@@ -594,15 +632,14 @@ class PushSkill(ManipulationSkill):
         # from the ACTUAL built trajectory (clamp included). Push has no
         # suction seal to form, so no stationary settle is needed before the
         # stroke — the modes differ only in WHERE the approach rides:
-        #   * PRE-POSITION (default): the approach is its OWN blocking
-        #     dispatch (status POSITIONING) and the fired motion is stroke +
-        #     chain only — t_contact becomes stroke-only (short,
-        #     geometry-independent fire horizon).
-        #   * FLOW (GP8_PUSH_PREPOSITION=0): the 19:30 2026-07-06
-        #     operator-validated shape — approach(current → [aim via] →
-        #     backswing) + stroke + chain is ONE dispatch, fired so the
-        #     paddle crosses the contact point exactly at the object's
-        #     arrival.
+        #   * PRE-POSITION (opt-in, GP8_PUSH_PREPOSITION=1): the approach is
+        #     its OWN blocking dispatch (status POSITIONING) and the fired
+        #     motion is stroke + chain only — t_contact becomes stroke-only
+        #     (short, geometry-independent fire horizon).
+        #   * FLOW (default): the 19:30 2026-07-06 operator-validated shape
+        #     — approach(current → [aim via] → backswing) + stroke + chain
+        #     is ONE dispatch, fired so the paddle crosses the contact point
+        #     exactly at the object's arrival.
         T_cur = ctx.robot.forward_kinematics(
             np.asarray(current_joint, dtype=float)[:6]
         )
@@ -655,6 +692,7 @@ class PushSkill(ManipulationSkill):
             traj_pos, vel_pos, ts_pos = self._build_gated_approach(
                 current_joint, q_park, via=approach_via,
             )
+            _t_pos_planned = float(ts_pos[-1])
             ctx.traj_ctrl.send_trajectory_queue(
                 traj_pos, vel_pos, ts_pos, final_joint=q_park,
             )
@@ -721,6 +759,29 @@ class PushSkill(ManipulationSkill):
             f"{PUSH_LEAD_RESIDUAL * 1000:.0f}ms"
             + (" [OVERRIDDEN by GP8_FIXED_DELAY_PUSH]" if _FIXED_DELAY_PUSH_ENV else "")
         )
+        # PIPELINE DIAGNOSTIC: measured serial time from execute entry to
+        # wait entry vs the t_to_contact budget's non-motion terms — the data
+        # that says whether PUSH_BUILD_BUDGET / PUSH_PREPOS_TAIL /
+        # PUSH_SETTLE_BUDGET match this machine. Flow mode: expect ≈ build
+        # only. Pre-position: expect ≈ build + planned positioning + tail +
+        # settle + dispatch.
+        _pipe = time.time() - _t_exec0
+        if PUSH_PREPOSITION:
+            _serial = _pipe - _t_pos_planned
+            ctx.log.info(
+                f"[pipeline] exec→wait {_pipe * 1000:.0f}ms = positioning "
+                f"(planned {_t_pos_planned * 1000:.0f}ms) + serial "
+                f"{_serial * 1000:.0f}ms (budget build "
+                f"{PUSH_BUILD_BUDGET * 1000:.0f} + tail "
+                f"{PUSH_PREPOS_TAIL * 1000:.0f} + settle "
+                f"{PUSH_SETTLE_BUDGET * 1000:.0f} + dispatch "
+                f"{ctx.traj_ctrl.qmode_ms_avg:.0f})"
+            )
+        else:
+            ctx.log.info(
+                f"[pipeline] exec→wait {_pipe * 1000:.0f}ms "
+                f"(budget build {PUSH_BUILD_BUDGET * 1000:.0f}ms)"
+            )
         ctx.set_status("WAITING", target.class_name)
         ctx.wait_for_arrival(target, T_grasp[1, 3], offset=lead)
 
