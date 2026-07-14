@@ -22,7 +22,9 @@ Visualization Manager:
       Description Topic:
         Value: /robot_description
         Depth: 5
-        Durability Policy: Volatile
+        # robot_state_publisher publishes robot_description once with transient-local
+        # durability. RViz often starts later, so it must request the retained sample.
+        Durability Policy: Transient Local
         Reliability Policy: Reliable
       Visual Enabled: true
       Collision Enabled: false
@@ -48,7 +50,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Fixed Frame: base_link
-    Frame Rate: 30
+    Frame Rate: 60
   Tools:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/FocusCamera

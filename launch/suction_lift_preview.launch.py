@@ -30,9 +30,13 @@ def generate_launch_description():
     bin_x = LaunchConfiguration("bin_x")
     bin_y = LaunchConfiguration("bin_y")
     bin_z_offset = LaunchConfiguration("bin_z_offset")
+    release_x_offset = LaunchConfiguration("release_x_offset")
+    release_z_offset = LaunchConfiguration("release_z_offset")
     tool_offset = LaunchConfiguration("tool_offset")
     vel_scale = LaunchConfiguration("vel_scale")
     preview_rate = LaunchConfiguration("preview_rate")
+    preview_speed = LaunchConfiguration("preview_speed")
+    preview_domain_id = LaunchConfiguration("preview_domain_id")
     rviz_enabled = LaunchConfiguration("rviz")
 
     args = [
@@ -42,21 +46,39 @@ def generate_launch_description():
                               description="pick/grasp Y [m]"),
         DeclareLaunchArgument("lift", default_value="0.10",
                               description="lift height after suction [m]"),
-        DeclareLaunchArgument("bin_x", default_value="1.0",
+        DeclareLaunchArgument("bin_x", default_value="1.5",
                               description="target bin X [m]"),
         DeclareLaunchArgument("bin_y", default_value="0.0",
                               description="target bin Y [m]"),
         DeclareLaunchArgument("bin_z_offset", default_value="0.10",
                               description="target bin height offset from grasp z [m]"),
+        DeclareLaunchArgument("release_x_offset", default_value="0.10",
+                              description="release X offset from pick X [m]"),
+        DeclareLaunchArgument("release_z_offset", default_value="0.33",
+                              description="release Z offset from pick Z [m]"),
         DeclareLaunchArgument("tool_offset", default_value="0.0",
                               description="extra offset beyond gp8.py/MuJoCo TCP [m]"),
         DeclareLaunchArgument("vel_scale", default_value="0.3",
                               description="low-speed move velocity scale"),
-        DeclareLaunchArgument("preview_rate", default_value="30.0",
+        DeclareLaunchArgument("preview_rate", default_value="60.0",
                               description="preview /joint_states rate [Hz]"),
+        DeclareLaunchArgument("preview_speed", default_value="0.25",
+                              description="preview playback speed (1.0=real time)"),
+        DeclareLaunchArgument(
+            "preview_domain_id", default_value="42",
+            description="isolated ROS_DOMAIN_ID for preview nodes",
+        ),
         DeclareLaunchArgument("rviz", default_value="true",
                               description="start RViz"),
     ]
+
+    # 실제 bringup의 joint_state_broadcaster/robot_state_publisher가 같은
+    # /joint_states와 /tf를 발행 중이어도 preview 화면을 덮어쓰지 못하게 한다.
+    # 이 launch에서 시작하는 preview, RSP, RViz 세 프로세스만 domain 42에서
+    # 통신한다.
+    set_preview_domain = SetEnvironmentVariable(
+        "ROS_DOMAIN_ID", preview_domain_id,
+    )
 
     # Let the source tree version run before a colcon rebuild during iteration.
     ros2_ws_src = os.path.realpath(
@@ -65,6 +87,7 @@ def generate_launch_description():
     set_pythonpath = SetEnvironmentVariable(
         "PYTHONPATH", ros2_ws_src + ":" + os.environ.get("PYTHONPATH", ""),
     )
+    set_python_unbuffered = SetEnvironmentVariable("PYTHONUNBUFFERED", "1")
 
     xacro_path = os.path.join(
         get_package_share_directory("gp8_control"),
@@ -76,7 +99,7 @@ def generate_launch_description():
     robot_state_publisher = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
-        name="robot_state_publisher",
+        name="suction_lift_preview_state_publisher",
         parameters=[{"robot_description": robot_description}],
         output="screen",
     )
@@ -89,9 +112,12 @@ def generate_launch_description():
         "--bin-x", bin_x,
         "--bin-y", bin_y,
         "--bin-z-offset", bin_z_offset,
+        "--release-x-offset", release_x_offset,
+        "--release-z-offset", release_z_offset,
         "--tool-offset", tool_offset,
         "--vel-scale", vel_scale,
         "--preview-rate", preview_rate,
+        "--preview-speed", preview_speed,
     ]
     preview_node = Node(
         package="gp8_control",
@@ -104,7 +130,7 @@ def generate_launch_description():
     rviz = Node(
         package="rviz2",
         executable="rviz2",
-        name="rviz2",
+        name="suction_lift_preview_rviz",
         arguments=["-d", PathJoinSubstitution([
             FindPackageShare("gp8_control"), "rviz", "suction_lift_preview.rviz",
         ])],
@@ -114,7 +140,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         *args,
+        set_preview_domain,
         set_pythonpath,
+        set_python_unbuffered,
         robot_state_publisher,
         preview_node,
         rviz,

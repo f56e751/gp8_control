@@ -41,7 +41,9 @@ class GP8(BaseRobot):
         (np.radians(-65.0),  np.radians(145.0)),    # J2  L
         (np.radians(-70.0),  np.radians(190.0)),    # J3  U
         (np.radians(-190.0), np.radians(190.0)),    # J4  R
-        (np.radians(-135.0), np.radians(135.0)),    # J5  B
+        # J5 +방향에는 현장 추가 장착판이 있어 원래 +135 deg까지 갈 수 없다.
+        # 2026-07-14 pendant collision 정지 위치를 측정한 물리 상한.
+        (np.radians(-135.0), 1.060747742652893),     # J5  B: upper=+60.7763688 deg
         (np.radians(-360.0), np.radians(360.0)),    # J6  T
     ]
 

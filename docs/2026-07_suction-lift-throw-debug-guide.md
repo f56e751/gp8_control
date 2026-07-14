@@ -48,19 +48,28 @@ ros2 launch gp8_control suction_lift_preview.launch.py
 
 - pick: `(x=0.55, y=0.0, z=Config.GRASP_Z)`
 - lift: `0.10 m`
-- bin: `(x=1.0, y=0.0, z=pick_z + 0.10)`
+- bin: `(x=1.5, y=0.0, z=pick_z + 0.10)`
+- release: `(x=pick_x + 0.10, y=pick_y, z=pick_z + 0.33)`
 - extra tool offset: `0.0 m`
-- preview rate: `30 Hz`
+- preview rate: `60 Hz`
+- preview playback: `0.25x` 슬로모션
+- preview ROS domain: `42` (실제 bringup과 분리)
 
 파라미터를 바꿔서 실행하는 예:
 
 ```bash
 ros2 launch gp8_control suction_lift_preview.launch.py \
   x:=0.55 y:=0.0 \
-  bin_x:=0.95 bin_y:=0.0 bin_z_offset:=0.10 \
+  bin_x:=1.50 bin_y:=0.0 bin_z_offset:=0.10 \
+  release_x_offset:=0.10 release_z_offset:=0.33 \
   tool_offset:=0.0 \
-  preview_rate:=30.0
+  preview_rate:=60.0 preview_speed:=0.25 \
+  preview_domain_id:=42
 ```
+
+`preview_speed:=1.0`이면 실제 계획 시간으로 재생한다. 궤적 형상을 확인할 때는
+기본 `0.25`를 권장한다. knot 사이는 시간 보간되며, 반복 재생의 마지막 자세와
+첫 자세도 연결되어 순간이동하지 않는다.
 
 RViz 없이 topic만 보고 싶으면:
 
@@ -91,11 +100,28 @@ RViz fixed frame은 `base_link` 기준이다.
 | 노란 sphere | throw runup 시작점 |
 | 자홍 sphere | follow-through 끝점 |
 | 노란 line | preview joint trajectory를 FK해서 얻은 실제 `suction_tool` 원점 path |
+| 자홍 line | 고속 throw 구간의 실제 TCP 곡선(start→release→follow-through) |
+| 주황 arrow | release 순간 TCP 속도 및 탄도 초기속도의 접선 방향 |
 | 하늘색 line | release 후 물체가 날아가는 탄도 궤적 |
 | 빨간 막대 | MuJoCo `grip_site`와 맞춘 TCP 시각화. `flange` 원점에서 `suction_tool` 원점까지 |
 | 빨간 작은 sphere | `suction_tool` frame 원점 |
 
 빨간 막대는 marker가 아니라 RViz RobotModel에 포함된 URDF visual이다.
+
+### 현장 J5 양(+) 방향 제한
+
+GP8 기본 사양의 J5 범위는 `-135° ~ +135°`지만, 현재 셀은 추가 장착판 때문에
+양(+) 방향이 제한된다. 2026-07-14 팬던트 정지 자세에서 읽은 값을 소프트웨어
+상한으로 사용한다.
+
+```text
+joint_5_b lower = -2.356194490192345 rad (-135°)
+joint_5_b upper = +1.060747742652893 rad (+60.7763688°)
+```
+
+이 제한은 `GP8` IK, ROS URDF, MoveIt planning limit, MuJoCo joint/actuator에
+동일하게 반영한다. 이는 ROS 계획 제한이며 팬던트의 하드웨어 파라미터를
+변경하는 값은 아니다.
 
 ## 5. Tool frame 정의
 
@@ -131,33 +157,48 @@ tool_offset 기본값 0.0
 
 ```text
 pick = (0.55, 0.0, Config.GRASP_Z)
-bin  = (1.00, 0.0, Config.GRASP_Z + 0.10)
+bin  = (1.50, 0.0, Config.GRASP_Z + 0.10)
 ```
 
-포물선 기준:
+기본 release는 pick에서 world +X 10 cm, world +Z 33 cm이다. release에서
+bin까지의 수평거리와 높이차를 이용해 진공 탄도의 필요 속도가 최소가
+되는 발사각과 속도를 계산한다. release 툴 +X축은 투척 전방에서
+아래로 30° 기울인다.
 
-1. `P`는 pick→bin 직선의 60% 지점
-2. release는 `P→bin` 구간의 30% 지점
-3. 따라서 release는 전체 pick→bin 기준 72% 지점
-4. release 이후 물체가 나머지 구간을 탄도로 날아 bin에 떨어지도록 release 속도를 계산
+TCP 위치에 원호를 강제하지 않는다. release에서 필요한 TCP 선속도와
+투척 평면 내 각속도를 spatial Jacobian으로 release 관절속도로 바꿘 뒤,
+이 상태를 중간점으로 하는 정지→release→정지 관절 스윙을 만든다.
+그 결과 TCP는 사람의 팔 스윙처럼 앞/위로 휘어진 곡선을 그리고,
+release에서 곡선의 접선이 탄도 초기속도와 정확히 일치한다.
+
+관절 가속도는 MoveIt 설정값 `[10, 10, 10, 15, 15, 20] rad/s²`의 90%를
+사용한다. 가속/감속 구간 양끝 5%에 jerk ramp를 두어 정지점과
+release에서 가속도가 0으로 연속이다. 전 관절의 위치는 하드 리미트에서
+2° 안쪽, 속도는 사양의 90% 이내인 후보만 통과한다.
 
 코드 상수:
 
 ```text
-P_RATIO_FROM_GRASP = 0.6
-RELEASE_FRACTION_FROM_P = 0.3
 BIN_Z_OFFSET_DEFAULT = 0.10
+RELEASE_X_OFFSET_DEFAULT = 0.10
+RELEASE_Z_OFFSET_DEFAULT = 0.33
 TOOL_OFFSET_DEFAULT = 0.0
+THROW_ACCEL_LIMITS = [10, 10, 10, 15, 15, 20]
+THROW_ACCEL_SCALE = 0.90
+THROW_JERK_RAMP_FRACTION = 0.05
 ```
 
-기본 조건에서 plan-only 검증 시 대표적으로 아래 값이 나온다.
+기본 `bin_x=1.5` 조건에서 plan-only 검증 시 대표적으로 아래 값이 나온다.
 
 ```text
-bin=(+1.000,+0.000,+0.162)
-release = pick→bin 72%
-v=(+1.409,+0.000,+1.034) m/s
-|v|=1.748 m/s
-angle=36.25 deg
+bin=(+1.500,+0.000,+0.162)
+release=(+0.650,+0.000,+0.392)
+v=(+2.006,+0.000,+1.535) m/s
+|v|=2.526 m/s, angle=37.43 deg
+swing=0.401 s runup + 0.401 s follow-through
+orientation start→release=61.25 deg
+max J5=56.35 deg (limit 60.776 deg)
+max velocity ratio=53.5%, max acceleration ratio=90.0%
 ```
 
 ## 7. 로봇 없이 계획만 검증
@@ -244,11 +285,14 @@ ros2 run gp8_control suction_lift_debug \
 --vel-scale          pick/lift 등 저속 이동 scale
 --bin-x, --bin-y     bin XY [m]
 --bin-z-offset       bin z = pick z + offset [m]
+--release-x-offset   release x = pick x + offset [m]
+--release-z-offset   release z = pick z + offset [m]
 --tool-offset        flange +X 방향 tool offset [m]
 --release-lead       release knot 대비 석션 OFF timing 보정 [s]
 --plan-only          로봇 없이 계획만 검증
 --rviz-preview       RViz preview용 publish만 수행
 --preview-rate       RViz preview joint state publish rate [Hz]
+--preview-speed      RViz 재생 배속, 기본 0.25 (1.0=실시간)
 ```
 
 ## 10. Troubleshooting
@@ -264,6 +308,30 @@ ros2 topic list | grep suction_lift_debug
 ```
 
 `/joint_states`가 안 나오면 preview node가 죽은 것이다. launch 로그에서 `suction_lift_debug` 에러를 먼저 본다.
+
+### RViz 로봇이 너무 빠르거나 뚝뚝 끊김
+
+실제 bringup의 `/joint_state_broadcaster`와 preview가 같은 `/joint_states` 및 TF를
+동시에 발행하면 두 자세가 서로 덮어써서 로봇이 빠르게 튄다. preview launch는
+이를 막기 위해 기본 `ROS_DOMAIN_ID=42`에서 RSP와 RViz까지 함께 실행한다.
+
+기본값은 `preview_speed:=0.25`이며 trajectory knot 사이를 보간한다. 더 느리게
+보려면 다음처럼 launch 전체를 새로 시작한다.
+
+```bash
+ros2 launch gp8_control suction_lift_preview.launch.py preview_speed:=0.1
+```
+
+preview domain의 topic을 터미널에서 확인하려면 CLI에도 같은 domain을 지정한다.
+
+```bash
+ROS_DOMAIN_ID=42 ros2 topic info /joint_states --verbose
+```
+
+이때 publisher는 `suction_lift_debug_rviz_preview` 하나여야 한다.
+
+`preview_rate`는 화면 배속이 아니라 `/joint_states` 발행률이다. 일반적으로
+기본 60 Hz를 권장하며 성능이 낮은 PC에서는 `preview_rate:=30.0`으로 낮출 수 있다.
 
 ### `unrecognized arguments: --ros-args ...` 에러
 
