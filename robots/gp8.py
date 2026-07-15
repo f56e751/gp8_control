@@ -50,6 +50,15 @@ class GP8(BaseRobot):
         np.array([455.0, 385.0, 520.0, 550.0, 550.0, 1000.0])
     )
 
+    # Measured YRC1000micro external-increment velocity ceilings at
+    # axis_increment_factor=1.0 [rad/s].  These are lower than the datasheet
+    # limits above because GP_getMaxIncPerIpCycle() includes the controller's
+    # no-lookahead increment-motion governor.  Values were measured on the GP8
+    # hardware on 2026-07-03; other factors scale these limits linearly.
+    _RT_STREAM_VELOCITY_LIMITS: np.ndarray = np.array(
+        [3.97, 3.36, 4.52, 4.77, 4.80, 8.76], dtype=float
+    )
+
     def __init__(self) -> None:
         self._screws, self._joint_positions = self._build_screws()
         self._M = self._build_home_ee()
@@ -69,6 +78,11 @@ class GP8(BaseRobot):
     @property
     def velocity_limits(self) -> np.ndarray:
         return self._VELOCITY_LIMITS.copy()
+
+    @property
+    def rt_stream_velocity_limits(self) -> np.ndarray:
+        """Measured RT-stream speed ceilings at axis_increment_factor=1.0."""
+        return self._RT_STREAM_VELOCITY_LIMITS.copy()
 
     # ------------------------------------------------------------------
     # Kinematic parameter construction
