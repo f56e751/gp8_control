@@ -58,6 +58,8 @@ class GP8(BaseRobot):
     _RT_STREAM_VELOCITY_LIMITS: np.ndarray = np.array(
         [3.97, 3.36, 4.52, 4.77, 4.80, 8.76], dtype=float
     )
+    RT_CONTROL_PERIOD: float = 0.004
+    DEFAULT_RT_ACCELERATION_FACTOR: float = 0.02
 
     def __init__(self) -> None:
         self._screws, self._joint_positions = self._build_screws()
@@ -83,6 +85,27 @@ class GP8(BaseRobot):
     def rt_stream_velocity_limits(self) -> np.ndarray:
         """Measured RT-stream speed ceilings at axis_increment_factor=1.0."""
         return self._RT_STREAM_VELOCITY_LIMITS.copy()
+
+    def rt_stream_acceleration_limits(
+        self,
+        acceleration_factor: float = DEFAULT_RT_ACCELERATION_FACTOR,
+    ) -> np.ndarray:
+        """Controller RT-stream acceleration ceilings in rad/s².
+
+        YRC external-increment motion uses ``_ACC_MAX = 2 * maxIncrement *
+        ACC_FACTOR``.  Since ``rt_stream_velocity_limits`` is maxIncrement
+        converted to rad/s at the 4 ms interpolation period, the SI-unit limit
+        is ``2 * velocity_factor1 * acceleration_factor / period``.
+        """
+        acceleration_factor = float(acceleration_factor)
+        if not 0.0 < acceleration_factor <= 1.0:
+            raise ValueError("acceleration_factor must be in (0, 1]")
+        return (
+            2.0
+            * self._RT_STREAM_VELOCITY_LIMITS
+            * acceleration_factor
+            / self.RT_CONTROL_PERIOD
+        )
 
     # ------------------------------------------------------------------
     # Kinematic parameter construction
