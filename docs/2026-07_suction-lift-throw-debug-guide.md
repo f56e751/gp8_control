@@ -103,6 +103,7 @@ RViz fixed frame은 `base_link` 기준이다.
 | 노란 line | preview joint trajectory를 FK해서 얻은 실제 `suction_tool` 원점 path |
 | 자홍 line | 고속 throw 구간의 실제 TCP 곡선(start→release→follow-through) |
 | 주황 arrow | release 순간 TCP 속도 및 탄도 초기속도의 접선 방향 |
+| 초록 arrow + `TCP x.xx m/s` | 재생 중 현재 `suction_tool` 끝점의 계획 선속도 벡터와 크기. `preview_speed`와 무관한 실제 계획 속도 |
 | 하늘색 line | release 후 물체가 날아가는 탄도 궤적 |
 | 빨간 막대 | MuJoCo `grip_site`와 맞춘 TCP 시각화. `flange` 원점에서 `suction_tool` 원점까지 |
 | 빨간 작은 sphere | `suction_tool` frame 원점 |

@@ -116,6 +116,7 @@ RELEASE_OMEGA_MAX = 8.0          # release 평면내 각속도 탐색 상한 [ra
 RELEASE_OMEGA_STEP = 0.05        # 경로 제약 후보 탐색 간격 [rad/s]
 PREVIEW_SPEED_DEFAULT = 0.25     # RViz 재생 배속 (실제 시간의 1/4)
 PREVIEW_STATIC_RATE = 1.0        # marker/path 재발행 주기 [Hz]
+RVIZ_TCP_VELOCITY_VECTOR_TIME = 0.10  # 속도 화살표 길이 = v_tcp * 이 시간 [m]
 BIN_Z_OFFSET_DEFAULT = 0.10      # bin 목표 높이 = grasp z + 이 값 [m]
 TOOL_OFFSET_DEFAULT = 0.0        # gp8.py EE는 MuJoCo grip_site/TCP와 일치하므로 추가 offset 없음.
 TOOL_FRAME = "suction_tool"
@@ -1138,6 +1139,22 @@ def _tool_path_from_joint_traj(gp8: GP8, traj, tool_offset: float) -> np.ndarray
     return pts
 
 
+def _tool_point_velocity(gp8: GP8, q, qd, tool_offset: float):
+    """현재 suction_tool 원점의 base_link 기준 위치/선속도를 반환한다.
+
+    ``gp8.jacobian``은 space twist ``[omega, v]``를 반환하므로 world 점
+    ``p``의 선속도는 ``v + omega x p``다. ``tool_offset``이 있으면 동일한
+    rigid body 위의 offset 점을 사용한다.
+    """
+    q = np.asarray(q, dtype=float)
+    qd = np.asarray(qd, dtype=float)
+    T = gp8.forward_kinematics(q)
+    point = T[:3, 3] + T[:3, 0] * float(tool_offset)
+    twist = gp8.jacobian(q) @ qd
+    velocity = twist[3:] + np.cross(twist[:3], point)
+    return point, velocity
+
+
 def _build_rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
                         throw_vel_limits, accel_limits):
     """RViz preview 용 전체 joint trajectory + marker geometry 를 생성."""
@@ -1182,13 +1199,23 @@ def _build_rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
         (ret_traj, ret_ts),
         (close_traj, close_ts),
     ])
+    preview_vel, velocity_ts = _concat_joint_segments([
+        (pick_lift_vel, pick_lift_ts),
+        (built["vel"], built["ts"]),
+        (ret_velj, ret_ts),
+        (close_velj, close_ts),
+    ])
+    if not np.allclose(preview_ts, velocity_ts, atol=1e-12, rtol=0.0):
+        raise ValueError("RViz preview position/velocity time base가 일치하지 않습니다")
     preview_traj[:, -1] = preview_traj[:, 0]  # modulo 반복 경계를 수치적으로도 정확히 닫음
+    preview_vel[:, -1] = preview_vel[:, 0]
     tool_path = _tool_path_from_joint_traj(gp8, preview_traj, args.tool_offset)
 
     return dict(
         plan=plan, built=built,
         grasp_xyz=grasp_xyz, lift_pos=lift_pos,
-        preview_traj=preview_traj, preview_ts=preview_ts,
+        preview_traj=preview_traj, preview_vel=preview_vel,
+        preview_ts=preview_ts,
         tool_path=tool_path,
         ee_path=np.vstack([
             lift_pos[None, :], plan["release_pos"][None, :],
@@ -1302,7 +1329,9 @@ def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
     """RViz에서 marker/path와 RobotModel 애니메이션으로 throw 계획을 미리 본다."""
     import rclpy
     from rclpy.node import Node
+    from geometry_msgs.msg import Point
     from sensor_msgs.msg import JointState
+    from visualization_msgs.msg import Marker, MarkerArray
 
     preview = _build_rviz_preview(
         gp8, args, z, move_vel_limits, throw_vel_limits, accel_limits,
@@ -1314,8 +1343,7 @@ def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
     pub_js = node.create_publisher(JointState, "/joint_states", 10)
     pub_js_urdf = node.create_publisher(JointState, "/joint_states_urdf", 10)
     pub_markers = node.create_publisher(
-        __import__("visualization_msgs.msg", fromlist=["MarkerArray"]).MarkerArray,
-        "/suction_lift_debug/markers", 10,
+        MarkerArray, "/suction_lift_debug/markers", 10,
     )
     pub_path = node.create_publisher(
         __import__("nav_msgs.msg", fromlist=["Path"]).Path,
@@ -1323,6 +1351,7 @@ def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
     )
 
     q = preview["preview_traj"]
+    qd = preview["preview_vel"]
     ts = preview["preview_ts"]
     duration = float(ts[-1])
     preview_speed = float(args.preview_speed)
@@ -1338,6 +1367,7 @@ def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
     print("  joint_states : /joint_states and /joint_states_urdf")
     print("  markers      : /suction_lift_debug/markers")
     print("  path         : /suction_lift_debug/path")
+    print("  TCP velocity : green arrow + live m/s text at suction_tool")
     print(f"  tool frame   : URDF {TOOL_FRAME} (MuJoCo grip_site/TCP); extra offset {args.tool_offset:+.3f} m")
     print(f"  fixed frame  : {frame_id}")
     print(f"  playback     : {preview_speed:.2f}x slow-motion "
@@ -1349,6 +1379,7 @@ def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
         now = node.get_clock().now().to_msg()
         t = ((time.monotonic() - started) * preview_speed) % duration
         q_now = _interpolate_joint_state(q, ts, t)
+        qd_now = _interpolate_joint_state(qd, ts, t)
 
         msg = JointState()
         msg.header.stamp = now
@@ -1356,6 +1387,59 @@ def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
         msg.position = [float(v) for v in q_now]
         pub_js.publish(msg)
         pub_js_urdf.publish(msg)
+
+        tool_point, tool_velocity = _tool_point_velocity(
+            gp8, q_now, qd_now, args.tool_offset,
+        )
+        speed = float(np.linalg.norm(tool_velocity))
+
+        def point(xyz):
+            p = Point()
+            p.x, p.y, p.z = map(float, xyz)
+            return p
+
+        arrow = Marker()
+        arrow.header.frame_id = frame_id
+        arrow.header.stamp = now
+        arrow.ns = "tcp_velocity_live"
+        arrow.id = 20
+        arrow.type = Marker.ARROW
+        arrow.pose.orientation.w = 1.0
+        if speed > 1e-4:
+            arrow.action = Marker.ADD
+            arrow.points = [
+                point(tool_point),
+                point(
+                    tool_point
+                    + RVIZ_TCP_VELOCITY_VECTOR_TIME * tool_velocity
+                ),
+            ]
+            arrow.scale.x = 0.014
+            arrow.scale.y = 0.030
+            arrow.scale.z = 0.040
+            arrow.color.r = 0.15
+            arrow.color.g = 1.0
+            arrow.color.b = 0.20
+            arrow.color.a = 0.95
+        else:
+            arrow.action = Marker.DELETE
+
+        label = Marker()
+        label.header.frame_id = frame_id
+        label.header.stamp = now
+        label.ns = "tcp_speed_live"
+        label.id = 21
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        label.pose.position = point(tool_point + np.array([0.0, 0.0, 0.075]))
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.045
+        label.color.r = 0.85
+        label.color.g = 1.0
+        label.color.b = 0.85
+        label.color.a = 1.0
+        label.text = f"TCP {speed:.2f} m/s"
+        pub_markers.publish(MarkerArray(markers=[arrow, label]))
 
     def publish_static():
         # marker/path는 움직이지 않는다. 매 animation frame마다 수백 점을
