@@ -89,8 +89,12 @@ RELEASE_DISTANCE_STEP = 0.05
 RELEASE_Z_OFFSET_MIN = 0.20
 RELEASE_Z_OFFSET_MAX = 0.60
 RELEASE_Z_OFFSET_STEP = 0.02
-# MoveIt joint_limits.yaml의 max_acceleration. 10% 안전 여유를 둔다.
-THROW_ACCEL_LIMITS = np.array([10.0, 10.0, 10.0, 15.0, 15.0, 20.0])
+# gp8_control/gp8_bringup.launch.py의 실제 로봇 기본값. YRC external-
+# increment 경로의 축별 한계는 GP8.rt_stream_velocity_limits(factor=1.0)
+# 에서 환산하고, 아래 throw scale로 10% 안전 여유를 둔다.
+RT_CONTROL_PERIOD = 0.004
+AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
+AXIS_ACCELERATION_FACTOR_DEFAULT = 0.02
 THROW_ACCEL_SCALE = 0.90
 THROW_VELOCITY_SCALE = 0.90
 THROW_JERK_RAMP_FRACTION = 0.05  # 가속/감속 구간 양끝 5%를 선형 jerk ramp로 사용
@@ -109,6 +113,27 @@ TOOL_FRAME = "suction_tool"
 SHOULDER_XZ = (0.04, 0.330)      # J1 축 기준 어깨 오프셋 (x, z) [m]
 WRIST_REACH = 0.6875             # 어깨→손목중심 최대 (상완 0.345 + 전완 0.3425) [m]
 TOOL_LEN = 0.325                 # 손목중심→기구학 EE 원점 [m]
+
+
+def _rt_motion_limits(gp8: GP8, increment_factor: float, acceleration_factor: float):
+    """현재 YRC external-increment factor의 축별 속도/가속도 상한.
+
+    ``rt_stream_velocity_limits``는 factor=1.0에서 실측한 속도다. 컨트롤러의
+    ``_ACC_MAX = 2 * maxIncrement * ACC_FACTOR``를 4 ms 주기 SI 단위로
+    환산하면 ``a_max = 2 * v_factor1 * ACC_FACTOR / dt``가 된다.
+    """
+    increment_factor = float(increment_factor)
+    acceleration_factor = float(acceleration_factor)
+    if not 0.0 < increment_factor <= 1.0:
+        raise ValueError("axis increment factor는 (0, 1] 범위여야 합니다")
+    if not 0.0 < acceleration_factor <= 1.0:
+        raise ValueError("axis acceleration factor는 (0, 1] 범위여야 합니다")
+    full_speed = np.asarray(gp8.rt_stream_velocity_limits, dtype=float)
+    velocity_limits = full_speed * increment_factor
+    acceleration_limits = (
+        2.0 * full_speed * acceleration_factor / RT_CONTROL_PERIOD
+    )
+    return velocity_limits, acceleration_limits
 
 
 def _flange_origin_from_tool(tool_pos, R_flange, tool_offset: float) -> np.ndarray:
@@ -385,7 +410,7 @@ def build_joint_traj(gp8: GP8, pos, vel, t, q_seed, R_fixed=None, R_seq=None,
     return traj, velj, np.asarray(t, dtype=float)
 
 
-def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
+def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
                 tool_offset: float = TOOL_OFFSET_DEFAULT):
     """release constraint를 만족하는 가속도 제한 관절 스윙을 만든다.
 
@@ -395,10 +420,11 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
     """
     q_seed = np.asarray(q_seed, dtype=float)
     vel_limits = np.asarray(vel_limits, dtype=float)
+    accel_limits = np.asarray(accel_limits, dtype=float)
     joint_limits = np.asarray(gp8.joint_limits, dtype=float)
     soft_lower = joint_limits[:, 0] + JOINT_LIMIT_MARGIN
     soft_upper = joint_limits[:, 1] - JOINT_LIMIT_MARGIN
-    effective_accel = THROW_ACCEL_LIMITS * THROW_ACCEL_SCALE
+    effective_accel = accel_limits * THROW_ACCEL_SCALE
     release_pos = np.asarray(plan["release_pos"], dtype=float)
 
     T_release = np.eye(4)
@@ -474,7 +500,7 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
             qd_release=qd_release, omega_release=omega_release,
             release_omega=float(omega_mag), vel_ratio=vel_ratio,
             accel_peak=accel_peak,
-            accel_ratio=float(np.max(accel_peak / THROW_ACCEL_LIMITS)),
+            accel_ratio=float(np.max(accel_peak / accel_limits)),
             wrist_branch_jump=wrist_jump,
         ))
 
@@ -533,6 +559,7 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits,
         orientation_swing=float(orientation_swing),
         j5_max=j5_max, j5_upper=j5_upper, j5_margin=j5_upper - j5_max,
         duration=float(best["ts"][-1]), n_knots=best["traj"].shape[1],
+        velocity_limits=vel_limits.copy(), acceleration_limits=accel_limits.copy(),
         swing_vel=None,
     )
     best.pop("score", None)
@@ -568,6 +595,7 @@ def _adaptive_release_candidates(preferred_distance: float, preferred_z: float):
 
 def plan_and_build_adaptive_throw(
     gp8: GP8, grasp_xyz, bin_xy, bin_z_offset: float, q_seed, vel_limits,
+    accel_limits,
     preferred_distance: float = RELEASE_DISTANCE_DEFAULT,
     preferred_z_offset: float = RELEASE_Z_OFFSET_DEFAULT,
     tool_offset: float = TOOL_OFFSET_DEFAULT,
@@ -589,6 +617,7 @@ def plan_and_build_adaptive_throw(
             )
             built = build_throw(
                 gp8, plan, q_seed=q_seed, vel_limits=vel_limits,
+                accel_limits=accel_limits,
                 tool_offset=tool_offset,
             )
         except ValueError as exc:
@@ -644,6 +673,9 @@ def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
           f"/ limit {np.degrees(b['j5_upper']):.2f}° "
           f"(여유 {np.degrees(b['j5_margin']):.2f}°), "
           f"속도 {b['vel_ratio'] * 100:.1f}% / 가속도 {b['accel_ratio'] * 100:.1f}%")
+    print(f"              RT accel limits="
+          f"{np.round(b['acceleration_limits'], 1).tolist()} rad/s², "
+          f"throw margin={THROW_ACCEL_SCALE * 100:.0f}%")
     print(f"  orientation : 자유 관절 스윙, start→release "
           f"{np.degrees(b['orientation_swing']):.2f}°, "
           f"release |ω|={np.degrees(b['release_omega']):.1f}°/s")
@@ -700,10 +732,11 @@ def _move_cart_slerp(ctrl, gp8: GP8, p0, p1, R0, R1, q_seed,
 # =====================================================================
 # 사이클
 # =====================================================================
-def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, vel_limits) -> None:
+def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, move_vel_limits,
+              throw_vel_limits, accel_limits) -> None:
     plan, built = plan_and_build_adaptive_throw(
         gp8, grasp_xyz, (args.bin_x, args.bin_y), args.bin_z_offset,
-        q_seed=lift_q, vel_limits=vel_limits,
+        q_seed=lift_q, vel_limits=throw_vel_limits, accel_limits=accel_limits,
         preferred_distance=args.release_distance,
         preferred_z_offset=args.release_z_offset,
         tool_offset=args.tool_offset,
@@ -722,10 +755,11 @@ def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, vel_limits) -> None:
     rel_idx = max(0, min(rel_idx, len(ts) - 1))
 
     print("→ 와인드업 시작 관절자세로 이동 (throw TCP offset 적용, 석션 유지)...")
-    vel_limits = np.asarray(vel_limits, dtype=float)
+    move_vel_limits = np.asarray(move_vel_limits, dtype=float)
     _move(
         ctrl, lift_q, built["q_start"],
-        vel_limits * args.vel_scale, vel_limits * args.vel_scale * JOINT_ACCEL_RATIO,
+        move_vel_limits * args.vel_scale,
+        move_vel_limits * args.vel_scale * JOINT_ACCEL_RATIO,
         Config().TRAJ_HZ,
     )
     time.sleep(0.2)
@@ -744,13 +778,15 @@ def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, vel_limits) -> None:
     input("\nEnter → lift 자세로 복귀 ")
     _move(
         ctrl, built["q_end"], lift_q,
-        vel_limits * args.vel_scale, vel_limits * args.vel_scale * JOINT_ACCEL_RATIO,
+        move_vel_limits * args.vel_scale,
+        move_vel_limits * args.vel_scale * JOINT_ACCEL_RATIO,
         Config().TRAJ_HZ,
     )
     print("  복귀 완료.")
 
 
-def run_cycle(ctrl, gp8: GP8, args, z: float, M1, M2, hz: float, vel_limits) -> None:
+def run_cycle(ctrl, gp8: GP8, args, z: float, M1, M2, hz: float,
+              move_vel_limits, throw_vel_limits, accel_limits) -> None:
     x, y = args.x, args.y
     current_q = np.asarray(ctrl.current_joints, dtype=float)
 
@@ -794,7 +830,10 @@ def run_cycle(ctrl, gp8: GP8, args, z: float, M1, M2, hz: float, vel_limits) -> 
     ans = input("\nt = 포물선 throw / Enter = 석션 OFF(제자리 릴리즈) > ").strip().lower()
     if ans == "t":
         try:
-            run_throw(ctrl, gp8, args, np.array([x, y, z]), lift_q, vel_limits)
+            run_throw(
+                ctrl, gp8, args, np.array([x, y, z]), lift_q,
+                move_vel_limits, throw_vel_limits, accel_limits,
+            )
         except ValueError as e:
             print(f"  throw 계획 실패: {e}")
             input("\nEnter → 석션 OFF (릴리즈) ")
@@ -804,7 +843,8 @@ def run_cycle(ctrl, gp8: GP8, args, z: float, M1, M2, hz: float, vel_limits) -> 
         print("  릴리즈 완료.")
 
 
-def plan_only(gp8: GP8, args, z: float, vel_limits) -> None:
+def plan_only(gp8: GP8, args, z: float, move_vel_limits,
+              throw_vel_limits, accel_limits) -> None:
     """로봇/ROS 없이 throw 기하 + IK + 관절궤적을 검증 출력."""
     grasp_xyz = np.array([args.x, args.y, z])
     q_seed = _ik_tool_down(gp8, args.x, args.y, z + args.lift, tool_offset=args.tool_offset)
@@ -814,7 +854,7 @@ def plan_only(gp8: GP8, args, z: float, vel_limits) -> None:
     try:
         plan, built = plan_and_build_adaptive_throw(
             gp8, grasp_xyz, (args.bin_x, args.bin_y), args.bin_z_offset,
-            q_seed=q_seed, vel_limits=vel_limits,
+            q_seed=q_seed, vel_limits=throw_vel_limits, accel_limits=accel_limits,
             preferred_distance=args.release_distance,
             preferred_z_offset=args.release_z_offset,
             tool_offset=args.tool_offset,
@@ -826,7 +866,7 @@ def plan_only(gp8: GP8, args, z: float, vel_limits) -> None:
     for name, q in (("q_start", built["q_start"]), ("q_end", built["q_end"])):
         print(f"  {name} (deg): {[round(float(np.degrees(j)), 1) for j in q]}")
     # lift↔throw start/end 는 관절공간 저속 연결.
-    M1 = np.asarray(vel_limits, dtype=float) * args.vel_scale
+    M1 = np.asarray(move_vel_limits, dtype=float) * args.vel_scale
     M2 = M1 * JOINT_ACCEL_RATIO
     zero = np.zeros_like(M1)
     _, _, ts_in = trajectory(q_seed, zero, built["q_start"], zero, M1, M2, hertz=100.0)
@@ -881,7 +921,8 @@ def _tool_path_from_joint_traj(gp8: GP8, traj, tool_offset: float) -> np.ndarray
     return pts
 
 
-def _build_rviz_preview(gp8: GP8, args, z: float, vel_limits):
+def _build_rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
+                        throw_vel_limits, accel_limits):
     """RViz preview 용 전체 joint trajectory + marker geometry 를 생성."""
     grasp_xyz = np.array([args.x, args.y, z], dtype=float)
     grasp_q = _ik_tool_down(gp8, args.x, args.y, z, tool_offset=args.tool_offset)
@@ -895,13 +936,13 @@ def _build_rviz_preview(gp8: GP8, args, z: float, vel_limits):
 
     plan, built = plan_and_build_adaptive_throw(
         gp8, grasp_xyz, (args.bin_x, args.bin_y), args.bin_z_offset,
-        q_seed=lift_q, vel_limits=vel_limits,
+        q_seed=lift_q, vel_limits=throw_vel_limits, accel_limits=accel_limits,
         preferred_distance=args.release_distance,
         preferred_z_offset=args.release_z_offset,
         tool_offset=args.tool_offset,
     )
 
-    M1 = np.asarray(vel_limits, dtype=float) * args.vel_scale
+    M1 = np.asarray(move_vel_limits, dtype=float) * args.vel_scale
     M2 = M1 * JOINT_ACCEL_RATIO
     zero = np.zeros_like(M1)
     pick_lift_traj, pick_lift_vel, pick_lift_ts = trajectory(
@@ -1044,13 +1085,16 @@ def _publish_rviz_static(pub_markers, pub_path, preview, frame_id: str, stamp):
     pub_path.publish(path)
 
 
-def rviz_preview(gp8: GP8, args, z: float, vel_limits) -> None:
+def rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
+                 throw_vel_limits, accel_limits) -> None:
     """RViz에서 marker/path와 RobotModel 애니메이션으로 throw 계획을 미리 본다."""
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
 
-    preview = _build_rviz_preview(gp8, args, z, vel_limits)
+    preview = _build_rviz_preview(
+        gp8, args, z, move_vel_limits, throw_vel_limits, accel_limits,
+    )
     print_throw_plan(preview["plan"], preview["built"], args.release_lead)
 
     rclpy.init()
@@ -1146,6 +1190,16 @@ def main() -> None:
                         help="리프트 높이 [m] (기본 0.10)")
     parser.add_argument("--vel-scale", type=float, default=0.3,
                         help="저속 이동 관절속도 스케일 (기본 0.3)")
+    parser.add_argument(
+        "--axis-increment-factor", type=float,
+        default=AXIS_INCREMENT_FACTOR_DEFAULT,
+        help="YRC external-increment 속도 factor (기본 1.0; bringup과 일치시킬 것)",
+    )
+    parser.add_argument(
+        "--axis-acceleration-factor", type=float,
+        default=AXIS_ACCELERATION_FACTOR_DEFAULT,
+        help="YRC external-increment 가속도 factor (기본 0.02; bringup과 일치시킬 것)",
+    )
     parser.add_argument("--bin-x", type=float, default=1.5,
                         help="throw bin X [m] (기본 1.5)")
     parser.add_argument("--bin-y", type=float, default=0.0,
@@ -1181,14 +1235,31 @@ def main() -> None:
     cfg = Config()
     z = cfg.GRASP_Z if args.z is None else args.z
     gp8 = GP8()
-    vel_limits = np.asarray(gp8.velocity_limits, dtype=float)
+    try:
+        throw_vel_limits, accel_limits = _rt_motion_limits(
+            gp8, args.axis_increment_factor, args.axis_acceleration_factor,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(
+        "YRC RT limits: "
+        f"increment_factor={args.axis_increment_factor:.3f}, "
+        f"acceleration_factor={args.axis_acceleration_factor:.3f}\n"
+        f"  velocity     ={np.round(throw_vel_limits, 3).tolist()} rad/s\n"
+        f"  acceleration ={np.round(accel_limits, 3).tolist()} rad/s²"
+    )
+    move_vel_limits = np.asarray(gp8.velocity_limits, dtype=float)
 
     if args.plan_only:
-        plan_only(gp8, args, z, vel_limits)
+        plan_only(
+            gp8, args, z, move_vel_limits, throw_vel_limits, accel_limits,
+        )
         return
 
     if args.rviz_preview:
-        rviz_preview(gp8, args, z, vel_limits)
+        rviz_preview(
+            gp8, args, z, move_vel_limits, throw_vel_limits, accel_limits,
+        )
         return
 
     import rclpy
@@ -1224,12 +1295,15 @@ def main() -> None:
         print(f"  current joints (deg): "
               f"{[round(float(np.degrees(j)), 1) for j in ctrl.current_joints]}")
 
-        M1 = vel_limits * args.vel_scale
+        M1 = move_vel_limits * args.vel_scale
         M2 = M1 * JOINT_ACCEL_RATIO
 
         print("\n⚠️  실제 로봇 모션입니다. 컨베이어 정지 + 주변 공간 확보 확인.")
         while True:
-            run_cycle(ctrl, gp8, args, z, M1, M2, cfg.TRAJ_HZ, vel_limits)
+            run_cycle(
+                ctrl, gp8, args, z, M1, M2, cfg.TRAJ_HZ,
+                move_vel_limits, throw_vel_limits, accel_limits,
+            )
             ans = input(
                 "\n다시 실행? (y = 같은 지점 / 'x y' 새 좌표 입력 / N 종료) > "
             ).strip().lower()

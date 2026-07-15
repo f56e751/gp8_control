@@ -51,6 +51,7 @@ ros2 launch gp8_control suction_lift_preview.launch.py
 - bin: `(x=1.5, y=0.0, z=pick_z + 0.10)`
 - release: `pick→bin 방향 0.10 m, z=pick_z + 0.33` (실패 시 거리/Z adaptive)
 - extra tool offset: `0.0 m`
+- YRC motion factors: `axis_increment_factor=1.0`, `axis_acceleration_factor=0.02`
 - preview rate: `60 Hz`
 - preview playback: `0.25x` 슬로모션
 - preview ROS domain: `42` (실제 bringup과 분리)
@@ -63,6 +64,7 @@ ros2 launch gp8_control suction_lift_preview.launch.py \
   bin_x:=1.50 bin_y:=0.0 bin_z_offset:=0.10 \
   release_distance:=0.10 release_z_offset:=0.33 \
   tool_offset:=0.0 \
+  axis_increment_factor:=1.0 axis_acceleration_factor:=0.02 \
   preview_rate:=60.0 preview_speed:=0.25 \
   preview_domain_id:=42
 ```
@@ -176,10 +178,13 @@ TCP 위치에 원호를 강제하지 않는다. release에서 필요한 TCP 선�
 그 결과 TCP는 사람의 팔 스윙처럼 앞/위로 휘어진 곡선을 그리고,
 release에서 곡선의 접선이 탄도 초기속도와 정확히 일치한다.
 
-관절 가속도는 MoveIt 설정값 `[10, 10, 10, 15, 15, 20] rad/s²`의 90%를
-사용한다. 가속/감속 구간 양끝 5%에 jerk ramp를 두어 정지점과
-release에서 가속도가 0으로 연속이다. 전 관절의 위치는 하드 리미트에서
-2° 안쪽, 속도는 사양의 90% 이내인 후보만 통과한다.
+관절 속도/가속도는 YRC external-increment 경로의 실측 factor-1.0 속도
+`[3.97, 3.36, 4.52, 4.77, 4.80, 8.76] rad/s`에서 계산한다. 기본
+`axis_acceleration_factor=0.02`, 제어주기 4 ms에서 가속도 상한은
+`[39.7, 33.6, 45.2, 47.7, 48.0, 87.6] rad/s²`다. throw는 이 속도와
+가속도 상한의 90%만 사용한다. 가속/감속 구간 양끝 5%에 jerk ramp를
+두어 정지점과 release에서 가속도가 0으로 연속이다. 전 관절 위치는
+하드 리미트에서 2° 안쪽인 후보만 통과한다.
 
 코드 상수:
 
@@ -190,7 +195,9 @@ RELEASE_Z_OFFSET_DEFAULT = 0.33
 RELEASE_DISTANCE_MIN/MAX/STEP = 0.10 / 0.25 / 0.05
 RELEASE_Z_OFFSET_MIN/MAX/STEP = 0.20 / 0.60 / 0.02
 TOOL_OFFSET_DEFAULT = 0.0
-THROW_ACCEL_LIMITS = [10, 10, 10, 15, 15, 20]
+RT_CONTROL_PERIOD = 0.004
+AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
+AXIS_ACCELERATION_FACTOR_DEFAULT = 0.02
 THROW_ACCEL_SCALE = 0.90
 THROW_JERK_RAMP_FRACTION = 0.05
 ```
@@ -199,13 +206,13 @@ THROW_JERK_RAMP_FRACTION = 0.05
 
 ```text
 bin=(+1.500,+0.000,+0.162)
-release=(+0.650,+0.000,+0.392)
-v=(+2.006,+0.000,+1.535) m/s
-|v|=2.526 m/s, angle=37.43 deg
-swing=0.401 s runup + 0.401 s follow-through
-orientation start→release=61.25 deg
-max J5=56.35 deg (limit 60.776 deg)
-max velocity ratio=53.5%, max acceleration ratio=90.0%
+release=(+0.750,+0.000,+0.392)
+v=(+1.875,+0.000,+1.386) m/s
+|v|=2.332 m/s, angle=36.48 deg
+swing=0.103 s runup + 0.103 s follow-through
+orientation start→release=14.77 deg
+max J5=6.86 deg (limit 60.776 deg)
+max velocity ratio=87.7%, max acceleration ratio=90.0%
 ```
 
 ## 7. 로봇 없이 계획만 검증
@@ -269,6 +276,8 @@ ros2 run gp8_control suction_lift_debug \
   --bin-x 0.95 --bin-y 0.0 \
   --bin-z-offset 0.10 \
   --tool-offset 0.0 \
+  --axis-increment-factor 1.0 \
+  --axis-acceleration-factor 0.02 \
   --vel-scale 0.3
 ```
 

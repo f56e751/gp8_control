@@ -34,6 +34,8 @@ def generate_launch_description():
     release_z_offset = LaunchConfiguration("release_z_offset")
     tool_offset = LaunchConfiguration("tool_offset")
     vel_scale = LaunchConfiguration("vel_scale")
+    axis_increment_factor = LaunchConfiguration("axis_increment_factor")
+    axis_acceleration_factor = LaunchConfiguration("axis_acceleration_factor")
     preview_rate = LaunchConfiguration("preview_rate")
     preview_speed = LaunchConfiguration("preview_speed")
     preview_domain_id = LaunchConfiguration("preview_domain_id")
@@ -60,6 +62,14 @@ def generate_launch_description():
                               description="extra offset beyond gp8.py/MuJoCo TCP [m]"),
         DeclareLaunchArgument("vel_scale", default_value="0.3",
                               description="low-speed move velocity scale"),
+        DeclareLaunchArgument(
+            "axis_increment_factor", default_value="1.0",
+            description="YRC external-increment velocity factor used for planning",
+        ),
+        DeclareLaunchArgument(
+            "axis_acceleration_factor", default_value="0.02",
+            description="YRC external-increment acceleration factor used for planning",
+        ),
         DeclareLaunchArgument("preview_rate", default_value="60.0",
                               description="preview /joint_states rate [Hz]"),
         DeclareLaunchArgument("preview_speed", default_value="0.25",
@@ -116,6 +126,8 @@ def generate_launch_description():
         "--release-z-offset", release_z_offset,
         "--tool-offset", tool_offset,
         "--vel-scale", vel_scale,
+        "--axis-increment-factor", axis_increment_factor,
+        "--axis-acceleration-factor", axis_acceleration_factor,
         "--preview-rate", preview_rate,
         "--preview-speed", preview_speed,
     ]
