@@ -92,9 +92,8 @@ RELEASE_Z_OFFSET_STEP = 0.02
 # gp8_control/gp8_bringup.launch.py의 실제 로봇 기본값. YRC external-
 # increment 경로의 축별 한계는 GP8.rt_stream_velocity_limits(factor=1.0)
 # 에서 환산하고, 아래 throw scale로 10% 안전 여유를 둔다.
-RT_CONTROL_PERIOD = 0.004
 AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
-AXIS_ACCELERATION_FACTOR_DEFAULT = 0.02
+AXIS_ACCELERATION_FACTOR_DEFAULT = GP8.DEFAULT_RT_ACCELERATION_FACTOR
 THROW_ACCEL_SCALE = 0.90
 THROW_VELOCITY_SCALE = 0.90
 THROW_JERK_RAMP_FRACTION = 0.05  # 가속/감속 구간 양끝 5%를 선형 jerk ramp로 사용
@@ -118,9 +117,8 @@ TOOL_LEN = 0.325                 # 손목중심→기구학 EE 원점 [m]
 def _rt_motion_limits(gp8: GP8, increment_factor: float, acceleration_factor: float):
     """현재 YRC external-increment factor의 축별 속도/가속도 상한.
 
-    ``rt_stream_velocity_limits``는 factor=1.0에서 실측한 속도다. 컨트롤러의
-    ``_ACC_MAX = 2 * maxIncrement * ACC_FACTOR``를 4 ms 주기 SI 단위로
-    환산하면 ``a_max = 2 * v_factor1 * ACC_FACTOR / dt``가 된다.
+    ``rt_stream_velocity_limits``는 factor=1.0에서 실측한 속도다. 가속도
+    환산은 GP8 모델의 공용 ``rt_stream_acceleration_limits``를 사용한다.
     """
     increment_factor = float(increment_factor)
     acceleration_factor = float(acceleration_factor)
@@ -130,9 +128,7 @@ def _rt_motion_limits(gp8: GP8, increment_factor: float, acceleration_factor: fl
         raise ValueError("axis acceleration factor는 (0, 1] 범위여야 합니다")
     full_speed = np.asarray(gp8.rt_stream_velocity_limits, dtype=float)
     velocity_limits = full_speed * increment_factor
-    acceleration_limits = (
-        2.0 * full_speed * acceleration_factor / RT_CONTROL_PERIOD
-    )
+    acceleration_limits = gp8.rt_stream_acceleration_limits(acceleration_factor)
     return velocity_limits, acceleration_limits
 
 
