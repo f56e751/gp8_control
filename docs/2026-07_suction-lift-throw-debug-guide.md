@@ -168,7 +168,7 @@ bin까지의 수평거리와 높이차를 이용해 진공 탄도의 필요 속�
 아래로 30° 기울인다.
 
 기준 release가 관절 위치/속도/가속도 제한을 만족하지 못하면
-pick→bin 방향 거리 `10~25 cm`(간격 5 cm), release Z offset
+pick→bin 방향 거리 `10~35 cm`(간격 5 cm), release Z offset
 `20~60 cm`(간격 2 cm)를 자동 탐색한다. 기준 `10 cm / 33 cm`에
 해가 있으면 그대로 사용한다. 기준 후보가 실패하면 비행거리와 불필요한
 backswing을 줄이기 위해 큰 release 거리부터, Z는 기준값에 가까운 순서로
@@ -188,8 +188,8 @@ release 앞뒤에도 서로 다른 궤적을 접합하지 않고 위치·속도�
 관절 속도/가속도는 YRC external-increment 경로의 실측 factor-1.0 속도
 `[3.97, 3.36, 4.52, 4.77, 4.80, 8.76] rad/s`에서 계산한다. 기본
 `axis_acceleration_factor=0.02`, 제어주기 4 ms에서 가속도 상한은
-`[39.7, 33.6, 45.2, 47.7, 48.0, 87.6] rad/s²`다. throw는 이 속도와
-가속도 상한의 90%만 사용한다. polynomial 양 끝의 속도와 가속도는 0으로
+`[39.7, 33.6, 45.2, 47.7, 48.0, 87.6] rad/s²`다. throw는 관절속도
+상한의 100%, 가속도 상한의 90%를 사용한다. polynomial 양 끝의 속도와 가속도는 0으로
 제약하고, 전 관절 위치는 하드 리미트에서 2° 안쪽인 후보만 통과한다.
 또한 lift→release의 실제 TCP FK 곡선 길이가 두 점의 직선거리의 1.25배를
 넘으면 불필요한 backswing으로 판정하여 해당 polynomial 후보를 버린다.
@@ -200,12 +200,13 @@ release 앞뒤에도 서로 다른 궤적을 접합하지 않고 위치·속도�
 BIN_Z_OFFSET_DEFAULT = 0.10
 RELEASE_DISTANCE_DEFAULT = 0.10
 RELEASE_Z_OFFSET_DEFAULT = 0.33
-RELEASE_DISTANCE_MIN/MAX/STEP = 0.10 / 0.25 / 0.05
+RELEASE_DISTANCE_MIN/MAX/STEP = 0.10 / 0.35 / 0.05
 RELEASE_Z_OFFSET_MIN/MAX/STEP = 0.20 / 0.60 / 0.02
 TOOL_OFFSET_DEFAULT = 0.0
 AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
 AXIS_ACCELERATION_FACTOR_DEFAULT = GP8.DEFAULT_RT_ACCELERATION_FACTOR  # 0.02
 THROW_ACCEL_SCALE = 0.90
+THROW_VELOCITY_SCALE = 1.00
 THROW_POLY_DEGREE = 7
 THROW_RELEASE_FRACTIONS = (0.55, 0.60, 0.65, 0.70)
 THROW_TCP_PATH_RATIO_MAX = 1.25
@@ -215,15 +216,15 @@ THROW_TCP_PATH_RATIO_MAX = 1.25
 
 ```text
 bin=(+1.500,+0.000,+0.162)
-release=(+0.800,+0.000,+0.392)
-v=(+1.806,+0.000,+1.308) m/s
-|v|=2.230 m/s, angle=35.91 deg
-single degree-7 minimum-jerk polynomial, release at 70%
-swing=0.422 s lift-to-release + 0.181 s follow-through
-TCP path/direct=1.244 (limit 1.25)
+release=(+0.900,+0.000,+0.392)
+v=(+1.658,+0.000,+1.140) m/s
+|v|=2.012 m/s, angle=34.51 deg
+single degree-7 minimum-jerk polynomial, release at 60%
+swing=0.279 s lift-to-release + 0.186 s follow-through
+TCP path/direct=1.001 (limit 1.25)
 orientation lift→release=60.00 deg
-max J5=9.88 deg (limit 60.776 deg)
-max velocity ratio=89.5%, max acceleration ratio=89.8%
+max J5=-1.74 deg (limit 60.776 deg)
+max velocity ratio=99.7%, max acceleration ratio=89.5%
 ```
 
 ## 7. 로봇 없이 계획만 검증

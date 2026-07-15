@@ -5,7 +5,7 @@ throw_skill 이 ambush 대기에 쓰는 그 그랩 높이)로 내려가 파킹 �
 1초 홀드, 진공 형성) → 10 cm 리프트. 이후 선택적으로 **throw**:
 
   * release XY = pick→bin 방향 10 cm, release Z = pick +33 cm을 우선
-    사용한다. 계획이 실패하면 거리 10~25 cm, Z 20~60 cm에서
+    사용한다. 계획이 실패하면 거리 10~35 cm, Z 20~60 cm에서
     제한을 만족하는 가장 가까운 release를 자동 선택한다.
   * release→bin 포물선은 두 지점을 연결하는 최소 속도 탄도를 계산한다.
     release에서 툴 축은 투척 전방 기준 아래 30°다.
@@ -85,7 +85,7 @@ THROW_DT = 0.01            # throw 구간 knot 간격 [s] (스트림이 4ms 로 
 RELEASE_DISTANCE_DEFAULT = 0.10  # release XY = pick XY + distance * unit(pick→bin)
 RELEASE_Z_OFFSET_DEFAULT = 0.33  # release Z = pick Z + offset [m]
 RELEASE_DISTANCE_MIN = 0.10
-RELEASE_DISTANCE_MAX = 0.25
+RELEASE_DISTANCE_MAX = 0.35
 RELEASE_DISTANCE_STEP = 0.05
 RELEASE_Z_OFFSET_MIN = 0.20
 RELEASE_Z_OFFSET_MAX = 0.60
@@ -96,7 +96,9 @@ RELEASE_Z_OFFSET_STEP = 0.02
 AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
 AXIS_ACCELERATION_FACTOR_DEFAULT = GP8.DEFAULT_RT_ACCELERATION_FACTOR
 THROW_ACCEL_SCALE = 0.90
-THROW_VELOCITY_SCALE = 0.90
+# 장거리 throw를 위해 YRC RT-stream 실측 관절속도 상한을 100% 사용한다.
+# axis_increment_factor 자체는 하드웨어 허용범위인 1.0을 넘기지 않는다.
+THROW_VELOCITY_SCALE = 1.00
 THROW_POLY_DEGREE = 7
 # release를 전체 polynomial의 어느 시점에 둘지도 함께 탐색한다. lift에서
 # release까지가 팔로스루보다 길도록 50% 뒤쪽만 허용한다.
@@ -832,7 +834,7 @@ def plan_and_build_adaptive_throw(
 ):
     """release 거리/Z를 adaptive 탐색해 ``(plan, built)``를 반환한다.
 
-    기준값을 먼저 시도하고, 실패할 때만 pick→bin 방향 10~25 cm,
+    기준값을 먼저 시도하고, 실패할 때만 pick→bin 방향 10~35 cm,
     pick Z +20~60 cm 격자를 큰 release 거리/Z 기준값 근접 순으로 탐색한다.
     """
     errors = []
@@ -912,7 +914,8 @@ def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
           f"(limit {THROW_TCP_PATH_RATIO_MAX:.2f}x)")
     print(f"              RT accel limits="
           f"{np.round(b['acceleration_limits'], 1).tolist()} rad/s², "
-          f"throw margin={THROW_ACCEL_SCALE * 100:.0f}%")
+          f"throw scales: velocity={THROW_VELOCITY_SCALE * 100:.0f}%, "
+          f"acceleration={THROW_ACCEL_SCALE * 100:.0f}%")
     print(f"  orientation : 자유 관절 스윙, lift→release "
           f"{np.degrees(b['orientation_swing']):.2f}°, "
           f"release |ω|={np.degrees(b['release_omega']):.1f}°/s")
