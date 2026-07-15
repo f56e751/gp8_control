@@ -96,10 +96,9 @@ RViz fixed frame은 `base_link` 기준이다.
 | 색 / 형태 | 의미 |
 |---|---|
 | 초록 sphere | pick / grasp 위치 |
-| 하늘색 sphere | lift 후 위치 |
+| 하늘색 sphere | lift 후 위치이자 polynomial throw 시작점 |
 | 주황 sphere | release 위치 |
 | 파란 sphere | bin 최종 목표 위치 |
-| 노란 sphere | throw runup 시작점 |
 | 자홍 sphere | follow-through 끝점 |
 | 노란 line | preview joint trajectory를 FK해서 얻은 실제 `suction_tool` 원점 path |
 | 자홍 line | 고속 throw 구간의 실제 TCP 곡선(start→release→follow-through) |
@@ -170,21 +169,29 @@ bin까지의 수평거리와 높이차를 이용해 진공 탄도의 필요 속�
 기준 release가 관절 위치/속도/가속도 제한을 만족하지 못하면
 pick→bin 방향 거리 `10~25 cm`(간격 5 cm), release Z offset
 `20~60 cm`(간격 2 cm)를 자동 탐색한다. 기준 `10 cm / 33 cm`에
-가장 가까운 유효 후보를 선택한다.
+해가 있으면 그대로 사용한다. 기준 후보가 실패하면 비행거리와 불필요한
+backswing을 줄이기 위해 큰 release 거리부터, Z는 기준값에 가까운 순서로
+유효 후보를 탐색한다.
 
 TCP 위치에 원호를 강제하지 않는다. release에서 필요한 TCP 선속도와
 투척 평면 내 각속도를 spatial Jacobian으로 release 관절속도로 바꿘 뒤,
-이 상태를 중간점으로 하는 정지→release→정지 관절 스윙을 만든다.
-그 결과 TCP는 사람의 팔 스윙처럼 앞/위로 휘어진 곡선을 그리고,
-release에서 곡선의 접선이 탄도 초기속도와 정확히 일치한다.
+10 cm lift 종료 관절점을 polynomial 시작점으로 직접 사용하고 release 관절
+위치/속도를 등식제약으로 걸어 lift→release→follow-through 전체를 **하나의
+7차 minimum-jerk polynomial**로 최적화한다. lift와 throw 사이에 별도
+runup 이동이나 정지 segment를 삽입하지 않는다. release는 전체 시간의
+55/60/65/70% 후보 중 제한을 만족하는 가장 짧은 해를 선택한다. 따라서
+release 앞뒤에도 서로 다른 궤적을 접합하지 않고 위치·속도·가속도·jerk가
+연속이다. TCP는 이 관절 polynomial의 FK 결과이며 release에서 곡선의
+접선은 탄도 초기속도와 정확히 일치한다.
 
 관절 속도/가속도는 YRC external-increment 경로의 실측 factor-1.0 속도
 `[3.97, 3.36, 4.52, 4.77, 4.80, 8.76] rad/s`에서 계산한다. 기본
 `axis_acceleration_factor=0.02`, 제어주기 4 ms에서 가속도 상한은
 `[39.7, 33.6, 45.2, 47.7, 48.0, 87.6] rad/s²`다. throw는 이 속도와
-가속도 상한의 90%만 사용한다. 가속/감속 구간 양끝 5%에 jerk ramp를
-두어 정지점과 release에서 가속도가 0으로 연속이다. 전 관절 위치는
-하드 리미트에서 2° 안쪽인 후보만 통과한다.
+가속도 상한의 90%만 사용한다. polynomial 양 끝의 속도와 가속도는 0으로
+제약하고, 전 관절 위치는 하드 리미트에서 2° 안쪽인 후보만 통과한다.
+또한 lift→release의 실제 TCP FK 곡선 길이가 두 점의 직선거리의 1.25배를
+넘으면 불필요한 backswing으로 판정하여 해당 polynomial 후보를 버린다.
 
 코드 상수:
 
@@ -198,20 +205,24 @@ TOOL_OFFSET_DEFAULT = 0.0
 AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
 AXIS_ACCELERATION_FACTOR_DEFAULT = GP8.DEFAULT_RT_ACCELERATION_FACTOR  # 0.02
 THROW_ACCEL_SCALE = 0.90
-THROW_JERK_RAMP_FRACTION = 0.05
+THROW_POLY_DEGREE = 7
+THROW_RELEASE_FRACTIONS = (0.55, 0.60, 0.65, 0.70)
+THROW_TCP_PATH_RATIO_MAX = 1.25
 ```
 
 기본 `bin_x=1.5` 조건에서 plan-only 검증 시 대표적으로 아래 값이 나온다.
 
 ```text
 bin=(+1.500,+0.000,+0.162)
-release=(+0.750,+0.000,+0.392)
-v=(+1.875,+0.000,+1.386) m/s
-|v|=2.332 m/s, angle=36.48 deg
-swing=0.103 s runup + 0.103 s follow-through
-orientation start→release=14.77 deg
-max J5=6.86 deg (limit 60.776 deg)
-max velocity ratio=87.7%, max acceleration ratio=90.0%
+release=(+0.800,+0.000,+0.392)
+v=(+1.806,+0.000,+1.308) m/s
+|v|=2.230 m/s, angle=35.91 deg
+single degree-7 minimum-jerk polynomial, release at 70%
+swing=0.422 s lift-to-release + 0.181 s follow-through
+TCP path/direct=1.244 (limit 1.25)
+orientation lift→release=60.00 deg
+max J5=9.88 deg (limit 60.776 deg)
+max velocity ratio=89.5%, max acceleration ratio=89.8%
 ```
 
 ## 7. 로봇 없이 계획만 검증

@@ -10,11 +10,12 @@ throw_skill 이 ambush 대기에 쓰는 그 그랩 높이)로 내려가 파킹 �
   * release→bin 포물선은 두 지점을 연결하는 최소 속도 탄도를 계산한다.
     release에서 툴 축은 투척 전방 기준 아래 30°다.
   * 스윙은 TCP에 원호를 강제하지 않는다. release pose와 탄도 선속도,
-    투척 평면 내 각속도를 spatial Jacobian으로 관절 상태로 바꾸고,
-    그 상태를 중간점으로 하는 와인드업→release→팔로스루를 만든다.
-    관절 가속도는 제한의 90% 이내이고, 양끝 5% 구간에 jerk ramp를 넣어
-    정지점과 release에서 가속도가 0으로 연속이다. 스윙 전체에서 J5 현장
-    상한(+60.776°) 및 전 관절 위치/속도 제한을 검사한다. 석션 off는
+    투척 평면 내 각속도를 spatial Jacobian으로 관절 상태로 바꾼 뒤,
+    10 cm lift 종료점→release→팔로스루 전체를 하나의 7차 minimum-jerk
+    polynomial로 최적화한다. 별도 runup 이동은 없다. lift 종료점은 정지
+    상태, release 위치/속도는 정확한 내부 제약, 끝점은 정지 상태이며 전
+    구간의 위치/속도/가속도 제한과 lift→release TCP 경로 길이(직선의
+    1.25배 이하)를 검사한다. 석션 off는
     send_trajectory_queue_with_timed_release로 release knot에 동기한다.
 
 app.py / 카메라 / 컨베이어 / torch 의존 없음. 로봇 드라이버 bringup
@@ -50,9 +51,9 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+from functools import lru_cache
 
 import numpy as np
-from scipy.spatial.transform import Rotation, Slerp
 
 from gp8_control.config import Config
 from gp8_control.robots.gp8 import GP8
@@ -96,12 +97,23 @@ AXIS_INCREMENT_FACTOR_DEFAULT = 1.0
 AXIS_ACCELERATION_FACTOR_DEFAULT = GP8.DEFAULT_RT_ACCELERATION_FACTOR
 THROW_ACCEL_SCALE = 0.90
 THROW_VELOCITY_SCALE = 0.90
-THROW_JERK_RAMP_FRACTION = 0.05  # 가속/감속 구간 양끝 5%를 선형 jerk ramp로 사용
+THROW_POLY_DEGREE = 7
+# release를 전체 polynomial의 어느 시점에 둘지도 함께 탐색한다. lift에서
+# release까지가 팔로스루보다 길도록 50% 뒤쪽만 허용한다.
+THROW_RELEASE_FRACTIONS = (0.55, 0.60, 0.65, 0.70)
+THROW_DURATION_SCALE_MIN = 0.75
+THROW_DURATION_SCALE_MAX = 4.0
+THROW_DURATION_COARSE_SAMPLES = 21
+THROW_DURATION_REFINE_SAMPLES = 13
+THROW_POLY_CHECK_SAMPLES = 81
+THROW_POLY_FINAL_CHECK_SAMPLES = 401
+# lift→release TCP FK 곡선이 두 점의 직선거리보다 25% 넘게 우회하면
+# minimum-jerk 값이 작아도 불필요한 backswing으로 보고 버린다.
+THROW_TCP_PATH_RATIO_MAX = 1.25
+THROW_TCP_PATH_PREFILTER_SAMPLES = 7
+THROW_TCP_PATH_CHECK_SAMPLES = 401
 RELEASE_OMEGA_MAX = 8.0          # release 평면내 각속도 탐색 상한 [rad/s]
-RELEASE_OMEGA_STEP = 0.01        # 각속도 탐색 간격 [rad/s]
-PREMOVE_SPEED = 0.20       # 와인드업 위치로 하강/복귀 카르테시안 이동 속도 [m/s]
-PREMOVE_ACCEL = 1.0        # 그 가속도 [m/s^2]
-PREMOVE_DT = 0.02          # 그 knot 간격 [s]
+RELEASE_OMEGA_STEP = 0.05        # 경로 제약 후보 탐색 간격 [rad/s]
 PREVIEW_SPEED_DEFAULT = 0.25     # RViz 재생 배속 (실제 시간의 1/4)
 PREVIEW_STATIC_RATE = 1.0        # marker/path 재발행 주기 [Hz]
 BIN_Z_OFFSET_DEFAULT = 0.10      # bin 목표 높이 = grasp z + 이 값 [m]
@@ -257,162 +269,286 @@ def plan_parabola_throw(
     )
 
 
-def _jerk_ramp_unit_profile(s, ramp_fraction: float):
-    """0→1 속도 profile ``h``와 적분 ``H`` 및 미분 ``dh/ds``.
+def _poly_basis(s, derivative: int = 0, degree: int = THROW_POLY_DEGREE):
+    """``s``에서 power-basis polynomial의 미분 기저 행렬을 만든다."""
+    s = np.atleast_1d(np.asarray(s, dtype=float))
+    basis = np.zeros((s.size, degree + 1), dtype=float)
+    for power in range(derivative, degree + 1):
+        factor = 1.0
+        for k in range(derivative):
+            factor *= power - k
+        basis[:, power] = factor * s ** (power - derivative)
+    return basis
 
-    가속도는 처음/끝 ramp 구간에서 선형으로 증감하고 중간에서
-    일정하다. 따라서 h(0)=0, h(1)=1, h'(0)=h'(1)=0,
-    H(1)=0.5이다.
+
+@lru_cache(maxsize=len(THROW_RELEASE_FRACTIONS))
+def _minimum_jerk_constraint_map(release_fraction: float) -> tuple[np.ndarray, np.ndarray]:
+    """7차 minimum-jerk QP의 등식제약→계수 선형 map을 반환한다.
+
+    각 관절에 대해 ``q(s)=sum(a[k] s**k)``이고 ``s=t/T``다. 제약은
+
+      q(0)=q_start, q'(0)=q''(0)=0,
+      q(r)=q_release, q'(r)=qd_release*T,
+      q'(1)=q''(1)=0
+
+    이다. 남는 1 자유도는 ``integral_0^1 q'''(s)^2 ds``를 최소화한다.
+    따라서 release 앞/뒤를 접합한 두 다항식이 아니라 전체 throw에 하나의
+    계수 벡터만 사용하고, release에서 모든 차수의 미분이 자동 연속이다.
     """
-    s = np.asarray(s, dtype=float)
-    e = float(ramp_fraction)
-    if not (0.0 < e < 0.5):
-        raise ValueError(f"jerk ramp fraction은 0~0.5 사이여야 합니다 ({e})")
-    A = 1.0 / (1.0 - e)
-    h = np.empty_like(s)
-    H = np.empty_like(s)
-    dh = np.empty_like(s)
-    first = s < e
-    middle = (s >= e) & (s <= 1.0 - e)
-    last = s > 1.0 - e
-    h[first] = A * s[first] ** 2 / (2.0 * e)
-    H[first] = A * s[first] ** 3 / (6.0 * e)
-    dh[first] = A * s[first] / e
-    h[middle] = A * (s[middle] - 0.5 * e)
-    H[middle] = A * (
-        0.5 * s[middle] ** 2 - 0.5 * e * s[middle] + e ** 2 / 6.0
-    )
-    dh[middle] = A
-    u = 1.0 - s[last]
-    h[last] = 1.0 - A * u ** 2 / (2.0 * e)
-    H[last] = s[last] - 0.5 + A * u ** 3 / (6.0 * e)
-    dh[last] = A * u / e
-    return h, H, dh
+    r = float(release_fraction)
+    if not 0.0 < r < 1.0:
+        raise ValueError(f"release fraction은 (0, 1)이어야 합니다 ({r})")
+
+    n_coeff = THROW_POLY_DEGREE + 1
+    Q = np.zeros((n_coeff, n_coeff), dtype=float)
+    for i in range(3, n_coeff):
+        ci = i * (i - 1) * (i - 2)
+        for j in range(3, n_coeff):
+            cj = j * (j - 1) * (j - 2)
+            Q[i, j] = ci * cj / (i + j - 5)
+
+    C = np.vstack([
+        _poly_basis([0.0], 0)[0],
+        _poly_basis([0.0], 1)[0],
+        _poly_basis([0.0], 2)[0],
+        _poly_basis([r], 0)[0],
+        _poly_basis([r], 1)[0],
+        _poly_basis([1.0], 1)[0],
+        _poly_basis([1.0], 2)[0],
+    ])
+    n_constraints = C.shape[0]
+    KKT = np.block([
+        [Q, C.T],
+        [C, np.zeros((n_constraints, n_constraints), dtype=float)],
+    ])
+    rhs = np.vstack([
+        np.zeros((n_coeff, n_constraints), dtype=float),
+        np.eye(n_constraints, dtype=float),
+    ])
+    try:
+        constraint_map = np.linalg.solve(KKT, rhs)[:n_coeff]
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"minimum-jerk polynomial QP 해석 실패: {exc}") from exc
+    return constraint_map, Q
 
 
-def _joint_swing_profile(q_release, qd_release, half_duration: float, dt: float):
-    """정지→release→정지 시대칭 관절 스윙을 만든다."""
+def _joint_polynomial_profile(
+    q_start, q_release, qd_release, total_duration: float,
+    release_fraction: float, dt: float, sample_s=None,
+):
+    """단일 7차 minimum-jerk throw polynomial을 계산한다."""
+    q_start = np.asarray(q_start, dtype=float)
     q_release = np.asarray(q_release, dtype=float)
     qd_release = np.asarray(qd_release, dtype=float)
-    T = float(half_duration)
-    n_uniform = max(5, int(np.ceil(T / dt)) + 1)
-    e = THROW_JERK_RAMP_FRACTION
-    # 운동학 piecewise 경계를 knot에 정확히 포함해 Hermite 리샘플이
-    # jerk ramp 끝을 건너뛰지 않게 한다.
-    tau = np.unique(np.concatenate([
-        np.linspace(0.0, T, n_uniform), np.array([e * T, (1.0 - e) * T]),
-    ]))
-    s = tau / T
-    h, H, _ = _jerk_ramp_unit_profile(s, THROW_JERK_RAMP_FRACTION)
-    q_start = q_release - 0.5 * qd_release * T
-    q_end = q_release + 0.5 * qd_release * T
-    q_pre = q_start[:, None] + qd_release[:, None] * T * H[None, :]
-    qd_pre = qd_release[:, None] * h[None, :]
-    q_post = (
-        q_release[:, None]
-        + qd_release[:, None] * T * (s - H)[None, :]
-    )
-    qd_post = qd_release[:, None] * (1.0 - h)[None, :]
-    traj = np.concatenate([q_pre, q_post[:, 1:]], axis=1)
-    vel = np.concatenate([qd_pre, qd_post[:, 1:]], axis=1)
-    ts = np.concatenate([tau, T + tau[1:]])
-    return traj, vel, ts, len(tau) - 1, q_start, q_end
+    T = float(total_duration)
+    r = float(release_fraction)
+    if T <= 0.0:
+        raise ValueError(f"throw duration은 양수여야 합니다 ({T})")
+
+    constraint_map, Q = _minimum_jerk_constraint_map(r)
+    zeros = np.zeros_like(q_start)
+    constraints = np.vstack([
+        q_start, zeros, zeros, q_release, qd_release * T, zeros, zeros,
+    ])
+    coeff = constraint_map @ constraints
+
+    if sample_s is None:
+        n_uniform = max(9, int(np.ceil(T / dt)) + 1)
+        s = np.unique(np.concatenate([
+            np.linspace(0.0, 1.0, n_uniform), np.array([r]),
+        ]))
+    else:
+        s = np.unique(np.concatenate([
+            np.asarray(sample_s, dtype=float), np.array([0.0, r, 1.0]),
+        ]))
+    q = (_poly_basis(s, 0) @ coeff).T
+    qd = (_poly_basis(s, 1) @ coeff).T / T
+    qdd = (_poly_basis(s, 2) @ coeff).T / T ** 2
+    ts = s * T
+    i_release = int(np.argmin(np.abs(s - r)))
+    # physical jerk 제곱 적분: ds 적분값에 1/T^5가 곱해진다.
+    jerk_cost = float(np.sum(coeff * (Q @ coeff)) / T ** 5)
+    return q, qd, qdd, ts, i_release, coeff, jerk_cost
 
 
-def _line_profile_knots(p0, p1, v_peak, accel, dt):
-    """p0→p1 직선을 사다리꼴(v_peak 도달 시 등속) 프로파일로 knot 샘플.
-    저속 카르테시안 이동(와인드업 위치로 하강/복귀)용."""
-    p0 = np.asarray(p0, dtype=float)
-    p1 = np.asarray(p1, dtype=float)
-    L = float(np.linalg.norm(p1 - p0))
-    u = (p1 - p0) / L
-    v_tri = float(np.sqrt(accel * L))
-    v_pk = min(float(v_peak), v_tri)
-    t_a = v_pk / accel
-    L_cruise = max(0.0, L - v_pk ** 2 / accel)
-    t_c = L_cruise / v_pk
-
-    def _phase(t_end):
-        n = max(2, int(round(t_end / dt)) + 1)
-        return np.linspace(0.0, t_end, n)
-
-    ta = _phase(t_a)
-    sa = 0.5 * accel * ta ** 2
-    va = accel * ta
-    t_all, s_all, v_all = [ta], [sa], [va]
-    t_off, s_off = t_a, sa[-1]
-    if t_c > 1e-9:
-        tc = _phase(t_c)[1:]
-        t_all.append(t_off + tc); s_all.append(s_off + v_pk * tc)
-        v_all.append(np.full(tc.shape, v_pk))
-        t_off += t_c; s_off += L_cruise
-    td = _phase(t_a)[1:]
-    t_all.append(t_off + td)
-    s_all.append(s_off + v_pk * td - 0.5 * accel * td ** 2)
-    v_all.append(v_pk - accel * td)
-
-    t = np.concatenate(t_all)
-    s = np.concatenate(s_all)
-    ds = np.concatenate(v_all)
-    pos = p0[None, :] + s[:, None] * u[None, :]
-    vel = ds[:, None] * u[None, :]
-    return pos, vel, t
-
-
-def build_joint_traj(gp8: GP8, pos, vel, t, q_seed, R_fixed=None, R_seq=None,
-                     omega_seq=None, tool_offset: float = TOOL_OFFSET_DEFAULT):
-    """카르테시안 knot 열 → 관절 궤적 (6,N)/(6,N)/(N,).
-
-    R_fixed: 전 knot 동일 자세(ω=0) → 관절속도는 공간 자코비안 (ω,v) 로
-    q̇ = J⁻¹·[0; ṗ] 정확 산출 (상위 3행 = ω, 수치 검증 완료).
-    R_seq: knot 별 자세. omega_seq도 주어지면 각 knot의 world-frame 각속도로
-    spatial twist를 정확히 풀고, 없으면 저속 slerp용 시간 FD를 사용한다.
-    IK 는 이전 knot 해로 warm-start. 실패 시 ValueError.
-    """
-    n = pos.shape[0]
-    traj = np.zeros((6, n))
-    velj = np.zeros((6, n))
-    q_prev = np.asarray(q_seed, dtype=float)
-    for k in range(n):
-        T = np.eye(4)
-        Rk = R_fixed if R_fixed is not None else R_seq[k]
-        T[:3, :3] = Rk
-        T[:3, 3] = _flange_origin_from_tool(pos[k], Rk, tool_offset)
-        q = gp8.inverse_kinematics(T, q_init=q_prev)
-        if q is None:
-            raise ValueError(
-                f"IK 실패 @ knot {k}/{n - 1} pos=({pos[k][0]:+.3f}, "
-                f"{pos[k][1]:+.3f}, {pos[k][2]:+.3f}) — 도달 범위 밖"
+def _optimize_joint_polynomial(
+    q_start, q_release, qd_release, nominal_release_duration,
+    vel_limits, accel_limits, soft_lower, soft_upper,
+):
+    """release 시점과 전체 시간을 탐색해 가장 짧은 feasible polynomial 선택."""
+    q_start = np.asarray(q_start, dtype=float)
+    q_release = np.asarray(q_release, dtype=float)
+    qd_release = np.asarray(qd_release, dtype=float)
+    vel_limits = np.asarray(vel_limits, dtype=float)
+    accel_limits = np.asarray(accel_limits, dtype=float)
+    soft_lower = np.asarray(soft_lower, dtype=float)
+    soft_upper = np.asarray(soft_upper, dtype=float)
+    best = None
+    check_s = np.linspace(0.0, 1.0, THROW_POLY_CHECK_SAMPLES)
+    for release_fraction in THROW_RELEASE_FRACTIONS:
+        nominal_total = float(nominal_release_duration) / release_fraction
+        duration_min = max(
+            4.0 * THROW_DT, THROW_DURATION_SCALE_MIN * nominal_total,
+        )
+        duration_max = max(
+            5.0 * THROW_DT, THROW_DURATION_SCALE_MAX * nominal_total,
+        )
+        # constraint의 release velocity 행만 T에 비례하므로 polynomial 계수는
+        # coeff(T)=coeff_const + T*coeff_slope다. 131개 duration을 Python loop로
+        # 다시 만들지 않고 한 번에 broadcast 평가한다.
+        constraint_map, Q = _minimum_jerk_constraint_map(release_fraction)
+        zeros = np.zeros_like(q_start)
+        constraints_const = np.vstack([
+            q_start, zeros, zeros, q_release, zeros, zeros, zeros,
+        ])
+        constraints_slope = np.vstack([
+            zeros, zeros, zeros, zeros, qd_release, zeros, zeros,
+        ])
+        coeff_const = constraint_map @ constraints_const
+        coeff_slope = constraint_map @ constraints_slope
+        basis_q = _poly_basis(check_s, 0)
+        basis_qd = _poly_basis(check_s, 1)
+        basis_qdd = _poly_basis(check_s, 2)
+        q_const = basis_q @ coeff_const
+        q_slope = basis_q @ coeff_slope
+        qd_const = basis_qd @ coeff_const
+        qd_slope = basis_qd @ coeff_slope
+        qdd_const = basis_qdd @ coeff_const
+        qdd_slope = basis_qdd @ coeff_slope
+        def evaluate_durations(durations):
+            durations = np.asarray(durations, dtype=float)
+            coeffs = (
+                coeff_const[None, :, :]
+                + durations[:, None, None] * coeff_slope[None, :, :]
             )
-        q = np.asarray(q, dtype=float)
-        traj[:, k] = q
-        if R_fixed is not None or omega_seq is not None:
-            J = gp8.jacobian(q)
-            omega = (np.zeros(3) if omega_seq is None
-                     else np.asarray(omega_seq[k], dtype=float))
-            # Space Jacobian의 하위 3행은 원점 선속도가 아니라 spatial v이다.
-            # world 점 p에 대해 p_dot=v+ω×p이므로 v=p_dot-ω×p.
-            spatial_v = vel[k] - np.cross(omega, pos[k])
-            twist = np.concatenate([omega, spatial_v])
-            try:
-                velj[:, k] = np.linalg.solve(J, twist)
-            except np.linalg.LinAlgError:
-                velj[:, k] = np.linalg.lstsq(J, twist, rcond=None)[0]
-        q_prev = q
-    if R_fixed is None and omega_seq is None:
-        velj = np.gradient(traj, np.asarray(t, dtype=float), axis=1)
-        velj[:, 0] = 0.0
-        velj[:, -1] = 0.0
-    return traj, velj, np.asarray(t, dtype=float)
+            T = durations[:, None, None]
+            positions = q_const[None, :, :] + T * q_slope[None, :, :]
+            velocities = qd_const[None, :, :] / T + qd_slope[None, :, :]
+            accelerations = (
+                qdd_const[None, :, :] / T ** 2
+                + qdd_slope[None, :, :] / T
+            )
+            velocity_ratios = np.max(
+                np.abs(velocities) / vel_limits[None, None, :], axis=(1, 2),
+            )
+            acceleration_ratios = np.max(
+                np.abs(accelerations) / accel_limits[None, None, :],
+                axis=(1, 2),
+            )
+            position_ok = np.all(
+                (positions >= soft_lower[None, None, :] - 1e-9)
+                & (positions <= soft_upper[None, None, :] + 1e-9),
+                axis=(1, 2),
+            )
+            feasible = (
+                (velocity_ratios <= THROW_VELOCITY_SCALE + 1e-9)
+                & (acceleration_ratios <= THROW_ACCEL_SCALE + 1e-9)
+                & position_ok
+            )
+            return dict(
+                durations=durations, coeffs=coeffs,
+                accelerations=accelerations,
+                velocity_ratios=velocity_ratios,
+                acceleration_ratios=acceleration_ratios,
+                feasible=feasible,
+            )
+
+        # 41점 coarse 탐색으로 feasible 구간을 찾고 그 한 구간만 17점으로
+        # 재탐색한다. 기존 131점 전수평가보다 계산량은 작고 시간 해상도는 높다.
+        coarse = evaluate_durations(np.linspace(
+            duration_min, duration_max, THROW_DURATION_COARSE_SAMPLES,
+        ))
+        feasible_indices = np.flatnonzero(coarse["feasible"])
+        if feasible_indices.size == 0:
+            continue
+        coarse_idx = int(feasible_indices[0])
+        if coarse_idx == 0:
+            selected = coarse
+            idx = 0
+        else:
+            selected = evaluate_durations(np.linspace(
+                coarse["durations"][coarse_idx - 1],
+                coarse["durations"][coarse_idx],
+                THROW_DURATION_REFINE_SAMPLES,
+            ))
+            refined_indices = np.flatnonzero(selected["feasible"])
+            if refined_indices.size == 0:
+                # coarse endpoint 자체는 feasible이므로 수치 오차 시 그 값을 사용.
+                selected = coarse
+                idx = coarse_idx
+            else:
+                idx = int(refined_indices[0])
+
+        total_duration = float(selected["durations"][idx])
+        coeff = selected["coeffs"][idx]
+        q_coeff = Q @ coeff
+        jerk_cost = float(np.sum(coeff * q_coeff) / total_duration ** 5)
+        score = (total_duration, jerk_cost)
+        result = dict(
+            score=score, release_fraction=float(release_fraction),
+            duration=total_duration, coeff=coeff,
+            vel_ratio=float(selected["velocity_ratios"][idx]),
+            accel_ratio=float(selected["acceleration_ratios"][idx]),
+            accel_peak=np.max(
+                np.abs(selected["accelerations"][idx]), axis=0,
+            ),
+            jerk_cost=jerk_cost,
+        )
+        if best is None or score < best["score"]:
+            best = result
+
+    if best is None:
+        return None
+
+    # 81점 탐색은 후보를 빠르게 고르는 용도다. 최종 선택은 401점으로 다시
+    # 검사하여 샘플 사이의 속도/가속도 peak나 관절 리미트 위반을 허용하지 않는다.
+    check_traj, check_vel, check_accel, _, _, _, _ = (
+        _joint_polynomial_profile(
+            q_start, q_release, qd_release, best["duration"],
+            best["release_fraction"], THROW_DT,
+            sample_s=np.linspace(0.0, 1.0, THROW_POLY_FINAL_CHECK_SAMPLES),
+        )
+    )
+    final_velocity_ratio = float(np.max(
+        np.abs(check_vel) / vel_limits[:, None]
+    ))
+    final_acceleration_ratio = float(np.max(
+        np.abs(check_accel) / accel_limits[:, None]
+    ))
+    if (
+        final_velocity_ratio > THROW_VELOCITY_SCALE + 1e-9
+        or final_acceleration_ratio > THROW_ACCEL_SCALE + 1e-9
+        or np.any(check_traj < soft_lower[:, None] - 1e-9)
+        or np.any(check_traj > soft_upper[:, None] + 1e-9)
+    ):
+        return None
+    best.update(
+        vel_ratio=final_velocity_ratio,
+        accel_ratio=final_acceleration_ratio,
+        accel_peak=np.max(np.abs(check_accel), axis=1),
+    )
+
+    # 컨트롤러에 보낼 THROW_DT knot를 다시 생성한다. release fraction을
+    # 반드시 knot로 삽입하므로 timed suction release와 상태 제약이 정확히 맞는다.
+    traj, vel, accel, ts, i_rel, coeff, jerk_cost = _joint_polynomial_profile(
+        q_start, q_release, qd_release, best["duration"],
+        best["release_fraction"], THROW_DT,
+    )
+    best.update(
+        traj=traj, vel=vel, accel=accel, ts=ts, release_idx=i_rel,
+        coeff=coeff, jerk_cost=jerk_cost, q_end=traj[:, -1].copy(),
+    )
+    return best
 
 
 def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
                 tool_offset: float = TOOL_OFFSET_DEFAULT):
-    """release constraint를 만족하는 가속도 제한 관절 스윙을 만든다.
+    """release constraint를 만족하는 단일 polynomial 관절 스윙을 만든다.
 
     release 평면 법선 축의 각속도를 탐색하여 release TCP 선속도를
-    정확히 맞추면서 관절 속도/가속도/위치 제한을 모두 만족하는 가장
-    짧은 시대칭 스윙을 선택한다. TCP 경로는 그 관절 스윙의 FK 결과이다.
+    정확히 맞춘다. 각 후보의 시작 관절점, release 관절점/속도를 제약으로
+    걸고 시작→release→팔로스루 전체를 하나의 7차 minimum-jerk polynomial로
+    최적화한다. TCP 경로는 그 관절 polynomial의 FK 결과이다.
     """
     q_seed = np.asarray(q_seed, dtype=float)
     vel_limits = np.asarray(vel_limits, dtype=float)
@@ -421,6 +557,7 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
     soft_lower = joint_limits[:, 0] + JOINT_LIMIT_MARGIN
     soft_upper = joint_limits[:, 1] - JOINT_LIMIT_MARGIN
     effective_accel = accel_limits * THROW_ACCEL_SCALE
+    effective_velocity = vel_limits * THROW_VELOCITY_SCALE
     release_pos = np.asarray(plan["release_pos"], dtype=float)
 
     T_release = np.eye(4)
@@ -438,7 +575,10 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
     J_release = gp8.jacobian(q_release)
     n_plane = np.array([-plan["u_xy"][1], plan["u_xy"][0], 0.0])
     kinematic_candidates = []
-    reject_counts = {"velocity": 0, "position": 0, "wrist": 0, "floor": 0}
+    reject_counts = {
+        "velocity": 0, "position": 0, "wrist": 0,
+        "polynomial": 0, "path_length": 0, "floor": 0,
+    }
 
     for omega_mag in np.arange(
         0.0, RELEASE_OMEGA_MAX + 0.5 * RELEASE_OMEGA_STEP,
@@ -459,16 +599,19 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
         if vel_ratio > THROW_VELOCITY_SCALE:
             reject_counts["velocity"] += 1
             continue
-        # h'(s)의 최댓값은 1/(1-ramp_fraction).
-        half_duration = float(np.max(
-            np.abs(qd_release)
-            / (effective_accel * (1.0 - THROW_JERK_RAMP_FRACTION))
+        # throw 시작점은 별도 와인드업 점이 아니라 이미 물체를 10 cm 들어
+        # 올린 q_seed 그 자체다. lift→release→follow-through가 한 polynomial
+        # 안에 들어가므로 lift 뒤에 방향이 꺾이는 segment 경계가 생기지 않는다.
+        q_start = q_seed.copy()
+        q_delta = np.abs(q_release - q_start)
+        nominal_release_duration = float(max(
+            np.max(np.abs(qd_release) / effective_accel),
+            np.max(np.sqrt(2.0 * q_delta / effective_accel)),
+            np.max(q_delta / effective_velocity),
         ))
-        if half_duration <= 1e-6:
+        if nominal_release_duration <= 1e-6:
             continue
-        q_start = q_release - 0.5 * qd_release * half_duration
-        q_end = q_release + 0.5 * qd_release * half_duration
-        q_bounds = np.column_stack([q_start, q_release, q_end])
+        q_bounds = np.column_stack([q_start, q_release])
         if (
             np.any(q_bounds < soft_lower[:, None] - 1e-9)
             or np.any(q_bounds > soft_upper[:, None] + 1e-9)
@@ -476,27 +619,23 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
             reject_counts["position"] += 1
             continue
         wrist_delta = (
-            q_start[[3, 5]] - q_seed[[3, 5]] + np.pi
+            q_release[[3, 5]] - q_seed[[3, 5]] + np.pi
         ) % (2.0 * np.pi) - np.pi
         wrist_jump = float(np.max(np.abs(wrist_delta)))
         if wrist_jump > WRIST_BRANCH_JUMP_MAX:
             reject_counts["wrist"] += 1
             continue
 
-        accel_peak = np.abs(qd_release) / (
-            half_duration * (1.0 - THROW_JERK_RAMP_FRACTION)
-        )
-        score = (half_duration, -float(np.min(np.minimum(
+        score = (nominal_release_duration, -float(np.min(np.minimum(
             q_bounds - joint_limits[:, 0, None],
             joint_limits[:, 1, None] - q_bounds,
         ))))
         kinematic_candidates.append(dict(
             score=score,
-            q_start=q_start, q_release=q_release.copy(), q_end=q_end,
+            q_start=q_start, q_release=q_release.copy(),
             qd_release=qd_release, omega_release=omega_release,
             release_omega=float(omega_mag), vel_ratio=vel_ratio,
-            accel_peak=accel_peak,
-            accel_ratio=float(np.max(accel_peak / accel_limits)),
+            nominal_release_duration=nominal_release_duration,
             wrist_branch_jump=wrist_jump,
         ))
 
@@ -507,33 +646,106 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
         )
 
     best = None
-    # 관절 조건으로 정렬한 뒤 상위 후보부터 FK를 계산한다. 기존처럼
-    # 모든 omega 후보에 전체 FK를 반복하지 않아 adaptive 탐색 시간을 줄인다.
+    # 관절 조건으로 정렬한 뒤 각 후보에 단일 polynomial 최적화를 적용하고,
+    # feasible한 후보만 FK로 바닥 간섭을 검사한다.
     for candidate in sorted(kinematic_candidates, key=lambda c: c["score"]):
-        traj, velj, ts, i_rel, q_start, q_end = _joint_swing_profile(
-            q_release, candidate["qd_release"], candidate["score"][0], THROW_DT,
+        optimized = _optimize_joint_polynomial(
+            candidate["q_start"], q_release, candidate["qd_release"],
+            candidate["nominal_release_duration"], vel_limits, accel_limits,
+            soft_lower, soft_upper,
         )
+        if optimized is None:
+            reject_counts["polynomial"] += 1
+            continue
+        # 전체 10 ms trajectory를 FK하기 전에 13개 chord로 경로 길이를
+        # 하한 평가한다. chord 합이 이미 limit을 넘으면 실제 곡선은 반드시
+        # 더 길기 때문에 안전하게 즉시 제외할 수 있다.
+        prefilter_s = np.linspace(
+            0.0, optimized["release_fraction"],
+            THROW_TCP_PATH_PREFILTER_SAMPLES,
+        )
+        prefilter_traj = (
+            _poly_basis(prefilter_s, 0) @ optimized["coeff"]
+        ).T
+        prefilter_pos = np.zeros((prefilter_traj.shape[1], 3), dtype=float)
+        for k in range(prefilter_traj.shape[1]):
+            Tk = gp8.forward_kinematics(prefilter_traj[:, k])
+            prefilter_pos[k] = Tk[:3, 3] + Tk[:3, 0] * float(tool_offset)
+        prefilter_direct = float(np.linalg.norm(
+            prefilter_pos[-1] - prefilter_pos[0]
+        ))
+        if prefilter_direct <= 1e-9:
+            reject_counts["path_length"] += 1
+            continue
+        prefilter_length = float(np.sum(np.linalg.norm(
+            np.diff(prefilter_pos, axis=0), axis=1,
+        )))
+        if (
+            prefilter_length / prefilter_direct
+            > THROW_TCP_PATH_RATIO_MAX + 1e-9
+        ):
+            reject_counts["path_length"] += 1
+            continue
+
+        traj = optimized["traj"]
         swing_pos = np.zeros((traj.shape[1], 3), dtype=float)
         swing_R = np.zeros((traj.shape[1], 3, 3), dtype=float)
         for k in range(traj.shape[1]):
             Tk = gp8.forward_kinematics(traj[:, k])
             swing_R[k] = Tk[:3, :3]
             swing_pos[k] = Tk[:3, 3] + Tk[:3, 0] * float(tool_offset)
+        i_release = optimized["release_idx"]
+        direct_runup = float(np.linalg.norm(
+            swing_pos[i_release] - swing_pos[0]
+        ))
+        runup_path_length = float(np.sum(np.linalg.norm(
+            np.diff(swing_pos[:i_release + 1], axis=0), axis=1,
+        )))
+        if direct_runup <= 1e-9:
+            reject_counts["path_length"] += 1
+            continue
+        runup_path_ratio = runup_path_length / direct_runup
+        if runup_path_ratio > THROW_TCP_PATH_RATIO_MAX + 1e-9:
+            reject_counts["path_length"] += 1
+            continue
+        # 10 ms controller knot의 chord 합은 곡선 길이를 작게 평가할 수 있다.
+        # coarse 검사를 통과한 후보만 dense FK로 재검산해 hard limit을 보장한다.
+        dense_s = np.linspace(
+            0.0, optimized["release_fraction"],
+            THROW_TCP_PATH_CHECK_SAMPLES,
+        )
+        dense_traj = (_poly_basis(dense_s, 0) @ optimized["coeff"]).T
+        dense_runup_pos = np.zeros((dense_traj.shape[1], 3), dtype=float)
+        for k in range(dense_traj.shape[1]):
+            Tk = gp8.forward_kinematics(dense_traj[:, k])
+            dense_runup_pos[k] = (
+                Tk[:3, 3] + Tk[:3, 0] * float(tool_offset)
+            )
+        direct_runup = float(np.linalg.norm(
+            dense_runup_pos[-1] - dense_runup_pos[0]
+        ))
+        runup_path_length = float(np.sum(np.linalg.norm(
+            np.diff(dense_runup_pos, axis=0), axis=1,
+        )))
+        runup_path_ratio = runup_path_length / direct_runup
+        if runup_path_ratio > THROW_TCP_PATH_RATIO_MAX + 1e-9:
+            reject_counts["path_length"] += 1
+            continue
         z_min = float(np.min(swing_pos[:, 2]))
         if z_min < plan["z_g"] + FLOOR_CLEARANCE:
             reject_counts["floor"] += 1
             continue
         candidate.update(
-            traj=traj, vel=velj, ts=ts, release_idx=i_rel,
-            q_start=q_start, q_end=q_end, swing_pos=swing_pos,
-            swing_R=swing_R, z_min=z_min,
+            optimized, swing_pos=swing_pos, swing_R=swing_R, z_min=z_min,
+            runup_direct=direct_runup, runup_path_length=runup_path_length,
+            runup_path_ratio=runup_path_ratio,
         )
         best = candidate
         break
 
     if best is None:
         raise ValueError(
-            "관절 제한을 만족하는 후보가 모두 바닥 클리어런스를 위반합니다 "
+            "관절 polynomial 후보가 경로 길이 또는 바닥 제약을 만족하지 못했습니다 "
             f"(제외: {reject_counts})"
         )
 
@@ -541,11 +753,13 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
     twist_chk = Jr @ best["qd_release"]
     v_chk = twist_chk[3:] + np.cross(twist_chk[:3], release_pos)
     release_fk = best["swing_pos"][best["release_idx"]]
-    orientation_swing = Rotation.from_matrix(
-        plan["throw_R"] @ best["swing_R"][0].T
-    ).magnitude()
+    relative_R = plan["throw_R"] @ best["swing_R"][0].T
+    orientation_swing = float(np.arccos(np.clip(
+        0.5 * (np.trace(relative_R) - 1.0), -1.0, 1.0,
+    )))
     j5_upper = float(joint_limits[4, 1])
     j5_max = float(np.max(best["traj"][4]))
+    i_release = best["release_idx"]
     plan["start_pos"] = best["swing_pos"][0].copy()
     plan["end_pos"] = best["swing_pos"][-1].copy()
     best.update(
@@ -554,6 +768,18 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
         release_pos_error=float(np.linalg.norm(release_fk - release_pos)),
         orientation_swing=float(orientation_swing),
         j5_max=j5_max, j5_upper=j5_upper, j5_margin=j5_upper - j5_max,
+        polynomial_release_q_error=float(np.linalg.norm(
+            best["traj"][:, i_release] - best["q_release"]
+        )),
+        polynomial_release_qd_error=float(np.linalg.norm(
+            best["vel"][:, i_release] - best["qd_release"]
+        )),
+        endpoint_velocity_max=float(np.max(np.abs(
+            best["vel"][:, [0, -1]]
+        ))),
+        endpoint_acceleration_max=float(np.max(np.abs(
+            best["accel"][:, [0, -1]]
+        ))),
         duration=float(best["ts"][-1]), n_knots=best["traj"].shape[1],
         velocity_limits=vel_limits.copy(), acceleration_limits=accel_limits.copy(),
         swing_vel=None,
@@ -563,7 +789,12 @@ def build_throw(gp8: GP8, plan: dict, q_seed, vel_limits, accel_limits,
 
 
 def _adaptive_release_candidates(preferred_distance: float, preferred_z: float):
-    """기준 release에 가까운 순서로 (수평거리, Z offset) 후보를 만든다."""
+    """기준 release 우선, 이후 큰 수평거리/Z 근접 순으로 후보를 만든다.
+
+    경로 길이 제약에서는 pick에 가까운 release가 긴 backswing을 만들기 쉽다.
+    사용자 지정 기준값은 항상 첫 번째로 보존하되, 실패 후에는 bin에 더 가까워
+    탄도 속도와 우회 경로가 작아지는 큰 release distance부터 검사한다.
+    """
     distances = list(np.arange(
         RELEASE_DISTANCE_MIN,
         RELEASE_DISTANCE_MAX + 0.5 * RELEASE_DISTANCE_STEP,
@@ -580,9 +811,11 @@ def _adaptive_release_candidates(preferred_distance: float, preferred_z: float):
     z_offsets = sorted({round(float(v), 6) for v in z_offsets})
     candidates = [(d, z) for d in distances for z in z_offsets]
     candidates.sort(key=lambda c: (
-        abs(c[0] - preferred_distance) / RELEASE_DISTANCE_STEP
-        + abs(c[1] - preferred_z) / RELEASE_Z_OFFSET_STEP,
-        abs(c[0] - preferred_distance),
+        0 if (
+            abs(c[0] - preferred_distance) <= 1e-9
+            and abs(c[1] - preferred_z) <= 1e-9
+        ) else 1,
+        -c[0],
         abs(c[1] - preferred_z),
         c[1],
     ))
@@ -599,7 +832,7 @@ def plan_and_build_adaptive_throw(
     """release 거리/Z를 adaptive 탐색해 ``(plan, built)``를 반환한다.
 
     기준값을 먼저 시도하고, 실패할 때만 pick→bin 방향 10~25 cm,
-    pick Z +20~60 cm 격자를 기준값에 가까운 순서로 탐색한다.
+    pick Z +20~60 cm 격자를 큰 release 거리/Z 기준값 근접 순으로 탐색한다.
     """
     errors = []
     candidates = _adaptive_release_candidates(
@@ -644,7 +877,7 @@ def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
     p, b = plan, built
     rp, v = p["release_pos"], p["v_rel"]
     ang = float(np.degrees(np.arctan2(v[2], np.hypot(v[0], v[1]))))
-    print("\n=== Acceleration-limited Throw Plan ===")
+    print("\n=== Polynomial-optimized Throw Plan ===")
     print(f"  grasp→bin : D={p['D']:.3f} m, "
           f"bin=({p['bin_xyz'][0]:+.3f}, {p['bin_xyz'][1]:+.3f}, {p['bin_xyz'][2]:+.3f}) "
           f"(grasp z +{p['bin_z_offset'] * 100:.1f} cm)")
@@ -662,17 +895,24 @@ def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
     print(f"  포물선     : release→bin 수평 {p['R']:.3f} m, "
           f"최소속도 해, apex=release +{p['apex'] * 100:.1f} cm")
     print(f"  낙하 검산  : bin 오차 {p['landing_err'] * 1000:.1f} mm (release 후 비행 {p['t_fly']:.3f}s)")
-    print(f"  관절 스윙   : 와인드업 {b['duration'] / 2:.3f}s + "
-          f"팔로스루 {b['duration'] / 2:.3f}s, "
-          f"총 {b['duration']:.3f}s / {b['n_knots']} knots, z_min={b['z_min']:.3f} m")
+    release_time = b["duration"] * b["release_fraction"]
+    print(f"  관절 스윙   : 단일 {THROW_POLY_DEGREE}차 minimum-jerk polynomial, "
+          f"release @ {b['release_fraction'] * 100:.0f}%")
+    print(f"              lift→release {release_time:.3f}s + "
+          f"팔로스루 {b['duration'] - release_time:.3f}s, "
+          f"총 {b['duration']:.3f}s / {b['n_knots']} knots, "
+          f"z_min={b['z_min']:.3f} m")
     print(f"  제한 검사  : max J5={np.degrees(b['j5_max']):.2f}° "
           f"/ limit {np.degrees(b['j5_upper']):.2f}° "
           f"(여유 {np.degrees(b['j5_margin']):.2f}°), "
           f"속도 {b['vel_ratio'] * 100:.1f}% / 가속도 {b['accel_ratio'] * 100:.1f}%")
+    print(f"              lift→release TCP path {b['runup_path_length']:.3f} m "
+          f"/ 직선 {b['runup_direct']:.3f} m = {b['runup_path_ratio']:.3f}x "
+          f"(limit {THROW_TCP_PATH_RATIO_MAX:.2f}x)")
     print(f"              RT accel limits="
           f"{np.round(b['acceleration_limits'], 1).tolist()} rad/s², "
           f"throw margin={THROW_ACCEL_SCALE * 100:.0f}%")
-    print(f"  orientation : 자유 관절 스윙, start→release "
+    print(f"  orientation : 자유 관절 스윙, lift→release "
           f"{np.degrees(b['orientation_swing']):.2f}°, "
           f"release |ω|={np.degrees(b['release_omega']):.1f}°/s")
     print(f"  release knot {b['release_idx']} (lead {release_lead:+.3f}s), "
@@ -680,6 +920,11 @@ def print_throw_plan(plan: dict, built: dict, release_lead: float) -> None:
           f"release 위치/속도오차 {b['release_pos_error'] * 1000:.3f} mm / "
           f"{b['v_err'] * 1000:.2f} mm/s, "
           f"각속도오차 {np.degrees(b['omega_err']):.3f}°/s")
+    print(f"              polynomial 제약오차 |Δq|="
+          f"{b['polynomial_release_q_error']:.2e} rad, |Δq̇|="
+          f"{b['polynomial_release_qd_error']:.2e} rad/s, "
+          f"양끝 max |q̇|={b['endpoint_velocity_max']:.2e} rad/s, "
+          f"|q̈|={b['endpoint_acceleration_max']:.2e} rad/s²")
     if b["vel_ratio"] > 0.8:
         print("  ⚠️ 관절속도가 limit의 80%를 넘습니다")
 
@@ -709,22 +954,6 @@ def _move(ctrl, q_from, q_to, M1, M2, hz: float) -> float:
     return float(ts[-1])
 
 
-def _move_cart_slerp(ctrl, gp8: GP8, p0, p1, R0, R1, q_seed,
-                     tool_offset: float = TOOL_OFFSET_DEFAULT) -> np.ndarray:
-    """p0→p1 카르테시안 직선 + R0→R1 slerp 저속 이동 (블록). 도착 관절값 리턴.
-    lift(tool-down) ↔ 와인드업 시작점(기울인 자세) 전환에 사용."""
-    pos, vel, t = _line_profile_knots(p0, p1, PREMOVE_SPEED, PREMOVE_ACCEL, PREMOVE_DT)
-    key = Rotation.from_matrix(np.stack([R0, R1]))
-    slerp = Slerp([0.0, 1.0], key)
-    frac = np.linspace(0.0, 1.0, pos.shape[0])
-    R_seq = slerp(frac).as_matrix()
-    traj, velj, ts = build_joint_traj(
-        gp8, pos, vel, t, q_seed, R_seq=R_seq, tool_offset=tool_offset,
-    )
-    ctrl.send_trajectory_queue(traj, velj, ts, final_joint=traj[:, -1])
-    return traj[:, -1].copy()
-
-
 # =====================================================================
 # 사이클
 # =====================================================================
@@ -750,17 +979,8 @@ def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, move_vel_limits,
     rel_idx = int(np.searchsorted(ts, t_target, side="right") - 1)
     rel_idx = max(0, min(rel_idx, len(ts) - 1))
 
-    print("→ 와인드업 시작 관절자세로 이동 (throw TCP offset 적용, 석션 유지)...")
-    move_vel_limits = np.asarray(move_vel_limits, dtype=float)
-    _move(
-        ctrl, lift_q, built["q_start"],
-        move_vel_limits * args.vel_scale,
-        move_vel_limits * args.vel_scale * JOINT_ACCEL_RATIO,
-        Config().TRAJ_HZ,
-    )
-    time.sleep(0.2)
-
-    print(f"→ throw 스윙 ({built['duration']:.2f}s, |v|={plan['speed']:.2f} m/s, "
+    print(f"→ lift 자세에서 단일 polynomial throw 시작 "
+          f"({built['duration']:.2f}s, |v|={plan['speed']:.2f} m/s, "
           f"release @ knot {rel_idx})...")
     ctrl.send_trajectory_queue_with_timed_release(
         built["traj"], built["vel"], built["ts"],
@@ -772,6 +992,7 @@ def run_throw(ctrl, gp8: GP8, args, grasp_xyz, lift_q, move_vel_limits,
           else "  스윙 완료.")
 
     input("\nEnter → lift 자세로 복귀 ")
+    move_vel_limits = np.asarray(move_vel_limits, dtype=float)
     _move(
         ctrl, built["q_end"], lift_q,
         move_vel_limits * args.vel_scale,
@@ -861,13 +1082,13 @@ def plan_only(gp8: GP8, args, z: float, move_vel_limits,
     print_throw_plan(plan, built, args.release_lead)
     for name, q in (("q_start", built["q_start"]), ("q_end", built["q_end"])):
         print(f"  {name} (deg): {[round(float(np.degrees(j)), 1) for j in q]}")
-    # lift↔throw start/end 는 관절공간 저속 연결.
+    # q_start는 lift_q와 동일하다. throw 뒤 복귀 segment만 별도로 검사한다.
     M1 = np.asarray(move_vel_limits, dtype=float) * args.vel_scale
     M2 = M1 * JOINT_ACCEL_RATIO
     zero = np.zeros_like(M1)
-    _, _, ts_in = trajectory(q_seed, zero, built["q_start"], zero, M1, M2, hertz=100.0)
     _, _, ts_out = trajectory(built["q_end"], zero, q_seed, zero, M1, M2, hertz=100.0)
-    print(f"  lift→throw_start 관절 연결 OK ({ts_in[-1]:.2f}s)")
+    print(f"  throw_start == lift: max |Δq|="
+          f"{np.max(np.abs(built['q_start'] - q_seed)):.2e} rad")
     print(f"  throw_end→lift 관절 연결 OK ({ts_out[-1]:.2f}s)")
     print("\nplan-only OK — 위 값이 타당하면 실제 실행으로 진행하세요.")
 
@@ -946,9 +1167,6 @@ def _build_rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
     )
 
     lift_pos = np.array([args.x, args.y, z + args.lift], dtype=float)
-    pre_traj, pre_velj, pre_ts = trajectory(
-        lift_q, zero, built["q_start"], zero, M1, M2, hertz=100.0,
-    )
     ret_traj, ret_velj, ret_ts = trajectory(
         built["q_end"], zero, lift_q, zero, M1, M2, hertz=100.0,
     )
@@ -960,7 +1178,6 @@ def _build_rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
 
     preview_traj, preview_ts = _concat_joint_segments([
         (pick_lift_traj, pick_lift_ts),
-        (pre_traj, pre_ts),
         (built["traj"], built["ts"]),
         (ret_traj, ret_ts),
         (close_traj, close_ts),
@@ -974,8 +1191,8 @@ def _build_rviz_preview(gp8: GP8, args, z: float, move_vel_limits,
         preview_traj=preview_traj, preview_ts=preview_ts,
         tool_path=tool_path,
         ee_path=np.vstack([
-            lift_pos[None, :], plan["start_pos"][None, :],
-            plan["release_pos"][None, :], plan["end_pos"][None, :],
+            lift_pos[None, :], plan["release_pos"][None, :],
+            plan["end_pos"][None, :],
             lift_pos[None, :],
         ]),
     )
@@ -1017,7 +1234,6 @@ def _publish_rviz_static(pub_markers, pub_path, preview, frame_id: str, stamp):
         (1, "lift", lift, 0.045, (0.1, 0.9, 0.9, 0.85)),
         (2, "release", release, 0.065, (1.0, 0.55, 0.0, 0.95)),
         (3, "bin", bin_xyz, 0.075, (0.1, 0.3, 1.0, 0.95)),
-        (4, "runup_start", plan["start_pos"], 0.035, (1.0, 1.0, 0.0, 0.85)),
         (5, "follow_end", plan["end_pos"], 0.035, (1.0, 0.0, 1.0, 0.85)),
     ]:
         m = marker_base(mid, ns, Marker.SPHERE)
