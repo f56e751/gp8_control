@@ -179,6 +179,7 @@ class TrajectoryController:
         self._io_queue: "queue.Queue" = queue.Queue()
         self._io_thread = threading.Thread(target=self._io_worker, daemon=True)
         self._io_thread.start()
+        self._io_closed = False
 
     # ------------------------------------------------------------------
     # Setup / state
@@ -343,7 +344,14 @@ class TrajectoryController:
                 self.suction_on()
                 st["primed_next"] = True
             if tick_fn is not None:
-                tick_fn()
+                # Existing callbacks return None and continue as before.  An
+                # explicit False is reserved for supervised debug motions that
+                # must stop at the current streamed command (for example the
+                # suction attachment-range measurement).
+                if tick_fn() is False:
+                    st["stopped_early"] = True
+                    st["stop_index"] = int(k)
+                    break
 
             # pace to the next 4 ms tick (drop no samples; sleep the remainder)
             dt_sleep = (start + (k + 1) * STREAM_DT) - time.monotonic()
@@ -384,6 +392,26 @@ class TrajectoryController:
             self._stream_trajectory(traj, vel, timestep, final_joint)
             return True
         return self._send_blocking(traj, vel, timestep, final_joint)
+
+    def send_trajectory_queue_interruptible(
+        self, traj, vel, timestep, final_joint, stop_requested,
+    ) -> bool:
+        """Stream until ``stop_requested()`` becomes true.
+
+        Returns True when the motion stopped early.  This is intentionally
+        limited to the default JGPC stream backend: cancelling a JTC action has
+        different timing semantics and is not suitable for a millimetre-scale
+        supervised attachment measurement.
+        """
+        if self._backend != "stream":
+            raise RuntimeError(
+                "interruptible motion requires GP8_ADV4NCR_BACKEND=stream"
+            )
+        state = self._stream_trajectory(
+            traj, vel, timestep, final_joint,
+            tick_fn=lambda: not bool(stop_requested()),
+        )
+        return bool(state.get("stopped_early", False))
 
     def send_trajectory_with_release(self, traj, vel, timestep, final_joint, release_joint) -> bool:
         return self._send_with_position_release(traj, vel, timestep, final_joint, release_joint)
@@ -649,6 +677,32 @@ class TrajectoryController:
         """Enqueue suction OFF (non-blocking); the IO worker does the TCP write off the servo loop (#2)."""
         self.last_suction_off_t = time.time()
         self._io_queue.put((SUCTION_IO_ADDRESS, 1))
+
+    def close(self, timeout_sec: float = 5.0) -> None:
+        """Drain pending suction writes and stop the IO worker cleanly.
+
+        The sentinel is queued after all prior writes, so a final ``suction_off``
+        is transmitted before the worker exits.  Explicit shutdown also avoids
+        leaving a Python thread inside rclpy logging while the ROS node and the
+        interpreter are being destroyed.
+        """
+        if self._io_closed:
+            return
+        self._io_closed = True
+        self._io_queue.put(None)
+        self._io_thread.join(timeout=max(0.0, float(timeout_sec)))
+        if self._io_thread.is_alive():
+            self._node.get_logger().warn(
+                "[IO] worker did not stop before shutdown timeout"
+            )
+            return
+        with self._io_lock:
+            if self._io_sock is not None:
+                try:
+                    self._io_sock.close()
+                except OSError:
+                    pass
+                self._io_sock = None
 
     def _io_worker(self) -> None:
         """Daemon: drain the IO queue and perform the blocking Simple Message TCP writes, so the

@@ -85,6 +85,13 @@ setup(
             # Static-object suction pick check: park at GRASP_Z, suction + hold,
             # lift 10 cm (no torch; system python OK). Conveyor stopped.
             "suction_lift_debug = gp8_control.tests.suction_lift_debug:main",
+            # Supervised low-speed Z descent with suction ON.  Records the TCP
+            # clearance when the operator marks visible object attachment.
+            "suction_attach_range_debug = "
+            "gp8_control.tests.suction_attach_range_debug:main",
+            # Preserve the current TCP X/Y/orientation, move to a requested
+            # base-frame Z, then hold suction ON until the operator releases it.
+            "suction_hold_at_z = gp8_control.tests.suction_hold_at_z:main",
         ],
     },
 )
