@@ -48,9 +48,13 @@ locates the venv by walking up from its own path; override with
 
 ### Force a single skill (debug)
 
-`GP8_FORCE_SKILL=throw|push` (env, for launch) or `--skill throw|push` (CLI flag,
-wins over env) pins every object to one skill, bypassing routing *and*
-`can_handle`. Empty = normal routing (everything → throw today).
+`GP8_FORCE_SKILL=throw|robust_throw|push` (env), launch arg
+`skill:=throw|robust_throw|push`, or `--skill ...` (CLI flag, wins over env) pins
+every object to one skill, bypassing routing *and* `can_handle`. Empty = normal
+routing. `robust_throw` is the NLP (CasADi/IPOPT) thrower in
+`skills/robust_throw_skill.py` — loaded lazily in `_build_skills`, needs `casadi`
+in `.venv` plus `skills/throw_nlp.py`/`skills/throwing.py`; without them normal
+throw/push runs still boot (selecting it then is a hard error).
 
 ## Tests
 

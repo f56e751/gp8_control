@@ -140,10 +140,17 @@ A live TUI shows raw vs corrected positions.
 | 모드 | 실행 |
 |---|---|
 | 정상 라우팅 (기본, 클래스별) | `ros2 launch gp8_control gp8_bringup.launch.py` |
-| throw 만 | `GP8_FORCE_SKILL=throw ros2 launch gp8_control gp8_bringup.launch.py` |
-| push 만 | `GP8_FORCE_SKILL=push ros2 launch gp8_control gp8_bringup.launch.py` |
+| throw 만 (NN thrower) | `ros2 launch gp8_control gp8_bringup.launch.py skill:=throw` |
+| robust_throw 만 (NLP thrower) | `ros2 launch gp8_control gp8_bringup.launch.py skill:=robust_throw` |
+| push 만 | `ros2 launch gp8_control gp8_bringup.launch.py skill:=push` |
 
-- 우선순위: CLI `--skill {throw,push}` > 환경변수 `GP8_FORCE_SKILL` > 기본(클래스별 라우팅).
+- `GP8_FORCE_SKILL=<skill> ros2 launch ...` 환경변수 방식도 동일하게 동작합니다
+  (`skill:=` 인자를 생략하면 셸의 `GP8_FORCE_SKILL`을 그대로 사용).
+- 우선순위: CLI `--skill {throw,robust_throw,push}` > launch `skill:=` / 환경변수
+  `GP8_FORCE_SKILL` > 기본(클래스별 라우팅).
+- `robust_throw` 는 CasADi/IPOPT NLP thrower (`skills/robust_throw_skill.py`) 입니다.
+  `.venv` 에 `casadi` 와 `skills/throw_nlp.py`/`skills/throwing.py` 가 필요하며, 없으면
+  throw/push 는 정상 기동하고 robust_throw 선택 시에만 명확한 에러로 종료합니다.
 - 기동 로그에 `ActionSelector FORCED to '<skill>' skill for ALL objects` 가 뜨면 강제 모드.
 - `push` 는 **실제 접촉 스윕**입니다 (`skills/push_skill.py`) — intercept 에서 대기 후
   벨트면과 평행하게 등속 직선으로 밀어내며 스윙을 줍니다. `metal` 클래스에 한해

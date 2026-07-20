@@ -257,12 +257,33 @@ class GP8App:
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)
+        skills = [self.throw_skill, self.push_skill]
         # Rule-based class routing (SKILL_BY_CLASS): cans -> push, PET bottles ->
         # throw; anything else -> default "throw". Swap this for an RL policy
         # later by replacing ActionSelector. FORCE_SKILL (env GP8_FORCE_SKILL /
-        # CLI --skill) pins every object to one skill for testing, overriding
-        # the class routing; empty -> normal per-class routing.
+        # CLI --skill / launch skill:=) pins every object to one skill for
+        # testing, overriding the class routing; empty -> normal per-class routing.
         force = self.cfg.FORCE_SKILL or None
+        # robust_throw (CasADi/IPOPT NLP thrower) is OPTIONAL: its import pulls
+        # casadi + the THR planner modules (skills/throw_nlp.py, skills/throwing.py),
+        # which a lean install may not have. Import lazily HERE so plain throw/push
+        # runs never depend on them; explicitly selecting robust_throw without the
+        # deps must fail loudly, not fall back to a different thrower.
+        self.robust_throw_skill = None
+        try:
+            from gp8_control.skills.robust_throw_skill import RobustThrowSkill
+            self.robust_throw_skill = RobustThrowSkill(self.ctx)
+            skills.append(self.robust_throw_skill)
+        except ImportError as e:
+            if force == "robust_throw" or "robust_throw" in self.cfg.SKILL_BY_CLASS.values():
+                raise RuntimeError(
+                    "robust_throw skill was selected but its NLP deps are missing "
+                    "(need casadi in .venv + skills/throw_nlp.py + skills/throwing.py): "
+                    f"{e}"
+                ) from e
+            self._node.get_logger().info(
+                f"robust_throw skill unavailable ({e}); throw/push only."
+            )
         if force is not None:
             self._node.get_logger().warn(
                 f"ActionSelector FORCED to '{force}' skill for ALL objects "
@@ -274,7 +295,7 @@ class GP8App:
                 f"(default 'throw')"
             )
         self.selector = ActionSelector(
-            [self.throw_skill, self.push_skill],
+            skills,
             default="throw",
             by_class=self.cfg.SKILL_BY_CLASS,
             force=force,
@@ -585,12 +606,13 @@ def main(argv=None) -> None:
     )
     parser.add_argument(
         "--skill",
-        choices=["throw", "push"],
+        choices=["throw", "robust_throw", "push"],
         default=None,
         help=(
             "Force every object to this manipulation skill (testing aid). "
             "Overrides the GP8_FORCE_SKILL env var. Omit for normal "
-            "push/throw routing."
+            "push/throw routing. robust_throw = NLP (CasADi/IPOPT) thrower; "
+            "requires casadi in .venv."
         ),
     )
     # parse_known_args so ROS 2 / ros2 launch-injected args (e.g. --ros-args)

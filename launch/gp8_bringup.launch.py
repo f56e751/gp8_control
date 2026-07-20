@@ -140,6 +140,15 @@ def generate_launch_description():
         default_value=EnvironmentVariable("GP8_GRASP_Z", default_value="0.062"),
         description="Throw/pick suction wait TCP Z in base frame [m] (GRASP_Z).",
     )
+    # Pin every object to ONE manipulation skill for this run:
+    # `skill:=throw|robust_throw|push`. Empty (default) = normal per-class
+    # routing. robust_throw is the NLP (CasADi/IPOPT) thrower and needs casadi
+    # in .venv; omitted -> shell GP8_FORCE_SKILL, else normal routing.
+    skill_arg = DeclareLaunchArgument(
+        "skill",
+        default_value=EnvironmentVariable("GP8_FORCE_SKILL", default_value=""),
+        description="Force ALL objects to one skill: throw|robust_throw|push (empty = class routing).",
+    )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
     # the included adv4ncr stack's robot_state_publisher and by move_group
@@ -297,6 +306,8 @@ def generate_launch_description():
             "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
             # Throw/pick suction wait height: `grasp_z:=` -> GP8_GRASP_Z.
             "GP8_GRASP_Z": LaunchConfiguration("grasp_z"),
+            # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
+            "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
         },
     )
 
@@ -311,6 +322,7 @@ def generate_launch_description():
         release_lead_arg,
         min_suction_hold_arg,
         grasp_z_arg,
+        skill_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,
