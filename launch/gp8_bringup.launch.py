@@ -40,6 +40,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     SetEnvironmentVariable,
 )
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     EnvironmentVariable,
@@ -148,6 +149,30 @@ def generate_launch_description():
         "skill",
         default_value=EnvironmentVariable("GP8_FORCE_SKILL", default_value=""),
         description="Force ALL objects to one skill: throw|robust_throw|push (empty = class routing).",
+    )
+    rviz_arg = DeclareLaunchArgument(
+        "rviz", default_value="false",
+        description="Start RViz with live throw trajectory/release/ballistic markers.",
+    )
+    throw_viz_impact_z_arg = DeclareLaunchArgument(
+        "throw_viz_impact_z",
+        default_value=EnvironmentVariable("GP8_THROW_VIZ_IMPACT_Z", default_value="0.0"),
+        description="Base-frame Z plane where the RViz ballistic preview lands [m].",
+    )
+    throw_goal_x_arg = DeclareLaunchArgument(
+        "throw_goal_x",
+        default_value=EnvironmentVariable("GP8_THROW_GOAL_X", default_value="1.1"),
+        description="Throw evaluation goal/bin center X in base_link [m].",
+    )
+    throw_goal_y_arg = DeclareLaunchArgument(
+        "throw_goal_y",
+        default_value=EnvironmentVariable("GP8_THROW_GOAL_Y", default_value="-0.25"),
+        description="Throw evaluation goal/bin center Y in base_link [m].",
+    )
+    throw_goal_radius_arg = DeclareLaunchArgument(
+        "throw_goal_radius",
+        default_value=EnvironmentVariable("GP8_THROW_GOAL_RADIUS", default_value="0.10"),
+        description="Horizontal acceptance radius for predicted throw landing [m].",
     )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
@@ -308,7 +333,23 @@ def generate_launch_description():
             "GP8_GRASP_Z": LaunchConfiguration("grasp_z"),
             # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
             "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
+            # Visualization-only impact plane; never changes robot motion.
+            "GP8_THROW_VIZ_IMPACT_Z": LaunchConfiguration("throw_viz_impact_z"),
+            "GP8_THROW_GOAL_X": LaunchConfiguration("throw_goal_x"),
+            "GP8_THROW_GOAL_Y": LaunchConfiguration("throw_goal_y"),
+            "GP8_THROW_GOAL_RADIUS": LaunchConfiguration("throw_goal_radius"),
         },
+    )
+
+    rviz = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="gp8_throw_rviz",
+        arguments=["-d", PathJoinSubstitution([
+            FindPackageShare("gp8_control"), "rviz", "throw_runtime.rviz",
+        ])],
+        condition=IfCondition(LaunchConfiguration("rviz")),
+        output="screen",
     )
 
     # =====================================================================
@@ -323,8 +364,14 @@ def generate_launch_description():
         min_suction_hold_arg,
         grasp_z_arg,
         skill_arg,
+        rviz_arg,
+        throw_viz_impact_z_arg,
+        throw_goal_x_arg,
+        throw_goal_y_arg,
+        throw_goal_radius_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,
         gp8_app,
+        rviz,
     ])

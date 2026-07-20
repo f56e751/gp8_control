@@ -121,6 +121,26 @@ class Config:
     RELEASE_LEAD: float = field(        # [s]  env GP8_RELEASE_LEAD / launch release_lead:=
         default_factory=lambda: float(os.environ.get("GP8_RELEASE_LEAD", "-0.1"))
     )
+    # Z plane used by the runtime RViz point-mass ballistic preview.  This does
+    # not affect motion or release control; it only defines where the displayed
+    # object trajectory is considered to land.
+    THROW_VIZ_IMPACT_Z: float = field(  # [m] env GP8_THROW_VIZ_IMPACT_Z
+        default_factory=lambda: float(os.environ.get("GP8_THROW_VIZ_IMPACT_Z", "0.0"))
+    )
+    # Runtime ballistic evaluation target.  The XY defaults match the throw
+    # heading target that was historically hard-coded in throw_skill.py.
+    # GOAL_RADIUS is the acceptable horizontal miss distance (roughly the bin
+    # opening radius); these values affect planning direction/evaluation only,
+    # never the robot's safety limits.
+    THROW_GOAL_X: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_X", "1.1"))
+    )
+    THROW_GOAL_Y: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_Y", "-0.25"))
+    )
+    THROW_GOAL_RADIUS: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_RADIUS", "0.10"))
+    )
 
     # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
     PICK_LOG_CSV: str = field(

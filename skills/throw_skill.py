@@ -15,6 +15,7 @@ from gp8_control.trajectory.trajectory_primitive import (
     trajectory,
     pad,
 )
+from gp8_control.skills.throw_visualizer import ThrowVisualizer
 
 if TYPE_CHECKING:
     from gp8_control.skills.context import PickRequest
@@ -24,14 +25,6 @@ if TYPE_CHECKING:
 # =========================================================================
 # Throw policy (was app-level policy in app.py)
 # =========================================================================
-
-# Throw target bin (base-frame XY, m). The throw HEADING (theta) is computed PER
-# OBJECT as the bearing from that object's grasp to this bin, so the swing re-aims
-# from any grab position. Y is downstream-negative (belt -Y). Tune to the measured
-# bin centre.
-THROW_BIN_X: float = 1.1
-THROW_BIN_Y: float = -0.25
-
 
 # Per-class throw bin TARGET (absolute base-frame XYZ, m). When a target's
 # class is in this map, T_aim2 is OVERRIDDEN with these coordinates so the
@@ -73,6 +66,13 @@ class ThrowSkill(ManipulationSkill):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._last_throw_meta: dict = {}
+        self._visualizer = ThrowVisualizer(
+            ctx.node,
+            ctx.robot,
+            impact_z=ctx.cfg.THROW_VIZ_IMPACT_Z,
+            goal_xy=(ctx.cfg.THROW_GOAL_X, ctx.cfg.THROW_GOAL_Y),
+            goal_radius=ctx.cfg.THROW_GOAL_RADIUS,
+        )
 
     def t_to_contact(self, move_time: float) -> float:
         """Throw pick budget = positioning estimate + a GUARANTEED parked
@@ -129,13 +129,23 @@ class ThrowSkill(ManipulationSkill):
         # Lift + throw.
         ctx.set_status("THROWING", target.class_name)
 
-        # Throw heading = bearing from THIS object's grasp to the fixed bin,
-        # recomputed per object so the swing re-aims from any grab position (a
-        # fixed per-class angle only matched a y=0 grasp). theta then tilts the
-        # throw swing toward the bin. See THROW_BIN_X/Y.
+        # Match the coordinate convention used to train the FCN: theta is the
+        # base-origin azimuth of the throw target, and the grasp/aim XY inputs
+        # are rotated by -theta inside PickThrowPlanner.  Do NOT use the
+        # point-to-point bearing (goal - grasp) here; that rotates coordinates
+        # about the wrong reference and produced a ~44 deg release-direction
+        # error on hardware.  TARGET_DISTANCE intentionally remains the
+        # separately configured fixed model input (currently 1.2 m).
         theta = float(np.arctan2(
-            THROW_BIN_Y - T_grasp[1, 3], THROW_BIN_X - T_grasp[0, 3],
+            ctx.cfg.THROW_GOAL_Y,
+            ctx.cfg.THROW_GOAL_X,
         ))
+        ctx.log.info(
+            f"Throw frame: theta={np.degrees(theta):+.2f}deg (goal azimuth), "
+            f"grasp=({T_grasp[0, 3]:+.3f},{T_grasp[1, 3]:+.3f}), "
+            f"goal=({ctx.cfg.THROW_GOAL_X:+.3f},{ctx.cfg.THROW_GOAL_Y:+.3f}), "
+            f"model_distance={ctx.cfg.TARGET_DISTANCE:.3f}m"
+        )
 
         # Throw target. If the class has a fixed bin coord in THROW_BIN_TARGET_MAP,
         # override T_aim2 with that absolute base-frame XYZ so the NN aims at the
@@ -351,11 +361,29 @@ class ThrowSkill(ManipulationSkill):
             f"lead {ctx.cfg.RELEASE_LEAD:.2f}s, full arc->{chain_dest})"
         )
 
+        # Publish the exact path/release waypoint that is about to be sent to
+        # the robot.  RViz visualization is best-effort and never alters the
+        # control trajectory.
+        evaluation = self._visualizer.publish(
+            traj_throw, vel_throw, timestep_throw,
+            release_index=release_idx,
+            eta_index=eta_idx,
+            release_lead=ctx.cfg.RELEASE_LEAD,
+            throw_last_index=n_steps,
+            eta_min=ctx.cfg.ETA_MIN,
+            eta_max=ctx.cfg.ETA_MAX,
+            trajectory_hz=ctx.cfg.TRAJ_HZ,
+        )
+
         ctx.traj_ctrl.send_trajectory_queue_with_timed_release(
             traj_throw, vel_throw, timestep_throw,
             final_joint=final_joint,
             release_index=release_idx,
         )
+        # The controller call blocks until the complete throw/park trajectory
+        # finishes, so this is deliberately a post-throw assessment.  It is a
+        # model-based prediction, not an observation of the physical object.
+        self._visualizer.log_post_throw(evaluation)
         self._last_throw_meta = {
             "T": params.T, "eta": params.eta,
             "release_idx": release_idx, "n_steps": n_steps,
