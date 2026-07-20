@@ -3,7 +3,8 @@
 NN throw를 THR 통합 NLP planner (throw_nlp.solve_throw_nlp — CasADi/IPOPT
 B-Spline)로 교체한 버전 (2026-07-15: 구 manifold plan.plan_throw 대체).
 궤적은 3-세그먼트:
-  lift   — 정지(grasp_joint)에서 던지기 시작 자세(q_lift, 정지)까지 time-optimal
+  lift   — 정지(프레스 자세 q_press, 폴백 시 grasp_joint)에서 던지기 시작
+           자세(q_lift, 정지)까지 time-optimal
            (grasp 위치 + THROW_LIFT 상승 — 벨트 clearance)
   throw  — NLP 단일 B-spline이 스윙+release 윈도우(t*±T/2)+감속을 통합 최적화.
            v0=vf=0 구조적 보장, 윈도우 내내 착지 최적 (아무 때나 release 가능),
@@ -29,6 +30,7 @@ import datetime
 import os
 import pickle
 import sys
+import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -77,12 +79,43 @@ THROW_BIN_X: float = 1.1
 THROW_BIN_Y: float = -0.25
 
 # Per-class throw bin TARGET (absolute base-frame XYZ, m). When a target's
-# class is in this map, the landing point is OVERRIDDEN with these coordinates.
-# Empty default — fill in with measured bin coords (e.g., from terminal_debug).
-THROW_BIN_TARGET_MAP: dict[str, tuple] = {}
+# class is in this map, the landing point is OVERRIDDEN with these coordinates
+# AND the NLP solve starts in the BACKGROUND at execute() start (fixed target →
+# 계획을 이동/대기와 겹침). 카메라 클래스명 기준: 페트병 = "transparent"
+# (perception_client.py — "plastic"이라는 클래스는 없음). 좌표는 운영자 제공
+# 실측(2026-07-20), z=0 = 바닥 높이 bin.
+THROW_BIN_TARGET_MAP: dict[str, tuple] = {
+    "metal": (1.5, 0.3, 0.0),
+    "transparent": (1.2, -0.2, 0.0),
+}
 
 # 던지기 시작 TCP = grasp 위치 + 이만큼 lift (벨트/주변 clearance 확보).
 THROW_LIFT: float = 0.10
+
+# HOVER_DESCEND 픽 대기 높이: grasp TCP + 이 값 [m]. 도착 전 벨트 위 물체가
+# 파킹된 컵과 충돌하지 않도록 위에서 기다린다.
+HOVER_ABOVE: float = 0.03
+# 프레스 목표 TCP Z [m, base 절대 높이]. 물체 도착 순간 이 높이까지 내려 찍는다.
+# 운영자 지정(2026-07-20). 주의: 벨트 접촉 실측 TCP Z(GRASP_Z 0.062, 터치 0.067)
+# 보다 ~3cm 낮음 — 컵 bellows/물체 압축으로 흡수되는 것을 전제로 한 값이므로,
+# 픽 미스(빈 벨트)에 프레스가 나가면 컵이 벨트를 강하게 누른다. 조정은 이 상수.
+PRESS_Z: float = -0.005
+# 프레스 후 유지 시간 [s]: 컵이 PRESS_Z에서 물체를 누른 채 이만큼 기다린 뒤
+# 던지기로 넘어간다 (진공 실링 확보). 이 구간 동안 팔은 정지가 아니라 벨트와
+# 같은 속도로 물체를 따라간다(_build_belt_follow) — 정지 유지면 물체가 컵 밑에서
+# v·PICK_TIME(0.25m/s·1s = 25cm)만큼 끌려나가 실링이 깨진다. NLP 선계획이 아직
+# 안 끝났으면 join이 이 구간과 겹쳐 흡수되므로 시간은 공짜에 가깝다.
+PICK_TIME: float = 0.5
+# 추종 마무리 감속 시간 [s]: 추종 끝에서 정지까지 (lift가 정지 출발 전제).
+# 이 구간의 뒤처짐(≈v·FOLLOW_DECEL_T/2)은 이미 실링된 뒤라 무해 — 컵이 물체를
+# 잡고 있으면 벨트가 밑에서 미끄러진다.
+FOLLOW_DECEL_T: float = 0.1
+# 프레스 선행 시간 [s] — 하강 소요시간(자동 계산) 위에 얹는 고정 보정.
+# 대기 종료를 이만큼 더 앞당겨 접촉을 앞으로 당긴다. 실기 관측(2026-07-20):
+# 프레스가 도착보다 일정하게 ~0.2s 늦어 0.2로 설정. 벨트 속도와 무관하게 일정
+# 시간 어긋날 때 쓰는 노브이고, 속도에 비례해 어긋나면 대신 카메라 쪽
+# GP8_PERCEPTION_LATENCY_S(v×delay 역보정)를 조정한다. env GP8_PRESS_LEAD.
+PRESS_LEAD: float = float(os.environ.get("GP8_PRESS_LEAD", "0.2"))
 # release 윈도우 길이 (s) — throw_nlp 기본값(0.05)과 동일하게 유지해야
 # W_ACC 스윕이 검증한 조합과 warm entry(제약 구성 키)가 그대로 성립한다.
 # 실기 밸브 지연의 '평균'은 RELEASE_LEAD 선행 명령이 보정하고, 잔여 jitter는
@@ -148,20 +181,18 @@ def _load_warm_db(log) -> list:
 class PickWaitMode(Enum):
     """How the arm waits at the ambush intercept before suction fires.
 
-    Extension point: map object classes to a wait mode in ``PICK_WAIT_MODE``
-    so e.g. fragile classes can hover-and-descend while flat ones park at
-    grasp height. Only WAIT_AT_GRASP is implemented today; HOVER_DESCEND
-    falls back to it with a warning until added.
+    Map object classes to a wait mode in ``PICK_WAIT_MODE``; unlisted classes
+    use ``DEFAULT_PICK_WAIT_MODE``.
     """
 
     WAIT_AT_GRASP = "wait_at_grasp"   # cup parked at grasp height; suction on arrival
-    HOVER_DESCEND = "hover_descend"   # park above, descend + suction on arrival (TODO)
+    HOVER_DESCEND = "hover_descend"   # hover HOVER_ABOVE above; press to PRESS_Z on arrival
 
 
 # Per-class wait mode (class_name -> PickWaitMode). Classes not listed use
 # DEFAULT_PICK_WAIT_MODE.
 PICK_WAIT_MODE: dict[str, PickWaitMode] = {}
-DEFAULT_PICK_WAIT_MODE = PickWaitMode.WAIT_AT_GRASP
+DEFAULT_PICK_WAIT_MODE = PickWaitMode.HOVER_DESCEND
 
 
 class RobustThrowSkill(ManipulationSkill):
@@ -201,6 +232,93 @@ class RobustThrowSkill(ManipulationSkill):
         base = move_time * self.ctx.cfg.PICK_FEASIBILITY_FACTOR
         return base + self.ctx.cfg.MIN_SUCTION_HOLD
 
+    def arrival_lead(self) -> float:
+        """대기를 끝내는 선행 시간 = 공용 디스패치 예산 + PRESS_LEAD.
+
+        HOVER_DESCEND 픽은 대기 종료 후 '하강해서 눌러야' 접촉이므로, 하강
+        소요시간(execute가 궤적에서 계산해 더함) 위에 잔여 지연 보정으로
+        PRESS_LEAD를 얹는다. base와 달리 이 스킬에만 적용된다.
+        """
+        return super().arrival_lead() + PRESS_LEAD
+
+    def _build_belt_follow(self, T_press: np.ndarray, press_joint: np.ndarray,
+                           v_belt: float):
+        """PICK_TIME 동안 벨트와 같은 속도로 물체를 따라가는 직교 직선 세그먼트.
+
+        TCP는 PRESS_Z를 유지한 채 벨트 진행 방향(-Y)으로 이동한다. 속도 프로파일은
+        [등속 v_belt] → [FOLLOW_DECEL_T 동안 정지까지 감속]: 실링이 걸리는 앞부분은
+        물체와 상대속도 0이고, 뒷부분 감속은 lift의 정지 출발 계약을 맞춘다.
+
+        각 waypoint는 직전 해를 시드로 IK를 풀어 같은 wrist branch를 유지한다
+        (push 스트로크와 동일 — 시드 없이 풀면 J5 부호 교차에서 4/6축이 π 튄다).
+        IK가 중간에 실패하면 거기서 잘라 반환한다 (도달 한계 → 짧게 추종).
+
+        리턴: (traj (6,n), vel (6,n), ts (n,)) 또는 None (벨트 정지/생성 불가).
+        """
+        ctx = self.ctx
+        if v_belt < 1e-3 or PICK_TIME <= 0.0:
+            return None                      # 벨트 정지 → 추종할 것이 없다
+        dt = 1.0 / ctx.cfg.TRAJ_HZ
+        n_steps = max(2, int(round(PICK_TIME / dt)))
+        t_dec = min(FOLLOW_DECEL_T, PICK_TIME)
+        t_cruise = PICK_TIME - t_dec
+
+        waypoints = []
+        q_seed = np.asarray(press_joint, dtype=float)
+        for i in range(n_steps + 1):
+            t = min(i * dt, PICK_TIME)
+            if t <= t_cruise:
+                s = v_belt * t               # 등속 추종 (물체와 상대속도 0)
+            else:
+                tau = t - t_cruise           # 선형 감속 v→0
+                s = v_belt * (t_cruise + tau - 0.5 * tau * tau / t_dec)
+            T_wp = np.asarray(T_press, dtype=float).copy()
+            T_wp[1, 3] -= s                  # 벨트는 -Y로 진행
+            T_wp[2, 3] = PRESS_Z
+            ik = ctx.robot.inverse_kinematics(T_wp, q_init=q_seed)
+            if ik is None:
+                ctx.log.warn(
+                    f"belt-follow IK 실패 @ {i}/{n_steps} (s={s * 1000:.0f}mm) — "
+                    f"추종을 {len(waypoints)} waypoint로 자름"
+                )
+                break
+            q_seed = np.asarray(ik, dtype=float)
+            waypoints.append(q_seed)
+
+        if len(waypoints) < 3:
+            ctx.log.warn("belt-follow 세그먼트 생성 실패 — 정지 유지로 폴백")
+            return None
+
+        n = len(waypoints)
+        traj = np.column_stack(waypoints)                  # (6, n)
+        ts = np.linspace(0.0, dt * (n - 1), n)
+        vel = np.zeros_like(traj)
+        vel[:, 1:-1] = (traj[:, 2:] - traj[:, :-2]) / (2.0 * dt)
+        # 시작은 벨트 속도로 진입(하강 세그먼트가 이 속도로 착지하도록 전달),
+        # 끝은 정지 (lift가 정지 출발).
+        vel[:, 0] = (traj[:, 1] - traj[:, 0]) / dt
+        vel[:, -1] = 0.0
+
+        # 관절 속도 한계 확인. 시간을 늘리면 벨트 추종이 깨지므로 stretch하지 않고
+        # 경고만 남긴다 (벨트 속도에서 넘칠 일은 없지만, 넘으면 추종 자체가 불가).
+        seg = np.abs(np.diff(traj, axis=1)) / dt
+        ratio = float(np.max(seg / np.asarray(ctx.M1[:6], dtype=float)[:, None]))
+        if ratio > 1.0:
+            ctx.log.warn(
+                f"belt-follow 관절속도 한계 초과 (max {ratio:.2f}×) — 추종 포기")
+            return None
+        return traj, vel, ts
+
+    def _tcp_z_joint(self, T_grasp: np.ndarray, z_abs: float, seed_joint: np.ndarray):
+        """grasp TCP의 XY/자세를 유지한 채 절대 높이 ``z_abs``의 IK 해 (로봇 규약,
+        seed_joint 시드 → 같은 IK branch). 실패 시 None (호출측이 폴백)."""
+        T_h = np.asarray(T_grasp, dtype=float).copy()
+        T_h[2, 3] = float(z_abs)
+        q = self.ctx.robot.inverse_kinematics(
+            T_h, q_init=np.asarray(seed_joint, dtype=float)[:6]
+        )
+        return None if q is None else np.asarray(q, dtype=float)
+
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
     # ------------------------------------------------------------------
@@ -216,22 +334,119 @@ class RobustThrowSkill(ManipulationSkill):
         secondary = request.secondary
 
         mode = PICK_WAIT_MODE.get(target.class_name, DEFAULT_PICK_WAIT_MODE)
-        if mode == PickWaitMode.HOVER_DESCEND:
-            ctx.log.warn(
-                "HOVER_DESCEND wait mode not implemented yet; using WAIT_AT_GRASP"
-            )
-            mode = PickWaitMode.WAIT_AT_GRASP
 
         # Start clean (uniform per-object flow: no cross-cycle suction hand-off).
         ctx.traj_ctrl.suction_off()
 
-        # WAIT_AT_GRASP: drive to the grasp pose and prime suction SUCTION_LEAD before
-        # the object's arrival. Returns once the object has reached the intercept.
+        # HOVER_DESCEND(기본): grasp + HOVER_ABOVE 높이에서 대기하고, 물체 도착
+        # 순간 절대 높이 PRESS_Z까지 하강해 위에서 찍어 누른다. 대기 종료
+        # (start_lead)를 하강 시간만큼 앞당겨 컵-물체 접촉이 도착 시각에 오도록
+        # 한다. suction은 position_and_prime이 hover에 파킹된 상태에서 프라임 →
+        # 접촉과 동시 실링. 프레스가 grasp보다 낮게 끝나므로 던지기 lift의 시작
+        # 관절(start_q)도 프레스 자세로 맞춘다 (아니면 던지기 시작에서 점프).
+        # WAIT_AT_GRASP(폴백/클래스별): grasp 높이에 파킹하고 도착을 받는다.
+        wait_joint = np.asarray(grasp_joint, dtype=float)
+        start_q = np.asarray(grasp_joint, dtype=float)   # 던지기 lift 시작 관절
+        T_lift_ref = np.asarray(T_grasp, dtype=float)    # p_lift 기준 (추종 후 이동)
+        descend = None                       # (d_traj, d_vel, d_ts) | None
+        follow = None                        # (f_traj, f_vel, f_ts) | None
+        if mode == PickWaitMode.HOVER_DESCEND:
+            q_hover = self._tcp_z_joint(
+                T_grasp, T_grasp[2, 3] + HOVER_ABOVE, grasp_joint)
+            q_press = self._tcp_z_joint(T_grasp, PRESS_Z, grasp_joint)
+            if q_hover is None or q_press is None:
+                ctx.log.warn("hover/press IK 실패 — WAIT_AT_GRASP로 폴백")
+            else:
+                zero6 = np.zeros(6)
+                # 벨트 추종 세그먼트를 먼저 만들어, 하강이 '벨트 속도로 착지'하게
+                # 그 진입 관절속도를 하강의 종료속도로 넘긴다 — 접촉 순간 컵과
+                # 물체의 상대속도가 0이 되어 실링 중 끌림이 없다.
+                follow = self._build_belt_follow(
+                    T_grasp, q_press, float(ctx.conveyor.current))
+                dq_press = follow[1][:, 0] if follow is not None else zero6
+                descend = trajectory(
+                    q_hover, zero6, q_press, dq_press,
+                    ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
+                )
+                wait_joint, start_q = q_hover, q_press
+                if follow is not None:
+                    # 추종이 끝난 자세에서 던지기가 출발한다. p_lift 기준도 그만큼
+                    # 하류로 옮기되 lift 높이 컨벤션(grasp z + THROW_LIFT)은 유지.
+                    start_q = follow[0][:, -1]
+                    T_end = ctx.robot.forward_kinematics(start_q)
+                    T_lift_ref = np.asarray(T_grasp, dtype=float).copy()
+                    T_lift_ref[0, 3], T_lift_ref[1, 3] = T_end[0, 3], T_end[1, 3]
+                    ctx.log.info(
+                        f"belt-follow: {float(ctx.conveyor.current):.3f} m/s로 "
+                        f"{float(follow[2][-1]):.2f}s 추종 "
+                        f"({(T_grasp[1, 3] - T_end[1, 3]) * 1000:.0f}mm 하류)"
+                    )
+
+        # 계획-대기 겹치기: 고정 bin 클래스는 착지점이 시간 불변이므로 intercept가
+        # 확정된 지금 NLP solve를 백그라운드로 시작한다 — 이동+hover 대기 시간과
+        # 겹쳐서, 프레스 직후 join만 하면 됨 (eta > solve 시간이면 체감 지연 ~0).
+        # casadi solve는 GIL을 해제(실측: solve 중 메인 스레드 처리율 101%)하므로
+        # 250 Hz 스트림/대기 루프를 방해하지 않는다. bin 미등록 클래스는 착지점이
+        # 시간 종속(fallback)이라 기존대로 프레스 후 순차로 푼다.
+        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+        plan_box: dict = {}
+        plan_thread = None
+        if bin_xyz is not None:
+            p_target_fixed = np.asarray(bin_xyz, dtype=float)
+            ctx.log.info(
+                f"Throw target for {target.class_name}: fixed bin "
+                f"({p_target_fixed[0]:+.3f}, {p_target_fixed[1]:+.3f}, "
+                f"{p_target_fixed[2]:+.3f}) m — NLP 선계획 백그라운드 시작"
+            )
+
+            def _plan_bg(_q=start_q, _T=T_lift_ref) -> None:
+                try:
+                    plan_box["planned"] = self.plan_nlp_throw(
+                        _q, _T, p_target_fixed)
+                except Exception as e:   # 스레드 예외는 join 후 회수 (넘기면 유실)
+                    plan_box["error"] = e
+
+            plan_thread = threading.Thread(
+                target=_plan_bg, name="nlp-preplan", daemon=True)
+            plan_thread.start()
+
+        start_lead = self.arrival_lead()
+        if descend is not None:
+            t_desc = float(descend[2][-1])
+            # position_and_prime은 suction cap(arrival - SUCTION_LEAD)보다 일찍
+            # 리턴하지 않으므로, 하강+디스패치가 SUCTION_LEAD 안에 들어와야
+            # 접촉이 도착 정시에 온다 (넘치면 그만큼 늦게 눌린다).
+            if t_desc + start_lead > ctx.cfg.SUCTION_LEAD:
+                ctx.log.warn(
+                    f"press 하강 {t_desc:.2f}s + lead {start_lead:.2f}s > "
+                    f"SUCTION_LEAD {ctx.cfg.SUCTION_LEAD:.2f}s — 접촉 지연"
+                )
+            start_lead += t_desc
+
         ctx.set_status("POSITIONING", target.class_name)
         ctx.position_and_prime(
-            current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
-            start_lead=self.arrival_lead(),
+            current_joint, aim_joint, wait_joint, target, T_grasp[1, 3],
+            start_lead=start_lead,
         )
+        if descend is not None:
+            # 도착 순간 프레스 하강 + (있으면) 벨트 추종을 하나의 궤적으로 이어
+            # 디스패치한다: 두 번 나눠 보내면 사이에 디스패치 간극이 생기고 그동안
+            # 물체가 계속 흘러간다. 추종의 첫 열은 하강의 마지막(q_press)과 중복이라
+            # 버리고 시계만 이어 붙인다 (push 스트로크와 동일한 접합 방식).
+            # 스트림이 실시간 페이싱하므로 이 호출 자체가 하강+PICK_TIME을 소모.
+            d_traj, d_vel, d_ts = descend
+            if follow is not None:
+                f_traj, f_vel, f_ts = follow
+                d_traj = np.concatenate((d_traj, f_traj[:, 1:]), axis=1)
+                d_vel = np.concatenate((d_vel, f_vel[:, 1:]), axis=1)
+                d_ts = np.concatenate((d_ts, f_ts[1:] + d_ts[-1]))
+            ctx.traj_ctrl.send_trajectory_queue(
+                d_traj, d_vel, d_ts, final_joint=start_q,
+            )
+            if follow is None:
+                # 벨트 정지/IK 불가 → 그 자리에서 유지 (JGPC가 마지막 명령을
+                # zero-order-hold; sleep_until은 신규 detection 인입을 계속).
+                ctx.sleep_until(time.time() + PICK_TIME)
 
         # DIAGNOSTIC: object vs intercept at the instant the lift/throw fires.
         ctx.log_action_timing(target, T_grasp[1, 3], "throw-lift")
@@ -239,25 +454,29 @@ class RobustThrowSkill(ManipulationSkill):
         # Lift + throw.
         ctx.set_status("THROWING", target.class_name)
 
-        # 착지 목표 결정. bin map에 있으면 절대좌표 사용, 없으면 legacy fallback
-        # (secondary 예측 위치 또는 T_aim hover). theta는 legacy fallback 전용 —
-        # manifold planner는 던지는 방향을 p_object→p_target으로 스스로 잡음.
-        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
-        if bin_xyz is not None:
-            p_target = np.asarray(bin_xyz, dtype=float)
-            ctx.log.info(
-                f"Throw target for {target.class_name}: fixed bin "
-                f"({p_target[0]:+.3f}, {p_target[1]:+.3f}, {p_target[2]:+.3f}) m"
-            )
+        # 계획 회수: 선계획 스레드가 있으면 join (이동+대기와 겹쳐 이미 풀렸으면
+        # 즉시 반환), 없으면(legacy fallback 착지점 — 시간 종속) 여기서 순차로 푼다.
+        if plan_thread is not None:
+            t_join0 = time.time()
+            plan_thread.join()
+            join_s = time.time() - t_join0
+            err = plan_box.get("error")
+            if err is not None:
+                ctx.log.error(
+                    f"NLP 선계획 스레드 예외: {type(err).__name__}: {err}")
+            planned = plan_box.get("planned")
+            ctx.log.info(f"NLP 선계획 회수: press 후 추가 대기 {join_s:.2f}s")
         else:
+            # legacy fallback (secondary 예측 위치 또는 T_aim hover). theta는
+            # fallback 전용 — planner는 방향을 p_object→p_target으로 스스로 잡음.
             theta = float(np.arctan2(
                 THROW_BIN_Y - T_grasp[1, 3], THROW_BIN_X - T_grasp[0, 3],
             ))
             T_aim2 = self.plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
             p_target = T_aim2[:3, 3].copy()
+            planned = self.plan_nlp_throw(start_q, T_grasp, p_target)
 
         # NLP throw 계획: lift + 통합 궤적. 불가능하면 던지지 않고 정리.
-        planned = self.plan_nlp_throw(grasp_joint, T_grasp, p_target)
         if planned is None:
             ctx.log.warn("Throw infeasible; dropping in place and parking")
             ctx.traj_ctrl.suction_off()
@@ -326,16 +545,18 @@ class RobustThrowSkill(ManipulationSkill):
 
     def plan_nlp_throw(
         self,
-        grasp_joint: np.ndarray,
+        start_joint: np.ndarray,
         T_grasp: np.ndarray,
         p_target: np.ndarray,
     ):
         """THR 통합 NLP planner 호출 + lift 세그먼트 생성.
 
+        ``start_joint``: lift가 출발하는 실제 관절 자세 (로봇 규약) — HOVER_DESCEND
+        픽에서는 프레스 자세(q_press, TCP z=PRESS_Z), 폴백에서는 grasp_joint.
         리턴: (res dict, (lift_traj (6,n), lift_vel (6,n), lift_ts (n,)))
         또는 None (실현 불가 — 사유는 로그).
         던지기 시작 TCP는 grasp 위치 + THROW_LIFT (벨트 clearance).
-        q_lift IK seed = grasp_joint이라 현재 자세 근처 branch로 잡히고,
+        q_lift IK seed = start_joint이라 현재 자세 근처 branch로 잡히고,
         NLP는 q_start=q_lift에서 정지 출발 (v0=0) — lift가 정지로 끝나므로 연속.
         """
         ctx = self.ctx
@@ -343,10 +564,10 @@ class RobustThrowSkill(ManipulationSkill):
         p_target = np.asarray(p_target, dtype=float)
 
         # lift 자세: NLP 위치 한계(B≥10°, U≤45°, |R|≤80° 포함) 안의 IK 해.
-        # ik_position/Q_LO/Q_HI는 플래너 규약이므로 로봇 규약인 grasp_joint를
+        # ik_position/Q_LO/Q_HI는 플래너 규약이므로 로봇 규약인 start_joint를
         # _PLANNER_SIGN으로 변환해 시드로 쓴다 (고정 시드들은 원래 플래너 규약).
         q_lift = None
-        seeds = [np.asarray(grasp_joint, dtype=float) * _PLANNER_SIGN]
+        seeds = [np.asarray(start_joint, dtype=float) * _PLANNER_SIGN]
         seeds += [np.array([seeds[0][0], 0.5, -0.2, 0.0, b, 0.0]) for b in (0.6, 0.9, 1.2)]
         for seed in seeds:
             q, ok = ik_position(p_lift, seed)
@@ -409,13 +630,13 @@ class RobustThrowSkill(ManipulationSkill):
             t_f=res["t_f"], t_star=res["t_star"], lam_g=res.get("lam_g"),
             u_pos=res.get("u_pos"), J=res["J"])
 
-        # lift: 정지(grasp_joint) → 정지(q_lift). trajectory()가 M1/M2 안에서
+        # lift: 정지(start_joint) → 정지(q_lift). trajectory()가 M1/M2 안에서
         # time-optimal 세그먼트를 만들어 줌. 스트리밍되는 세그먼트는 로봇 규약
         # 이어야 하므로 q_lift(플래너 규약)를 변환한 끝점을 쓴다 — NLP의
         # q_start=q_lift(플래너 규약)와는 별개다.
         zero6 = np.zeros(6)
         l_traj, l_vel, l_ts = trajectory(
-            np.asarray(grasp_joint, dtype=float), zero6,
+            np.asarray(start_joint, dtype=float), zero6,
             q_lift * _PLANNER_SIGN, zero6,
             ctx.M1[:6], ctx.M2[:6], hertz=ctx.cfg.TRAJ_HZ,
         )

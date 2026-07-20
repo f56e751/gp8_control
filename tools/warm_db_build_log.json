@@ -1,9 +1,14 @@
 {
  "targets": [
   [
-   1.1,
-   -0.25,
-   0.162
+   1.6,
+   0.0,
+   0.0
+  ],
+  [
+   1.2,
+   0.0,
+   0.0
   ],
   [
    0.45,
@@ -84,89 +89,85 @@
    "si": 0,
    "vi": 0,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 8.167048692703247,
-   "J": 3.1058048832032954,
-   "t_f": 1.1594048743376513
+   "ok": true,
+   "solve_s": 7.198185920715332,
+   "J": 1.728152460962252,
+   "t_f": 0.5649479301010921
   },
   {
    "ti": 0,
    "si": 0,
    "vi": 1,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 7.7851784229278564,
-   "J": 3.2054629773564285,
-   "t_f": 0.6555065256910215
+   "ok": true,
+   "solve_s": 7.144807577133179,
+   "J": 1.728152647934406,
+   "t_f": 0.5649492049644157
   },
   {
    "ti": 0,
    "si": 0,
    "vi": 2,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 7.485577344894409,
-   "J": 3.1058048856540066,
-   "t_f": 1.1594048717138594
+   "ok": true,
+   "solve_s": 6.119661808013916,
+   "J": 1.7281524923621898,
+   "t_f": 0.5649481442928829
   },
   {
    "ti": 0,
    "si": 0,
    "vi": 3,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 7.425544023513794,
-   "J": 3.1058048893005012,
-   "t_f": 1.1594048676867021
+   "ok": true,
+   "solve_s": 7.941486358642578,
+   "J": 1.7281524707832747,
+   "t_f": 0.5649479970887853
   },
   {
    "ti": 0,
    "si": 1,
    "vi": 0,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
@@ -174,78 +175,75 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 8.165467739105225,
-   "J": 0.8407181100755817,
-   "t_f": 0.3000001842795012
+   "solve_s": 8.592899084091187,
+   "J": 1.5693574044280196,
+   "t_f": 0.3000001957350152
   },
   {
    "ti": 0,
    "si": 1,
    "vi": 1,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 7.008443593978882,
-   "J": 2.040488090809419,
-   "t_f": 0.8121288866255229
+   "ok": true,
+   "solve_s": 5.968811511993408,
+   "J": 1.5693575410738432,
+   "t_f": 0.3000002543208915
   },
   {
    "ti": 0,
    "si": 1,
    "vi": 2,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 8.725778102874756,
-   "J": 2.9629366259731555,
-   "t_f": 1.183871019127274
+   "ok": true,
+   "solve_s": 6.694087266921997,
+   "J": 1.569357435676706,
+   "t_f": 0.30000020913044795
   },
   {
    "ti": 0,
    "si": 1,
    "vi": 3,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 6.95004940032959,
-   "J": 3.596261785451171,
-   "t_f": 0.8965740239585308
+   "ok": true,
+   "solve_s": 6.754655361175537,
+   "J": 1.5693574067888276,
+   "t_f": 0.3000001967469814
   },
   {
    "ti": 0,
    "si": 2,
    "vi": 0,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
@@ -253,78 +251,75 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 6.532358169555664,
-   "J": 0.835644666701417,
-   "t_f": 0.3000000679816456
+   "solve_s": 8.9222571849823,
+   "J": 1.600894421291306,
+   "t_f": 0.36487583300154197
   },
   {
    "ti": 0,
    "si": 2,
    "vi": 1,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     -0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 7.578790903091431,
-   "J": 2.7601768332904815,
-   "t_f": 0.7959462182869139
+   "ok": true,
+   "solve_s": 8.528118371963501,
+   "J": 1.6008946684739722,
+   "t_f": 0.36487588240358304
   },
   {
    "ti": 0,
    "si": 2,
    "vi": 2,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     -0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 6.101133108139038,
-   "J": 4.838790954519306,
-   "t_f": 1.1332115760925239
+   "ok": true,
+   "solve_s": 7.987545967102051,
+   "J": 1.6008944741519842,
+   "t_f": 0.3648758369611474
   },
   {
    "ti": 0,
    "si": 2,
    "vi": 3,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.45,
     -0.3,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 6.676723480224609,
-   "J": 3.0682400158160696,
-   "t_f": 1.151485157923028
+   "ok": true,
+   "solve_s": 8.124272108078003,
+   "J": 1.6008944340603546,
+   "t_f": 0.36487583362042675
   },
   {
    "ti": 0,
    "si": 3,
    "vi": 0,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.3,
@@ -332,18 +327,18 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 8.54249382019043,
-   "J": 0.8538223196264896,
-   "t_f": 0.3154718754139564
+   "solve_s": 8.77082347869873,
+   "J": 1.5747983278555142,
+   "t_f": 0.32820682084134334
   },
   {
    "ti": 0,
    "si": 3,
    "vi": 1,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.3,
@@ -351,38 +346,18 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 6.437626600265503,
-   "J": 0.8538223392051234,
-   "t_f": 0.3154720197843653
+   "solve_s": 7.149701356887817,
+   "J": 1.574799058820357,
+   "t_f": 0.3282074512068075
   },
   {
    "ti": 0,
    "si": 3,
    "vi": 2,
    "target": [
-    1.1,
-    -0.25,
-    0.162
-   ],
-   "p_start": [
-    0.3,
+    1.6,
     0.0,
-    0.162
-   ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 9.00860595703125,
-   "J": 2.7680533102287814,
-   "t_f": 0.9018629718259439
-  },
-  {
-   "ti": 0,
-   "si": 3,
-   "vi": 3,
-   "target": [
-    1.1,
-    -0.25,
-    0.162
+    0.0
    ],
    "p_start": [
     0.3,
@@ -390,92 +365,487 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 9.277089357376099,
-   "J": 0.8538223395604659,
-   "t_f": 0.3154720224042504
+   "solve_s": 6.487103223800659,
+   "J": 1.6852228176212383,
+   "t_f": 0.5627747423065863
+  },
+  {
+   "ti": 0,
+   "si": 3,
+   "vi": 3,
+   "target": [
+    1.6,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.3,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 5.820950508117676,
+   "J": 1.5747988489688878,
+   "t_f": 0.32820726397643557
   },
   {
    "ti": 0,
    "si": 4,
    "vi": 0,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.6,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 6.707674264907837,
-   "J": 3.793343751984572,
-   "t_f": 1.0410847633888487
+   "ok": true,
+   "solve_s": 9.844160556793213,
+   "J": 1.7117632413210382,
+   "t_f": 0.6178644107784587
   },
   {
    "ti": 0,
    "si": 4,
    "vi": 1,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.6,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 7.2678258419036865,
-   "J": 2.945685250110864,
-   "t_f": 1.0410845100862038
+   "ok": true,
+   "solve_s": 7.834777355194092,
+   "J": 1.5780151542782215,
+   "t_f": 0.3000001038102234
   },
   {
    "ti": 0,
    "si": 4,
    "vi": 2,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.6,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 5.863254070281982,
-   "J": 3.780661798723388,
-   "t_f": 1.0410845376845344
+   "ok": true,
+   "solve_s": 6.190810203552246,
+   "J": 1.578014947385341,
+   "t_f": 0.30000006852212296
   },
   {
    "ti": 0,
    "si": 4,
    "vi": 3,
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
    "p_start": [
     0.6,
     0.0,
     0.162
    ],
-   "ok": false,
-   "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 5.414283275604248,
-   "J": 3.7806619746166845,
-   "t_f": 1.0410846919576004
+   "ok": true,
+   "solve_s": 6.507761001586914,
+   "J": 1.7117632454346308,
+   "t_f": 0.6178644316688997
   },
   {
    "ti": 1,
+   "si": 0,
+   "vi": 0,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 9.243669271469116,
+   "J": 0.944145071099167,
+   "t_f": 0.3173226764258862
+  },
+  {
+   "ti": 1,
+   "si": 0,
+   "vi": 1,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.512207984924316,
+   "J": 0.9441452578617088,
+   "t_f": 0.31732337926226517
+  },
+  {
+   "ti": 1,
+   "si": 0,
+   "vi": 2,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 6.875673532485962,
+   "J": 0.9441451220746129,
+   "t_f": 0.31732286827091094
+  },
+  {
+   "ti": 1,
+   "si": 0,
+   "vi": 3,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 6.547468900680542,
+   "J": 0.9441450814033862,
+   "t_f": 0.3173227152063875
+  },
+  {
+   "ti": 1,
+   "si": 1,
+   "vi": 0,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 5.215499401092529,
+   "J": 0.935381613961326,
+   "t_f": 0.30000011481097383
+  },
+  {
+   "ti": 1,
+   "si": 1,
+   "vi": 1,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.045579195022583,
+   "J": 0.9353817494688637,
+   "t_f": 0.3000001506167137
+  },
+  {
+   "ti": 1,
+   "si": 1,
+   "vi": 2,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 5.7535011768341064,
+   "J": 0.9353816600282974,
+   "t_f": 0.3000001269851252
+  },
+  {
+   "ti": 1,
+   "si": 1,
+   "vi": 3,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 5.807988882064819,
+   "J": 0.9353816163638775,
+   "t_f": 0.3000001154459502
+  },
+  {
+   "ti": 1,
+   "si": 2,
+   "vi": 0,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    -0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.568300485610962,
+   "J": 0.9410736698394779,
+   "t_f": 0.309121538439946
+  },
+  {
+   "ti": 1,
+   "si": 2,
+   "vi": 1,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    -0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.228182554244995,
+   "J": 0.9410737437571786,
+   "t_f": 0.30912169353837626
+  },
+  {
+   "ti": 1,
+   "si": 2,
+   "vi": 2,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    -0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.354855060577393,
+   "J": 0.9410736928810602,
+   "t_f": 0.30912158658069155
+  },
+  {
+   "ti": 1,
+   "si": 2,
+   "vi": 3,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.45,
+    -0.3,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.106889724731445,
+   "J": 0.9410736738315653,
+   "t_f": 0.30912154676687326
+  },
+  {
+   "ti": 1,
+   "si": 3,
+   "vi": 0,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.3,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.646673202514648,
+   "J": 0.948182223448431,
+   "t_f": 0.3161640731858135
+  },
+  {
+   "ti": 1,
+   "si": 3,
+   "vi": 1,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.3,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.9014503955841064,
+   "J": 0.9481823769288957,
+   "t_f": 0.3161649050034995
+  },
+  {
+   "ti": 1,
+   "si": 3,
+   "vi": 2,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.3,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.385981321334839,
+   "J": 0.9481821950289848,
+   "t_f": 0.31616391922834275
+  },
+  {
+   "ti": 1,
+   "si": 3,
+   "vi": 3,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.3,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 5.8910298347473145,
+   "J": 0.9481822276753649,
+   "t_f": 0.31616409608074897
+  },
+  {
+   "ti": 1,
+   "si": 4,
+   "vi": 0,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.6,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 6.50324559211731,
+   "J": 0.9283435345249709,
+   "t_f": 0.3000000411345895
+  },
+  {
+   "ti": 1,
+   "si": 4,
+   "vi": 1,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.6,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 7.357626438140869,
+   "J": 0.928343707992271,
+   "t_f": 0.30000006869859275
+  },
+  {
+   "ti": 1,
+   "si": 4,
+   "vi": 2,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.6,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 6.756088018417358,
+   "J": 0.9283435683745859,
+   "t_f": 0.30000004652906204
+  },
+  {
+   "ti": 1,
+   "si": 4,
+   "vi": 3,
+   "target": [
+    1.2,
+    0.0,
+    0.0
+   ],
+   "p_start": [
+    0.6,
+    0.0,
+    0.162
+   ],
+   "ok": true,
+   "solve_s": 6.995976686477661,
+   "J": 0.9283435369512933,
+   "t_f": 0.3000000415216536
+  },
+  {
+   "ti": 2,
    "si": 0,
    "vi": 0,
    "target": [
@@ -490,10 +860,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 73.65075182914734
+   "solve_s": 68.0159227848053
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 0,
    "vi": 1,
    "target": [
@@ -508,10 +878,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 72.26725625991821
+   "solve_s": 64.52322149276733
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 0,
    "vi": 2,
    "target": [
@@ -526,10 +896,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 93.1282811164856
+   "solve_s": 63.254191637039185
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 0,
    "vi": 3,
    "target": [
@@ -544,10 +914,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 74.31600570678711
+   "solve_s": 70.45796728134155
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 1,
    "vi": 0,
    "target": [
@@ -562,12 +932,12 @@
    ],
    "ok": false,
    "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 44.039742946624756,
+   "solve_s": 39.02608013153076,
    "J": 0.4055714027349615,
    "t_f": 0.3000001021100176
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 1,
    "vi": 1,
    "target": [
@@ -582,10 +952,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Error_In_Step_Computation'",
-   "solve_s": 8.123956441879272
+   "solve_s": 8.765181541442871
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 1,
    "vi": 2,
    "target": [
@@ -600,12 +970,12 @@
    ],
    "ok": false,
    "why": "gate: landing window max infmm > 30mm",
-   "solve_s": 6.106842279434204,
+   "solve_s": 5.545990467071533,
    "J": 0.4055714257517733,
    "t_f": 0.30000012917173874
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 1,
    "vi": 3,
    "target": [
@@ -619,12 +989,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 6.426202774047852,
+   "solve_s": 6.379165172576904,
    "J": 0.3934438353009527,
    "t_f": 0.30000000543031846
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 2,
    "vi": 0,
    "target": [
@@ -638,12 +1008,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 7.219933271408081,
+   "solve_s": 6.711748361587524,
    "J": 0.3909402822718701,
    "t_f": 0.30000000187597303
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 2,
    "vi": 1,
    "target": [
@@ -658,10 +1028,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 73.92609786987305
+   "solve_s": 65.0387372970581
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 2,
    "vi": 2,
    "target": [
@@ -675,12 +1045,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 8.201115131378174,
+   "solve_s": 7.419358730316162,
    "J": 0.3909403068362499,
    "t_f": 0.3000000043659353
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 2,
    "vi": 3,
    "target": [
@@ -694,12 +1064,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 7.3975653648376465,
+   "solve_s": 5.969397068023682,
    "J": 0.39094029443921624,
    "t_f": 0.3000000031093643
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 3,
    "vi": 0,
    "target": [
@@ -714,10 +1084,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 69.76794242858887
+   "solve_s": 64.29582667350769
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 3,
    "vi": 1,
    "target": [
@@ -731,12 +1101,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 6.598956108093262,
+   "solve_s": 5.337495803833008,
    "J": 0.3938987729215824,
    "t_f": 0.3000000188548515
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 3,
    "vi": 2,
    "target": [
@@ -751,10 +1121,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Error_In_Step_Computation'",
-   "solve_s": 14.719485759735107
+   "solve_s": 16.114906311035156
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 3,
    "vi": 3,
    "target": [
@@ -768,12 +1138,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 6.268076181411743,
+   "solve_s": 6.954789400100708,
    "J": 0.38257934998962223,
    "t_f": 0.30000001588204145
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 4,
    "vi": 0,
    "target": [
@@ -788,10 +1158,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 75.76591730117798
+   "solve_s": 69.61659550666809
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 4,
    "vi": 1,
    "target": [
@@ -806,10 +1176,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 96.77795696258545
+   "solve_s": 66.3352472782135
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 4,
    "vi": 2,
    "target": [
@@ -824,10 +1194,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 71.9670672416687
+   "solve_s": 67.59197902679443
   },
   {
-   "ti": 1,
+   "ti": 2,
    "si": 4,
    "vi": 3,
    "target": [
@@ -842,10 +1212,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 90.19317531585693
+   "solve_s": 70.2670750617981
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 0,
    "vi": 0,
    "target": [
@@ -860,10 +1230,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 78.07240867614746
+   "solve_s": 70.45727562904358
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 0,
    "vi": 1,
    "target": [
@@ -878,10 +1248,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 71.20787930488586
+   "solve_s": 64.43256258964539
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 0,
    "vi": 2,
    "target": [
@@ -896,10 +1266,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 94.74655818939209
+   "solve_s": 66.81161618232727
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 0,
    "vi": 3,
    "target": [
@@ -914,10 +1284,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 73.2527208328247
+   "solve_s": 70.4054925441742
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 1,
    "vi": 0,
    "target": [
@@ -932,10 +1302,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 63.931809186935425
+   "solve_s": 67.241525888443
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 1,
    "vi": 1,
    "target": [
@@ -949,12 +1319,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 88.4541642665863,
+   "solve_s": 59.806965827941895,
    "J": 0.4004296246202307,
    "t_f": 0.30000000588426723
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 1,
    "vi": 2,
    "target": [
@@ -969,10 +1339,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 73.42659640312195
+   "solve_s": 69.89833045005798
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 1,
    "vi": 3,
    "target": [
@@ -986,12 +1356,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 6.129878759384155,
+   "solve_s": 8.950623750686646,
    "J": 0.4096843527575319,
    "t_f": 0.2999999951984354
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 2,
    "vi": 0,
    "target": [
@@ -1005,12 +1375,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 7.133281946182251,
+   "solve_s": 6.495572566986084,
    "J": 0.39726000102439496,
    "t_f": 0.30000000236004887
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 2,
    "vi": 1,
    "target": [
@@ -1024,12 +1394,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 7.976399183273315,
+   "solve_s": 7.948210000991821,
    "J": 0.4078629291249556,
    "t_f": 0.3000000113757162
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 2,
    "vi": 2,
    "target": [
@@ -1043,12 +1413,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 13.156616449356079,
+   "solve_s": 8.36560869216919,
    "J": 0.40786288254866376,
    "t_f": 0.3000000066398411
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 2,
    "vi": 3,
    "target": [
@@ -1062,12 +1432,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 13.131016254425049,
+   "solve_s": 7.7049031257629395,
    "J": 0.3972599555940657,
    "t_f": 0.29999999485402357
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 3,
    "vi": 0,
    "target": [
@@ -1082,10 +1452,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 87.72647643089294
+   "solve_s": 69.59132957458496
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 3,
    "vi": 1,
    "target": [
@@ -1100,10 +1470,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Infeasible_Problem_Detected'",
-   "solve_s": 25.73829436302185
+   "solve_s": 20.12789225578308
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 3,
    "vi": 2,
    "target": [
@@ -1118,10 +1488,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Maximum_Iterations_Exceeded'",
-   "solve_s": 67.68426012992859
+   "solve_s": 73.79618859291077
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 3,
    "vi": 3,
    "target": [
@@ -1136,10 +1506,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Infeasible_Problem_Detected'",
-   "solve_s": 7.246011257171631
+   "solve_s": 10.761021614074707
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 4,
    "vi": 0,
    "target": [
@@ -1153,12 +1523,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 5.123635530471802,
+   "solve_s": 8.257630586624146,
    "J": 0.39831361082344474,
    "t_f": 0.30000000033551794
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 4,
    "vi": 1,
    "target": [
@@ -1172,12 +1542,12 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 7.879597187042236,
+   "solve_s": 6.4590349197387695,
    "J": 0.3992194636687254,
    "t_f": 0.30000000458978443
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 4,
    "vi": 2,
    "target": [
@@ -1192,10 +1562,10 @@
    ],
    "ok": false,
    "why": "solve RuntimeError: Error in Opti::solve [OptiNode] at .../casadi/core/optistack.cpp:217:\n.../casadi/core/optistack_internal.cpp:1338: Assertion \"return_success(accept_limit)\" failed:\nSolver failed. You may use opti.debug.value to investigate the latest values of variables. return_status is 'Error_In_Step_Computation'",
-   "solve_s": 25.27755045890808
+   "solve_s": 22.92176842689514
   },
   {
-   "ti": 2,
+   "ti": 3,
    "si": 4,
    "vi": 3,
    "target": [
@@ -1209,7 +1579,7 @@
     0.162
    ],
    "ok": true,
-   "solve_s": 8.302636861801147,
+   "solve_s": 5.700904369354248,
    "J": 0.3983136151290485,
    "t_f": 0.3000000007370182
   }
@@ -1218,100 +1588,100 @@
   {
    "ok": true,
    "why": null,
-   "warm_s": 5.35696268081665,
+   "warm_s": 5.6374430656433105,
    "dxyz": [
     0.03,
     -0.02,
     0.0
    ],
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
-   "J": 0.8825564242878502
+   "J": 1.7909000487142654
   },
   {
    "ok": true,
    "why": null,
-   "warm_s": 5.573470592498779,
+   "warm_s": 6.212226390838623,
    "dxyz": [
     -0.02,
     0.04,
     0.01
    ],
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
-   "J": 0.8068302468147825
+   "J": 1.5702335529803677
   },
   {
    "ok": true,
    "why": null,
-   "warm_s": 4.387850761413574,
+   "warm_s": 5.920970916748047,
    "dxyz": [
     0.03,
     -0.02,
     0.0
    ],
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
-   "J": 0.8775802374700141
+   "J": 1.6257704491803082
   },
   {
    "ok": true,
    "why": null,
-   "warm_s": 4.581516981124878,
+   "warm_s": 5.666330099105835,
    "dxyz": [
     -0.02,
     0.04,
     0.01
    ],
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
-   "J": 0.8017094437412644
+   "J": 1.5341504578782967
   },
   {
    "ok": true,
    "why": null,
-   "warm_s": 5.195937633514404,
+   "warm_s": 5.0351173877716064,
    "dxyz": [
     0.03,
     -0.02,
     0.0
    ],
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
-   "J": 0.895740872714653
+   "J": 1.6560198709793483
   },
   {
    "ok": true,
    "why": null,
-   "warm_s": 5.158091068267822,
+   "warm_s": 5.4583740234375,
    "dxyz": [
     -0.02,
     0.04,
     0.01
    ],
    "target": [
-    1.1,
-    -0.25,
-    0.162
+    1.6,
+    0.0,
+    0.0
    ],
-   "J": 0.8210002854432046
+   "J": 1.5685739890128365
   }
  ],
- "n_entries": 9,
- "total_s": 350.9
+ "n_entries": 16,
+ "total_s": 340.6
 }

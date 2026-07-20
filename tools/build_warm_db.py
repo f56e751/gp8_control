@@ -42,7 +42,8 @@ DB_PATH = SKILLS_DIR / "warm_db.pkl"
 #  - 벨트 fallback z 0.132 = GRASP_Z + DETECTION_OFFSET_AIM(0.07, perception/extrinsics.py)
 #  - 벨트 밴드 x = REFERENCE_X_BASE(0.45) ± WORKSPACE_X_ABS(0.2) (캘리브레이션)
 TARGETS: list[tuple[float, float, float]] = [
-    (1.10, -0.25, 0.162),   # 던지기 bin (설정 XY + bin 조준 컨벤션 z)
+    (1.60, 0.00, 0.0),      # metal bin (운영자 실측 2026-07-20, 바닥 높이)
+    (1.20, 0.00, 0.0),      # transparent(페트병) bin (운영자 실측 2026-07-20)
     (0.45, -0.40, 0.132),   # 벨트 중앙선 downstream fallback 조준점
     (0.55, -0.30, 0.132),   # 벨트 밴드 가장자리 downstream fallback 조준점
 ]
