@@ -95,6 +95,59 @@ class TrackedObjectQueue:
     def pop_head(self) -> TrackedObject:
         return self._objects.pop(0)
 
+    def merge_duplicates(self, now: float, v: float, eps_x: float,
+                         eps_y_fn, logger=None) -> int:
+        """Collapse tracks that are the same physical object; return how many
+        were removed.
+
+        The detector emits no per-object identity, so intake dedups each new
+        detection against the existing tracks. That cannot repair a duplicate
+        which already exists — and one appears whenever a track goes
+        un-refreshed long enough for its dead-reckoned Y to leave the match
+        window (the main loop does not ingest while a pick/throw trajectory is
+        streaming), or when the detector's centroid jumps along a long object.
+        The stale twin then coasts down the belt and the arm picks empty space.
+
+        Objects are compared at a common time ``now`` (belt travels -Y).
+        ``eps_y_fn(age, v)`` supplies the belt-direction window for the older of
+        the pair, matching the intake policy. The FRESHEST-anchored track of a
+        pair survives (its pose was confirmed most recently) and absorbs the
+        other's class votes, so a merge never loses classification evidence.
+        """
+        if len(self._objects) < 2:
+            return 0
+        merged = 0
+        kept: list[TrackedObject] = []
+        # Freshest first: the survivor of each pair is the best-anchored one.
+        for obj in sorted(self._objects, key=lambda o: -o.detect_time):
+            oy = float(obj.T_grasp_base[1, 3]) - v * (now - obj.detect_time)
+            ox = float(obj.T_grasp_base[0, 3])
+            twin = None
+            for k in kept:
+                ky = float(k.T_grasp_base[1, 3]) - v * (now - k.detect_time)
+                kx = float(k.T_grasp_base[0, 3])
+                age = max(now - obj.detect_time, now - k.detect_time)
+                if abs(kx - ox) < eps_x and abs(ky - oy) < eps_y_fn(age, v):
+                    twin = k
+                    break
+            if twin is None:
+                kept.append(obj)
+                continue
+            for cls, w in obj.class_votes.items():
+                twin.class_votes[cls] = twin.class_votes.get(cls, 0.0) + w
+            if twin.class_votes:
+                twin.class_name = max(twin.class_votes, key=twin.class_votes.get)
+            merged += 1
+            if logger is not None:
+                logger.warn(
+                    f"[track-MERGE] duplicate id={obj.track_id} folded into "
+                    f"id={twin.track_id} (same object at y={oy:+.3f}; "
+                    f"class -> {twin.class_name})"
+                )
+        if merged:
+            self._objects = kept
+        return merged
+
     def update(self, now: float, conveyor_speed: float) -> None:
         """Drop anything past the pick line (drop_below_y), then sort by current Y.
 

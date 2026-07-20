@@ -139,13 +139,38 @@ class Config:
 
     # Loop cooldown
     TIME_STEP: float = 1.0 / 25.0
-    FRAME_COOLDOWN_DISTANCE: float = 0.8
+    FRAME_COOLDOWN_DISTANCE: float = 0.85
 
     # Spatial-dedup threshold for intake. A new detection within this
     # radius of an existing tracked object is treated as the same physical
     # object (so successive camera frames re-detecting it don't enqueue
     # duplicates). 5 cm covers typical position noise.
     OBJECT_MATCH_EPSILON: float = 0.05
+
+    # Belt-direction (Y) dedup tolerance GROWTH per second of dead reckoning,
+    # as a fraction of belt speed. A track that hasn't been re-detected for
+    # `age` seconds has been extrapolated by v*age, and the belt-speed estimate
+    # is only good to a few percent — so its predicted Y is uncertain by
+    # ~OBJECT_MATCH_DRIFT_FRAC * v * age. Without this the fixed 5 cm window is
+    # exceeded whenever the main loop is busy dispatching a multi-second
+    # trajectory (no intake runs during it), and the SAME object re-spawns as a
+    # second track at its true position. Across-belt (X) needs no growth term —
+    # the object doesn't drift sideways. 0.25 = tolerate a 25% belt-speed error.
+    OBJECT_MATCH_DRIFT_FRAC: float = 0.25
+    # Hard cap on that grown Y window [m], so a very stale track can't swallow a
+    # genuinely different object further down the belt. Generous is safe here:
+    # the first detection re-anchors the stale track (age -> 0), so every OTHER
+    # detection in the same frame is matched against the tight base window —
+    # two objects in one frame stay separate as long as they are > eps apart.
+    OBJECT_MATCH_EPS_Y_MAX: float = 0.20
+    # Cap for the queue MERGE pass, which is deliberately TIGHTER than the
+    # intake cap above. Intake compares a fresh camera detection against a
+    # prediction (the detection is ground truth, so a wide window is safe);
+    # merging compares two PREDICTIONS with no new evidence, so a wide window
+    # there would delete a genuinely separate object. 10 cm still catches a
+    # drift-spawned twin (~8 cm after a 4 s loop stall) while keeping objects
+    # spaced a normal belt gap apart distinct.
+    OBJECT_MERGE_EPS_Y_MAX: float = 0.10
 
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
     # whose ETA < move_time * factor — i.e. objects that will reach the

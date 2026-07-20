@@ -59,9 +59,38 @@ class DetectionIntake:
     same one.
     """
 
-    def __init__(self, eps: float) -> None:
+    def __init__(self, eps: float, drift_frac: float = 0.25,
+                 eps_y_max: float = 0.20, merge_eps_y_max: float = 0.10) -> None:
         #: spatial match radius [m] — OBJECT_MATCH_EPSILON on the app Config.
         self.eps = eps
+        #: belt-direction tolerance growth per second of dead reckoning, as a
+        #: fraction of belt speed (Config.OBJECT_MATCH_DRIFT_FRAC).
+        self.drift_frac = drift_frac
+        #: cap on the grown Y window [m] (Config.OBJECT_MATCH_EPS_Y_MAX).
+        self.eps_y_max = eps_y_max
+        #: tighter cap for the merge pass (Config.OBJECT_MERGE_EPS_Y_MAX).
+        self.merge_eps_y_max = merge_eps_y_max
+
+    def _grown_eps_y(self, age: float, v: float, cap: float) -> float:
+        """Belt-direction window for a track last seen ``age`` s ago.
+
+        Grows with the dead-reckoned distance because the belt-speed estimate
+        carries a few-percent error: a track un-refreshed for seconds (the main
+        loop is blocked while a pick/throw trajectory streams) is predicted at
+        v*age downstream with ~drift_frac*v*age of uncertainty. A fixed window
+        makes that track fail to match its own re-detection → duplicate spawn.
+        """
+        return min(self.eps + self.drift_frac * abs(v) * max(age, 0.0), cap)
+
+    def _eps_y(self, age: float, v: float) -> float:
+        """Window for matching a fresh DETECTION to a track (generous — the
+        detection is ground truth)."""
+        return self._grown_eps_y(age, v, self.eps_y_max)
+
+    def _eps_y_merge(self, age: float, v: float) -> float:
+        """Window for merging two TRACKS (tight — both sides are predictions
+        with no fresh evidence, so a wide window would delete a real object)."""
+        return self._grown_eps_y(age, v, self.merge_eps_y_max)
 
     def ingest(
         self,
@@ -104,9 +133,11 @@ class DetectionIntake:
         eps = self.eps
 
         def _matches(obj: TrackedObject, det_x: float, det_y: float) -> bool:
+            age = detect_time - obj.detect_time
             ox = float(obj.T_grasp_base[0, 3])
-            oy = float(obj.T_grasp_base[1, 3] - v * (detect_time - obj.detect_time))
-            return abs(ox - det_x) < eps and abs(oy - det_y) < eps
+            oy = float(obj.T_grasp_base[1, 3] - v * age)
+            return (abs(ox - det_x) < eps
+                    and abs(oy - det_y) < self._eps_y(age, v))
 
         added = 0
         refreshed = 0
@@ -166,6 +197,18 @@ class DetectionIntake:
                     f"x={det_x:+.3f} y={det_y:+.3f} conf={conf:.2f}"
                 )
             added += 1
+
+        # Safety net: collapse tracks that are the same physical object. The
+        # per-detection dedup above only compares a NEW detection against the
+        # existing tracks; it cannot undo a duplicate that already slipped in
+        # (e.g. spawned while the arm was mid-pick and the loop wasn't
+        # ingesting, or from a detector centroid that jumped along a long
+        # object). Without this the stale twin coasts down the belt and the arm
+        # picks at empty space.
+        merged = queue.merge_duplicates(
+            detect_time, v, self.eps, self._eps_y_merge, logger=logger,
+        )
+        added = max(0, added - merged)
 
         if added > 0 and logger is not None:
             logger.info(

@@ -114,7 +114,12 @@ class GP8App:
             self.cfg.MAX_REACH, drop_below_y=-self.cfg.MAX_REACH,
         )
         self.frame_gate = FrameGate(self.cfg.FRAME_COOLDOWN_DISTANCE)
-        self.detection_intake = DetectionIntake(self.cfg.OBJECT_MATCH_EPSILON)
+        self.detection_intake = DetectionIntake(
+            self.cfg.OBJECT_MATCH_EPSILON,
+            drift_frac=self.cfg.OBJECT_MATCH_DRIFT_FRAC,
+            eps_y_max=self.cfg.OBJECT_MATCH_EPS_Y_MAX,
+            merge_eps_y_max=self.cfg.OBJECT_MERGE_EPS_Y_MAX,
+        )
 
     # ------------------------------------------------------------------
     # Setup
