@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Move to a requested TCP Z, enable suction, and hold until operator release.
+"""Move via a raised TCP Z, enable suction at target, and hold until release.
 
-By default only world/base Z changes: the current TCP X/Y and orientation are
-preserved.  Optional --x/--y override the planar target.  This is a supervised
-real-robot debug command; Enter or Ctrl-C always requests suction OFF.
+The robot first reaches ``--via-z`` (default base Z=0.200 m) at the current
+TCP X/Y, then moves to the requested target.  The current TCP orientation is
+preserved throughout.  Optional --x/--y override the final planar target.  This
+is a supervised real-robot debug command; Enter or Ctrl-C always requests
+suction OFF.
 """
 
 from __future__ import annotations
@@ -35,8 +37,12 @@ def main() -> None:
         help="target TCP Y [m] (default: current TCP Y)",
     )
     parser.add_argument(
-        "--vel-scale", type=float, default=0.10,
-        help="joint velocity scale for the positioning move (default 0.10)",
+        "--via-z", type=float, default=0.200,
+        help="intermediate TCP Z in base frame [m] (default 0.200)",
+    )
+    parser.add_argument(
+        "--vel-scale", type=float, default=0.30,
+        help="joint velocity scale for the positioning move (default 0.30)",
     )
     parser.add_argument(
         "--plan-only", action="store_true",
@@ -44,10 +50,10 @@ def main() -> None:
     )
     args, _ros_unknown = parser.parse_known_args()
 
-    for name in ("z", "x", "y"):
+    for name in ("z", "x", "y", "via_z"):
         value = getattr(args, name)
         if value is not None and not math.isfinite(value):
-            parser.error(f"--{name} must be finite")
+            parser.error(f"--{name.replace('_', '-')} must be finite")
     if not 0.0 < args.vel_scale <= 1.0:
         parser.error("--vel-scale must be in (0, 1]")
 
@@ -83,23 +89,35 @@ def main() -> None:
         gp8 = GP8()
         current_q = np.asarray(ctrl.current_joints, dtype=float)
         current_T = gp8.forward_kinematics(current_q)
+        via_T = current_T.copy()
+        via_T[2, 3] = float(args.via_z)
         target_T = current_T.copy()
         target_T[0, 3] = current_T[0, 3] if args.x is None else float(args.x)
         target_T[1, 3] = current_T[1, 3] if args.y is None else float(args.y)
         target_T[2, 3] = float(args.z)
 
-        target_q = gp8.inverse_kinematics(target_T, q_init=current_q)
+        via_q = gp8.inverse_kinematics(via_T, q_init=current_q)
+        if via_q is None:
+            parser.error("via IK failed; change --via-z")
+        via_q = np.asarray(via_q, dtype=float)
+        target_q = gp8.inverse_kinematics(target_T, q_init=via_q)
         if target_q is None:
             parser.error(
                 "target IK failed; change --z or provide reachable --x/--y"
             )
         target_q = np.asarray(target_q, dtype=float)
+        solved_via_T = gp8.forward_kinematics(via_q)
         solved_T = gp8.forward_kinematics(target_q)
 
         print("\n=== Suction Hold-at-Z Plan ===")
         print(
             "  current TCP : "
             f"({current_T[0,3]:+.4f}, {current_T[1,3]:+.4f}, {current_T[2,3]:+.4f}) m"
+        )
+        print(
+            "  via TCP     : "
+            f"({solved_via_T[0,3]:+.4f}, {solved_via_T[1,3]:+.4f}, "
+            f"{solved_via_T[2,3]:+.4f}) m"
         )
         print(
             "  target TCP  : "
@@ -117,23 +135,29 @@ def main() -> None:
             print("취소.")
             return
 
-        # Start from a known-safe output state, then move at a low joint-speed scale.
+        # Start from a known-safe output state, rise to the waypoint, and only
+        # then approach the requested suction target.
         suction_io_used = True
         ctrl.suction_off()
-        if np.max(np.abs(target_q - current_q)) > 1e-6:
-            limits = np.asarray(gp8.velocity_limits, dtype=float) * args.vel_scale
-            accelerations = limits * JOINT_ACCEL_RATIO
-            zero = np.zeros(6, dtype=float)
+        limits = np.asarray(gp8.velocity_limits, dtype=float) * args.vel_scale
+        accelerations = limits * JOINT_ACCEL_RATIO
+        zero = np.zeros(6, dtype=float)
+
+        def move_segment(q_start: np.ndarray, q_end: np.ndarray, label: str) -> None:
+            if np.max(np.abs(q_end - q_start)) <= 1e-6:
+                print(f"→ {label}: 이미 해당 위치입니다.")
+                return
             q_traj, q_vel, ts = trajectory(
-                current_q, zero, target_q, zero,
+                q_start, zero, q_end, zero,
                 limits, accelerations, hertz=100.0,
             )
-            print(f"→ 목표 위치로 이동 ({ts[-1]:.2f}s)...")
+            print(f"→ {label} ({ts[-1]:.2f}s)...")
             ctrl.send_trajectory_queue(
-                q_traj, q_vel, ts, final_joint=target_q,
+                q_traj, q_vel, ts, final_joint=q_end,
             )
-        else:
-            print("→ 이미 목표 위치입니다.")
+
+        move_segment(current_q, via_q, f"경유 Z={args.via_z:.4f}m로 이동")
+        move_segment(via_q, target_q, f"목표 Z={args.z:.4f}m로 이동")
 
         ctrl.suction_on()
         print("→ 석션 ON. 현재 자세에서 유지합니다.")

@@ -132,6 +132,14 @@ def generate_launch_description():
         default_value=EnvironmentVariable("GP8_MIN_SUCTION_HOLD", default_value="0.3"),
         description="Guaranteed parked suction hold before throw lift [s] (MIN_SUCTION_HOLD).",
     )
+    # Absolute base-frame TCP Z where throw/pick parks and primes suction.
+    # `grasp_z:=0.0615` allows millimetre-level contact calibration without a
+    # rebuild; omitted -> shell GP8_GRASP_Z, else Config default 0.062 m.
+    grasp_z_arg = DeclareLaunchArgument(
+        "grasp_z",
+        default_value=EnvironmentVariable("GP8_GRASP_Z", default_value="0.062"),
+        description="Throw/pick suction wait TCP Z in base frame [m] (GRASP_Z).",
+    )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
     # the included adv4ncr stack's robot_state_publisher and by move_group
@@ -287,6 +295,8 @@ def generate_launch_description():
             "GP8_RELEASE_LEAD": LaunchConfiguration("release_lead"),
             # Guaranteed parked suction hold: `min_suction_hold:=` -> GP8_MIN_SUCTION_HOLD.
             "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
+            # Throw/pick suction wait height: `grasp_z:=` -> GP8_GRASP_Z.
+            "GP8_GRASP_Z": LaunchConfiguration("grasp_z"),
         },
     )
 
@@ -300,6 +310,7 @@ def generate_launch_description():
         acc_factor_arg,
         release_lead_arg,
         min_suction_hold_arg,
+        grasp_z_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,

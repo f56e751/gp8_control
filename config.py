@@ -76,7 +76,9 @@ class Config:
     # to 0.062 for firmer contact.
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
-    GRASP_Z: float = 0.062
+    GRASP_Z: float = field(             # [m] env GP8_GRASP_Z / launch grasp_z:=
+        default_factory=lambda: float(os.environ.get("GP8_GRASP_Z", "0.062"))
+    )
     # CAP on how early suction primes, now that priming is POSITION-triggered
     # (position_and_prime fires at max(cup-parked, arrival - SUCTION_LEAD)). The cup
     # is always parked at the grasp before suction fires; this only bounds how far
