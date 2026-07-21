@@ -236,6 +236,7 @@ def generate_launch_description():
                 "launch", "move_group.launch.py",
             ])
         ]),
+        condition=IfCondition(LaunchConfiguration("moveit")),
     )
 
     # =====================================================================
@@ -319,9 +320,28 @@ def generate_launch_description():
         if k not in os.environ:
             app_env[k] = v
 
+    # `app:=false` — 드라이버 스택(adv4ncr + JTC inactive + MoveIt)만 띄우고
+    # gp8_manager 앱은 생략. 정적 테스트(tests/static_pick_throw.py)나 디버그
+    # 도구처럼 JointGroupPositionController에 직접 명령을 쓰는 프로세스는 앱과
+    # 동시에 돌 수 없으므로 이 모드로 bringup 한다.
+    app_arg = DeclareLaunchArgument(
+        "app",
+        default_value="true",
+        description="Run the gp8_manager app (false = driver stack only, for tests).",
+    )
+    # MoveIt(move_group)도 선택화: 정적 테스트/디버그 도구는 JTC 액션 + 250Hz
+    # 스트림 + 자체 IK만 쓰므로 move_group이 필요 없다 (그리고 move_group이
+    # 죽어도 테스트에는 지장이 없다).
+    moveit_arg = DeclareLaunchArgument(
+        "moveit",
+        default_value="true",
+        description="Run MoveIt move_group (false = skip; tests don't need it).",
+    )
+
     gp8_app = ExecuteProcess(
         cmd=[_venv_python, "-m", "gp8_control.app"],
         output="screen",
+        condition=IfCondition(LaunchConfiguration("app")),
         additional_env={
             **app_env,
             # Throw suction-release lead: `release_lead:=` launch arg (falling back
@@ -364,6 +384,8 @@ def generate_launch_description():
         min_suction_hold_arg,
         grasp_z_arg,
         skill_arg,
+        app_arg,
+        moveit_arg,
         rviz_arg,
         throw_viz_impact_z_arg,
         throw_goal_x_arg,
