@@ -96,18 +96,35 @@ class Config:
     # end = GRASP_Z. So an un-flagged run descends the hover height onto the normal
     # grasp plane. TRACK_Z_SPEED <= 0 DISABLES tracking and restores the old parked
     # WAIT_AT_GRASP pick.
-    TRACK_Z_START: float = field(       # [m] env GP8_TRACK_Z_START (NaN -> GRASP_Z + TRACK_Z_HOVER)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "nan"))
+    # Defaults below are the values that tracked best on HW at belt 0.223 m/s
+    # (start 0.12 / end 0.03 / speed 0.2). Pass "nan" to restore the derive-from-
+    # GRASP_Z behaviour (start = GRASP_Z + TRACK_Z_HOVER, end = GRASP_Z).
+    TRACK_Z_START: float = field(       # [m] env GP8_TRACK_Z_START ("nan" -> GRASP_Z + TRACK_Z_HOVER)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "0.12"))
     )
-    TRACK_Z_END: float = field(         # [m] env GP8_TRACK_Z_END (NaN -> GRASP_Z)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "nan"))
+    TRACK_Z_END: float = field(         # [m] env GP8_TRACK_Z_END ("nan" -> GRASP_Z)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "0.03"))
     )
     TRACK_Z_SPEED: float = field(       # [m/s] env GP8_TRACK_Z_SPEED (<=0 disables tracking)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.10"))
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.2"))
     )
     # Hover height above GRASP_Z used when TRACK_Z_START is left at NaN. Also the
     # clearance the parked cup keeps over an approaching object before the descend.
     TRACK_Z_HOVER: float = 0.05         # [m]
+    # Extra lead added to the TRACK_DESCEND arrival_lead: start the follow+descend
+    # this many seconds EARLIER. The follow is open-loop parallel tracking at belt
+    # speed, so any lag in when it PHYSICALLY starts (dispatch/settle latency)
+    # persists as a fixed downstream offset — the cup lands that far BEHIND the
+    # object. Dialing this up starts the descend earlier and cancels that offset.
+    # Empirical knob: observed miss d[m] at belt v[m/s] ~= TRACK_LEAD_T*v, so start
+    # with TRACK_LEAD_T ~= d/v (e.g. 5 cm behind at 0.10 m/s -> ~0.5). Positive =
+    # earlier; too large lands the cup ahead of a late object. Only applied in
+    # TRACK_DESCEND (see ThrowSkill.arrival_lead). env/launch/CLI overridable.
+    # Default 0.3 tracked best on HW at belt 0.223 m/s.
+    #   GP8_TRACK_LEAD_T / track_lead_t:= / --track-lead-t   [s]
+    TRACK_LEAD_T: float = field(        # [s] env GP8_TRACK_LEAD_T
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_LEAD_T", "0.3"))
+    )
     # CAP on how early suction primes, now that priming is POSITION-triggered
     # (position_and_prime fires at max(cup-parked, arrival - SUCTION_LEAD)). The cup
     # is always parked at the grasp before suction fires; this only bounds how far

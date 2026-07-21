@@ -124,6 +124,10 @@ class ThrowSkill(ManipulationSkill):
         lead = super().arrival_lead()
         if self._track_z_params() is not None:
             lead += 0.5 * TRACK_ACCEL_T
+            # Empirical timing knob: start the follow+descend TRACK_LEAD_T earlier
+            # to cancel a fixed downstream landing offset (the object leading the
+            # cup at touchdown). See Config.TRACK_LEAD_T.
+            lead += float(self.ctx.cfg.TRACK_LEAD_T)
         return lead
 
     # ------------------------------------------------------------------
@@ -309,12 +313,24 @@ class ThrowSkill(ManipulationSkill):
                         f"{float(track[2][-1]):.2f}s"
                     )
 
-        # Drive to the wait pose and prime suction SUCTION_LEAD before the object's
-        # arrival. Returns arrival_lead() before the object reaches the intercept.
+        # Drive to the wait pose and (for the parked pick) prime suction SUCTION_LEAD
+        # before the object's arrival. Returns arrival_lead() before the object
+        # reaches the intercept.
+        #
+        # TRACK_DESCEND (track is not None): do NOT prime at the hover. The wait pose
+        # is TRACK_Z_START above the object, so an early prime there runs the vacuum
+        # in air for SUCTION_LEAD-arrival_lead (~0.43 s) while the arm sits STILL,
+        # before the descend even starts — the stationary suction-on gap. Instead
+        # park silently and fire suction AS the descend begins (below), so the vacuum
+        # forms DURING the descent motion and there is no still period. The descend's
+        # Z-landing takes (z_start-z_end)/v_desc (~0.5 s at defaults), which is the
+        # vacuum-formation window SUCTION_LEAD used to buy while parked. WAIT_AT_GRASP
+        # / fallback (track is None) keeps the original parked prime.
         ctx.set_status("POSITIONING", target.class_name)
         ctx.position_and_prime(
             current_joint, aim_joint, wait_joint, target, T_grasp[1, 3],
             start_lead=self.arrival_lead(),
+            prime_suction=(track is None),
         )
 
         # DIAGNOSTIC: object vs intercept at the instant the lift/throw fires.
@@ -329,6 +345,13 @@ class ThrowSkill(ManipulationSkill):
             # so the cup is down on the object, at rest, when it returns.
             t_traj, t_vel, t_ts = track
             q_end = t_traj[:, -1]
+            # Fire suction AS the descend starts — NOT parked high above it. suction_on()
+            # only enqueues on the IO worker and returns immediately, so the descend
+            # dispatch follows with no stationary gap: the vacuum forms while the cup
+            # is already moving down onto the object and is fully pulled by the time it
+            # settles at z_end (see the prime_suction=False rationale above).
+            ctx.traj_ctrl.suction_on()
+            ctx.log_suction_on(target)
             ctx.traj_ctrl.send_trajectory_queue(
                 t_traj, t_vel, t_ts, final_joint=q_end,
             )

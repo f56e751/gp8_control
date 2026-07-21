@@ -646,6 +646,15 @@ def main(argv=None) -> None:
             "Default: GP8_TRACK_Z_SPEED, else 0.10."
         ),
     )
+    parser.add_argument(
+        "--track-lead-t", type=float, default=None, metavar="S",
+        help=(
+            "Throw pick: start the belt-tracking follow+descend this many seconds "
+            "EARLIER, to cancel a fixed downstream landing offset (object leading "
+            "the cup at touchdown). ~= observed_miss[m] / belt[m/s]. "
+            "Default: GP8_TRACK_LEAD_T, else 0.0."
+        ),
+    )
     # parse_known_args so ROS 2 / ros2 launch-injected args (e.g. --ros-args)
     # pass through harmlessly instead of erroring out.
     args, _ = parser.parse_known_args(argv)
@@ -659,6 +668,8 @@ def main(argv=None) -> None:
         cfg.TRACK_Z_END = args.track_z_end
     if args.track_z_speed is not None:
         cfg.TRACK_Z_SPEED = args.track_z_speed
+    if args.track_lead_t is not None:
+        cfg.TRACK_LEAD_T = args.track_lead_t
 
     app = GP8App(cfg)
     app.run()

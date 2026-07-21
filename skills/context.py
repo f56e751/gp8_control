@@ -433,6 +433,7 @@ class SkillContext:
         target: "TrackedObject",
         intercept_y: float,
         start_lead: "Optional[float]" = None,
+        prime_suction: bool = True,
     ) -> bool:
         """Drive to the grasp pose, then POSITION-PRIME suction: fire it only once
         the cup is PARKED at the grasp, capped at SUCTION_LEAD before arrival.
@@ -451,6 +452,12 @@ class SkillContext:
         The adv4ncr 250 Hz stream (<10 ms command->motion) makes "fire when parked"
         land within a stream tick of the grasp. Returns once the object has reached
         the intercept (caller then lifts/throws).
+
+        ``prime_suction=False`` skips the suction entirely (still parks + waits +
+        returns at ``arrival - start_lead``). TRACK_DESCEND passes this because its
+        wait pose is a HOVER above the object: priming at the hover would run the
+        vacuum in air for ~SUCTION_LEAD before the descend starts (a stationary
+        suction-on gap). That caller fires suction as the descend begins instead.
         """
         now = time.time()
         v = self.conveyor.current
@@ -493,13 +500,18 @@ class SkillContext:
         #    never before the cup is down (now = just parked), never more than
         #    SUCTION_LEAD early. Backed-up object -> ~now; slack pick -> waits until
         #    SUCTION_LEAD before arrival.
+        #    prime_suction=False (TRACK_DESCEND): the wait pose is a HOVER above the
+        #    object, not the grasp, so priming here would run the vacuum in air for
+        #    ~SUCTION_LEAD before the descend even starts (the stationary suction-on
+        #    gap). That caller instead fires suction AS the descend begins.
         self.set_status("WAITING", getattr(target, "class_name", ""))
-        t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
-        self.sleep_until(t_suction)
-        self.traj_ctrl.suction_on()
-        # DIAGNOSTIC: object's calculated position vs the EE's actual position at
-        # the instant suction fired (see log_suction_on).
-        self.log_suction_on(target)
+        if prime_suction:
+            t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
+            self.sleep_until(t_suction)
+            self.traj_ctrl.suction_on()
+            # DIAGNOSTIC: object's calculated position vs the EE's actual position at
+            # the instant suction fired (see log_suction_on).
+            self.log_suction_on(target)
 
         # 3) End the wait `start_lead` s before predicted arrival so the post-wait
         #    trajectory dispatch overlaps the object's final approach and the lift

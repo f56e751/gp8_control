@@ -146,20 +146,28 @@ def generate_launch_description():
     # track_z_end at track_z_speed. "nan" (default) derives the heights from grasp_z
     # (start = grasp_z + 0.05, end = grasp_z); track_z_speed:=0 disables tracking and
     # restores the old parked wait-at-grasp pick.
+    # track_z_* / track_lead_t defaults below are the values that tracked best on
+    # HW at belt 0.223 m/s. Pass "nan" to restore the derive-from-grasp_z heights.
     track_z_start_arg = DeclareLaunchArgument(
         "track_z_start",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="nan"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="0.12"),
         description="Throw pick: TCP Z the descend starts from [m] (nan -> grasp_z + 0.05).",
     )
     track_z_end_arg = DeclareLaunchArgument(
         "track_z_end",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="nan"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.03"),
         description="Throw pick: TCP Z the descend ends at [m] (nan -> grasp_z).",
     )
     track_z_speed_arg = DeclareLaunchArgument(
         "track_z_speed",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_SPEED", default_value="0.10"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_SPEED", default_value="0.2"),
         description="Throw pick: descend rate while tracking the belt [m/s] (<=0 disables).",
+    )
+    track_lead_t_arg = DeclareLaunchArgument(
+        "track_lead_t",
+        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.3"),
+        description="Throw pick: start the tracking descend this many s EARLIER to "
+                    "cancel a downstream landing offset (~= miss[m]/belt[m/s]).",
     )
     # Pin every object to ONE manipulation skill for this run:
     # `skill:=throw|robust_throw|push`. Empty (default) = normal per-class
@@ -375,6 +383,8 @@ def generate_launch_description():
             "GP8_TRACK_Z_START": LaunchConfiguration("track_z_start"),
             "GP8_TRACK_Z_END": LaunchConfiguration("track_z_end"),
             "GP8_TRACK_Z_SPEED": LaunchConfiguration("track_z_speed"),
+            # Throw pick descend timing lead: `track_lead_t:=` -> GP8_TRACK_LEAD_T.
+            "GP8_TRACK_LEAD_T": LaunchConfiguration("track_lead_t"),
             # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
             "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
             # Visualization-only impact plane; never changes robot motion.
@@ -410,6 +420,7 @@ def generate_launch_description():
         track_z_start_arg,
         track_z_end_arg,
         track_z_speed_arg,
+        track_lead_t_arg,
         skill_arg,
         app_arg,
         moveit_arg,
