@@ -79,6 +79,35 @@ class Config:
     GRASP_Z: float = field(             # [m] env GP8_GRASP_Z / launch grasp_z:=
         default_factory=lambda: float(os.environ.get("GP8_GRASP_Z", "0.062"))
     )
+    # --- Throw pick: belt-tracking descend (PickWaitMode.TRACK_DESCEND) -------
+    # The throw pick no longer waits PARKED at the grasp. It parks at TRACK_Z_START
+    # (above the belt), and on the object's arrival runs one cartesian segment that
+    # FOLLOWS the object downstream (-Y at belt speed, zero relative velocity) while
+    # the TCP Z ramps TRACK_Z_START -> TRACK_Z_END at TRACK_Z_SPEED. The cup therefore
+    # settles onto a co-moving object instead of dropping onto one that is sliding
+    # underneath it. The throw then starts from wherever that segment ended (further
+    # downstream and lower than the nominal grasp).
+    # All three are absolute base-frame quantities, env/launch/CLI overridable so they
+    # can be swept per run without a rebuild:
+    #   GP8_TRACK_Z_START / track_z_start:= / --track-z-start   [m, absolute TCP Z]
+    #   GP8_TRACK_Z_END   / track_z_end:=   / --track-z-end     [m, absolute TCP Z]
+    #   GP8_TRACK_Z_SPEED / track_z_speed:= / --track-z-speed   [m/s descent rate]
+    # NaN (the default) means "derive from GRASP_Z": start = GRASP_Z + TRACK_Z_HOVER,
+    # end = GRASP_Z. So an un-flagged run descends the hover height onto the normal
+    # grasp plane. TRACK_Z_SPEED <= 0 DISABLES tracking and restores the old parked
+    # WAIT_AT_GRASP pick.
+    TRACK_Z_START: float = field(       # [m] env GP8_TRACK_Z_START (NaN -> GRASP_Z + TRACK_Z_HOVER)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "nan"))
+    )
+    TRACK_Z_END: float = field(         # [m] env GP8_TRACK_Z_END (NaN -> GRASP_Z)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "nan"))
+    )
+    TRACK_Z_SPEED: float = field(       # [m/s] env GP8_TRACK_Z_SPEED (<=0 disables tracking)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.10"))
+    )
+    # Hover height above GRASP_Z used when TRACK_Z_START is left at NaN. Also the
+    # clearance the parked cup keeps over an approaching object before the descend.
+    TRACK_Z_HOVER: float = 0.05         # [m]
     # CAP on how early suction primes, now that priming is POSITION-triggered
     # (position_and_prime fires at max(cup-parked, arrival - SUCTION_LEAD)). The cup
     # is always parked at the grasp before suction fires; this only bounds how far

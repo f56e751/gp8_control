@@ -620,6 +620,32 @@ def main(argv=None) -> None:
             "requires casadi in .venv."
         ),
     )
+    # Throw pick belt-tracking descend (skills/throw_skill.py). The throw pick
+    # follows the object downstream at belt speed while lowering the cup from
+    # --track-z-start to --track-z-end at --track-z-speed. Omit any of them to keep
+    # the env / Config default (heights default to GRASP_Z + hover / GRASP_Z).
+    parser.add_argument(
+        "--track-z-start", type=float, default=None, metavar="M",
+        help=(
+            "Throw pick: absolute TCP Z [m] the cup waits at before the "
+            "belt-tracking descend. Default: GP8_TRACK_Z_START, else GRASP_Z + 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--track-z-end", type=float, default=None, metavar="M",
+        help=(
+            "Throw pick: absolute TCP Z [m] the belt-tracking descend ends at "
+            "(contact height). Default: GP8_TRACK_Z_END, else GRASP_Z."
+        ),
+    )
+    parser.add_argument(
+        "--track-z-speed", type=float, default=None, metavar="MPS",
+        help=(
+            "Throw pick: descent rate [m/s] during the belt-tracking follow. "
+            "<=0 disables tracking (old parked wait-at-grasp pick). "
+            "Default: GP8_TRACK_Z_SPEED, else 0.10."
+        ),
+    )
     # parse_known_args so ROS 2 / ros2 launch-injected args (e.g. --ros-args)
     # pass through harmlessly instead of erroring out.
     args, _ = parser.parse_known_args(argv)
@@ -627,6 +653,12 @@ def main(argv=None) -> None:
     cfg = Config()
     if args.skill is not None:
         cfg.FORCE_SKILL = args.skill   # CLI flag wins over the env default
+    if args.track_z_start is not None:
+        cfg.TRACK_Z_START = args.track_z_start
+    if args.track_z_end is not None:
+        cfg.TRACK_Z_END = args.track_z_end
+    if args.track_z_speed is not None:
+        cfg.TRACK_Z_SPEED = args.track_z_speed
 
     app = GP8App(cfg)
     app.run()
