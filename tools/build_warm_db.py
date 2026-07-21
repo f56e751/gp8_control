@@ -44,6 +44,8 @@ DB_PATH = SKILLS_DIR / "warm_db.pkl"
 TARGETS: list[tuple[float, float, float]] = [
     (1.60, 0.00, 0.0),      # metal bin (운영자 실측 2026-07-20, 바닥 높이)
     (1.20, 0.00, 0.0),      # transparent(페트병) bin (운영자 실측 2026-07-20)
+    (1.20, -0.20, 0.0),     # 정적 테스트 target A (run_static_pick_throw 2026-07-21)
+    (1.50, 0.30, 0.0),      # 정적 테스트 target B
     (0.45, -0.40, 0.132),   # 벨트 중앙선 downstream fallback 조준점
     (0.55, -0.30, 0.132),   # 벨트 밴드 가장자리 downstream fallback 조준점
 ]

@@ -59,8 +59,8 @@ if TYPE_CHECKING:
 
 # 플래너(throwing/throw_nlp) ↔ 로봇(robots/gp8 = 하드웨어/스트림) 관절 부호 변환.
 # GP8 PoE 축은 J3..J6 = -y,-x,-y,-x 인데 THR 체인은 +y,+x,+y,+x — 관절 3~6 부호
-# 반전. 수치 검증(2026-07-20, 300 랜덤 자세): fk_pos(S*q) vs GP8.forward_kinematics(q)
-# 오차 = 전 자세 상수 5.0mm(툴 길이 0.320 vs 0.325m 차이 — throwing.py:27 참고).
+# 반전. 수치 검증: fk_pos(S*q) vs GP8.forward_kinematics(q) 오차 0.000mm (300
+# 랜덤 자세; 2026-07-21 툴 길이 URDF 통일 후 — 구 tool=0.240 시절엔 상수 5mm).
 # S는 자기 역원(S*S=1)이라 양방향 변환에 같은 벡터를 쓴다. 이 변환 없이 플래너
 # 해를 그대로 스트리밍하면 U/R/B/T가 반전된 계획 밖 스윙이 나간다 (2026-07-20
 # 적대 리뷰 확정 — 플래너의 한계/기둥회피 보장도 로봇 규약에선 무효).

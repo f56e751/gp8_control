@@ -23,8 +23,10 @@ G_VEC = np.array([0.0, 0.0, -G])
 # datasheet 치수 (m): base→L축 높이 d1, S→L offset a1, 상완 a2,
 # U→R offset a3, 전완 d4, 손목→flange d6.  reach 검증: a1+a2+d4 ≈ 0.725 (spec 0.727)
 # tool: flange에 단 suction gripper 길이 — TCP(=물체 위치)는 그리퍼 끝
-# 0.24 = IITP URDF 확정 (gripper 로드 24cm, TCP = link6에서 0.32; 2026-07-15 교정 v2)
-GP8_DIMS = dict(d1=0.330, a1=0.040, a2=0.345, a3=0.040, d4=0.340, d6=0.080, tool=0.240)
+# 0.245 = URDF 기준 (gp8_mujoco_suction_tool.xacro: flange→suction_tool 0.245,
+# link6→grip_site 0.325 = d6 0.080 + tool 0.245). robots/gp8.py(home EE x=0.705,
+# 손목→TCP 0.325)와 동일 — 2026-07-21 통일 (구 0.240은 전 자세 상수 5mm 오프셋).
+GP8_DIMS = dict(d1=0.330, a1=0.040, a2=0.345, a3=0.040, d4=0.340, d6=0.080, tool=0.245)
 
 # GP8 hardware limits (datasheet). 실기 파라미터 확인 후 필요시 교체.
 GP8_Q_MIN = np.deg2rad([-170.0, -65.0, -113.0, -190.0, -135.0, -360.0])
