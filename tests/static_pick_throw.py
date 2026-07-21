@@ -315,8 +315,9 @@ def main() -> None:
     ap.add_argument("--target", default="1.2,0,0",
                     help='던지기 착지 목표 [m base]: "x,y,z" (전 지점 공통) 또는 '
                          '지점별 "x,y,z;x,y,z;..." (지점 수와 일치해야 함)')
-    ap.add_argument("--vel-scale", type=float, default=0.3,
-                    help="포지셔닝 이동 속도 스케일 (던지기 자체는 NLP 계획 속도)")
+    ap.add_argument("--vel-scale", type=float, default=0.03,
+                    help="던지기 외 모든 이동(접근/하강/init + lift/chain)의 속도 "
+                         "스케일 — NLP 스윙 아크 자체는 영향 없음")
     ap.add_argument("--shuffle-points", action="store_true",
                     help="지점 방문 순서를 무작위로 섞음 (target 순서는 고정 — "
                          "i번째 사이클 = 섞인 i번째 지점 + i번째 target)")
@@ -361,6 +362,9 @@ def main() -> None:
         node, traj_ctrl = _FakeNode(), _CollectorTrajCtrl()
         ctx, skill, M1, M2, idle_joint = _build_ctx_and_skill(
             cfg, robot, node, traj_ctrl)
+        # 실기와 동일 조건으로 검증: lift/chain도 vel_scale 감속 반영
+        ctx.M1 = ctx.M1 * args.vel_scale
+        ctx.M2 = ctx.M1 * cfg.JOINT_ACCEL_LIMIT_SCALE
         print(f"\n=== PLAN-ONLY: {len(points)}개 지점 (지점별 target) ===")
         ok = 0
         for i, ((x, y, z), p_target) in enumerate(zip(points, targets)):
@@ -413,8 +417,14 @@ def main() -> None:
 
         ctx, skill, M1, M2, idle_joint = _build_ctx_and_skill(
             cfg, robot, node, traj_ctrl)
-        pos_M1 = M1 * args.vel_scale          # 포지셔닝 전용 감속 한계
-        pos_M2 = pos_M1 * cfg.JOINT_ACCEL_LIMIT_SCALE
+        # 던지기 외 전부 감속: 접근/하강/init 이동(pos_M1)뿐 아니라, 던지기
+        # 궤적에 포함되는 lift(프레스→스윙 시작)·chain(스윙 후 park) 세그먼트도
+        # ctx.M1로 만들어지므로 함께 vel_scale로 줄인다. NLP 스윙 아크는 solver
+        # 자체 한계로 계획되고 lift/chain은 정지-정지 세그먼트라 감속해도
+        # 던지기(스윙 속도/release/착지)에는 영향이 없다.
+        ctx.M1 = ctx.M1 * args.vel_scale
+        ctx.M2 = ctx.M1 * cfg.JOINT_ACCEL_LIMIT_SCALE
+        pos_M1, pos_M2 = ctx.M1, ctx.M2
         zero6 = np.zeros(6)
 
         # ---------- 시작: init(idle) 자세로 먼저 이동 ----------
