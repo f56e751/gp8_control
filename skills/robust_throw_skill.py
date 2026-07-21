@@ -50,7 +50,7 @@ if _THR_DIR not in sys.path:
     sys.path.insert(0, _THR_DIR)
 import throw_nlp  # noqa: E402
 from throw_nlp import Q_HI, Q_LO, _spline_eval, solve_throw_nlp  # noqa: E402
-from throwing import (GP8_QD_MAX, fk_pos, ik_position,  # noqa: E402
+from throwing import (GP8_DIMS, GP8_QD_MAX, fk_pos, ik_position,  # noqa: E402
                       jacobian, landing_error)
 
 if TYPE_CHECKING:
@@ -154,7 +154,18 @@ def _formulation_params() -> dict:
                 q_lo=throw_nlp.Q_LO.tolist(), q_hi=throw_nlp.Q_HI.tolist(),
                 qd_max=GP8_QD_MAX.tolist(),
                 col=(throw_nlp.COL_R, throw_nlp.COL_H),
-                pos_mode=getattr(throw_nlp, "POS_LIMIT_MODE", "colloc"))
+                pos_mode=getattr(throw_nlp, "POS_LIMIT_MODE", "colloc"),
+                # 2026-07-21 세분화: 해(특히 dual lam_g)의 유효성에 영향을 주는
+                # 나머지 공식화 요소 전부 — 목적함수 가중치(w1/w2/w_sens), 가속도
+                # 한계, t_f 범위, 스플라인 차수, 운동학 치수(툴 길이 포함). 이 중
+                # 하나라도 바뀌면 기존 entry는 무효 (빌더
+                # tools/build_warm_db._formulation_params_standalone 과 키를
+                # 반드시 동일하게 유지할 것; sim이 만드는 DB도 마찬가지).
+                w1=throw_nlp.W1, w2=throw_nlp.W2, w_sens=throw_nlp.W_SENS,
+                qdd_lim=throw_nlp.QDD_LIM.tolist(),
+                t_bounds=tuple(throw_nlp.T_BOUNDS),
+                degree=throw_nlp.DEGREE,
+                dims=dict(GP8_DIMS))
 
 
 def _load_warm_db(log) -> list:

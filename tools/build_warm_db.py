@@ -11,8 +11,13 @@
     entry:  dict(target, p_start, P, t_f, t_star, lam_g, u_pos, J, ...)
 
 사용:
-    .venv/bin/python tools/build_warm_db.py            # 빌드 + 검증 + 리포트 데이터
-    .venv/bin/python tools/build_warm_db.py --dry-run  # 그리드만 출력
+    .venv/bin/python tools/build_warm_db.py            # 축적(append) 빌드 + 검증
+    .venv/bin/python tools/build_warm_db.py --rebuild  # 전 조합 강제 재계산
+    .venv/bin/python tools/build_warm_db.py --dry-run  # 그리드/생략 조합만 출력
+
+기본은 **축적 모드**: 기존 warm_db.pkl의 공식화가 현재와 같으면 entry를 유지하고
+TARGETS/P_STARTS에 새로 추가된 (target, p_start) 조합만 풀어 병합한다. 공식화
+(W_ACC/윈도우/한계/치수)가 바뀐 경우에만 전체 재계산이 필요하며 자동 감지된다.
 """
 
 from __future__ import annotations
@@ -165,16 +170,26 @@ def _polish_check(job: tuple) -> dict:
 # Main (parent 프로세스는 throw_nlp 를 import하지 않는다 — spawn 워커만)
 # ============================================================================
 def _formulation_params_standalone() -> dict:
-    """robust_throw_skill._formulation_params 복제 (같은 throw_nlp 복사본 기준)."""
+    """robust_throw_skill._formulation_params 복제 (같은 throw_nlp 복사본 기준).
+
+    키를 바꾸면 로더(robust_throw_skill._formulation_params)와 반드시 함께 바꿀 것.
+    """
     sys.path.insert(0, str(SKILLS_DIR))
     import throw_nlp
-    from throwing import GP8_QD_MAX
+    from throwing import GP8_DIMS, GP8_QD_MAX
     return dict(rt=throw_nlp.RELEASE_TIME, w_acc=throw_nlp.W_ACC,
                 n_ctrl=throw_nlp.N_CTRL, n_win=throw_nlp.N_WIN,
                 q_lo=throw_nlp.Q_LO.tolist(), q_hi=throw_nlp.Q_HI.tolist(),
                 qd_max=GP8_QD_MAX.tolist(),
                 col=(throw_nlp.COL_R, throw_nlp.COL_H),
-                pos_mode=getattr(throw_nlp, "POS_LIMIT_MODE", "colloc"))
+                pos_mode=getattr(throw_nlp, "POS_LIMIT_MODE", "colloc"),
+                # 2026-07-21 세분화 — 로더와 동일 (목적함수 가중치/가속도/t_f
+                # 범위/차수/치수까지 전부 유효성 키).
+                w1=throw_nlp.W1, w2=throw_nlp.W2, w_sens=throw_nlp.W_SENS,
+                qdd_lim=throw_nlp.QDD_LIM.tolist(),
+                t_bounds=tuple(throw_nlp.T_BOUNDS),
+                degree=throw_nlp.DEGREE,
+                dims=dict(GP8_DIMS))
 
 
 def main() -> None:
@@ -182,24 +197,60 @@ def main() -> None:
     ap.add_argument("--out", default=str(DB_PATH))
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="기존 DB를 무시하고 전 조합 재계산 (기본은 축적/append)")
     ap.add_argument("--json-log", default=str(REPO / "tools" / "warm_db_build_log.json"))
     args = ap.parse_args()
 
     if not TARGETS or not P_STARTS:
         sys.exit("TARGETS/P_STARTS 가 비어 있음 — 실측 좌표를 채운 뒤 실행하라.")
 
+    params = _formulation_params_standalone()
+    out_path = Path(args.out)
+
+    # ---- 축적(append) 모드 (기본): 같은 공식화면 기존 entry에 이어붙인다 ----
+    # entry는 공식화 파라미터(W_ACC/윈도우/관절한계/기둥/치수 반영 해)가 같을
+    # 때만 warm start로 유효하다. 공식화가 다르면 기존 entry는 폐기하고 전체
+    # 재계산; 같으면 이미 커버된 (target, p_start) 조합은 건너뛰고 새 조합만
+    # 풀어 병합한다 — TARGETS/P_STARTS에 좌표를 추가하고 재실행하면 그만큼만 돈다.
+    def _key(t, p):
+        return (tuple(round(float(v), 3) for v in t),
+                tuple(round(float(v), 3) for v in p))
+
+    existing: list = []
+    if not args.rebuild and out_path.exists():
+        try:
+            with open(out_path, "rb") as f:
+                old = pickle.load(f)
+            if all(old.get("params", {}).get(k) == v for k, v in params.items()):
+                existing = old.get("entries", [])
+                print(f"append: 기존 DB {len(existing)} entries 유지 (공식화 일치)")
+            else:
+                print("append 불가: 기존 DB 공식화 불일치 — 전체 재계산 (기존 폐기)")
+        except Exception as e:  # 손상 파일 → 새로 만든다
+            print(f"기존 DB 로드 실패({type(e).__name__}) — 전체 재계산")
+
+    have = {_key(e["target"], e["p_start"]) for e in existing}
+    new_combos = [(ti, si, t, p)
+                  for ti, t in enumerate(TARGETS)
+                  for si, p in enumerate(P_STARTS)
+                  if _key(t, p) not in have]
     jobs = [(ti, si, vi, t, p)
-            for ti, t in enumerate(TARGETS)
-            for si, p in enumerate(P_STARTS)
+            for (ti, si, t, p) in new_combos
             for vi in range(len(INIT_VARIANTS))]
-    print(f"grid: {len(TARGETS)} targets x {len(P_STARTS)} starts x "
-          f"{len(INIT_VARIANTS)} variants = {len(jobs)} solves, "
+    n_total = len(TARGETS) * len(P_STARTS)
+    print(f"grid: {len(TARGETS)} targets x {len(P_STARTS)} starts = {n_total}조합 — "
+          f"신규 {len(new_combos)}조합 x {len(INIT_VARIANTS)} variants = "
+          f"{len(jobs)} solves (기존 커버 {n_total - len(new_combos)}조합 생략), "
           f"{args.workers} workers")
     for ti, t in enumerate(TARGETS):
         print(f"  target[{ti}] = {t}")
     for si, p in enumerate(P_STARTS):
         print(f"  p_start[{si}] = {p}")
     if args.dry_run:
+        return
+    if not jobs:
+        print("신규 조합 없음 — DB 변경 없이 종료")
         return
 
     t_all = time.time()
@@ -217,14 +268,16 @@ def main() -> None:
                 best[key] = r
         else:
             rejected.append(r)
-    entries = [best[k]["entry"] for k in sorted(best)]
+    entries = existing + [best[k]["entry"] for k in sorted(best)]
 
-    params = _formulation_params_standalone()
-    out_path = Path(args.out)
-    with open(out_path, "wb") as f:
+    # 원자적 쓰기: 쓰는 도중 죽어도(OOM 등) 기존 DB가 깨지지 않게 tmp→rename.
+    tmp_path = out_path.with_suffix(".pkl.tmp")
+    with open(tmp_path, "wb") as f:
         pickle.dump(dict(params=params, entries=entries), f)
+    os.replace(tmp_path, out_path)
     print(f"\nwrote {out_path}: {len(entries)} entries "
-          f"({len(rejected)} attempts rejected) in {time.time() - t_all:.0f}s")
+          f"(신규 {len(best)}, 기존 유지 {len(existing)}, "
+          f"{len(rejected)} attempts rejected) in {time.time() - t_all:.0f}s")
 
     # ---- 검증 1: 로드 라운드트립 (_load_warm_db 로직 복제: params subset 비교) ----
     with open(out_path, "rb") as f:
