@@ -399,14 +399,11 @@ def main() -> int:
     # back-lean run-up commands slightly negative paddle-edge clearance BY
     # DESIGN (eye-calibrated contact), so a band around t_contact alone would
     # false-positive on a correct motion.
-    # NOTE GP8_PUSH_PREPOSITION does not branch this family: the audit calls
-    # build_push_trajectory directly, and the flag only routes execute() —
-    # running under both env values checks the build path is env-insensitive.
+    # (The old GP8_PUSH_PREPOSITION env note is gone: the pre-position mode was
+    # removed in the 2026-07-22 minimal-timing rewrite; execute() always runs
+    # the flow shape and this audit calls build_push_trajectory directly.)
     print("\n== family 4 FULL build (gated): approach + run-up stroke + chain "
           "(transit via); assert outside-stroke > -2mm ==")
-    preposition_env = os.environ.get("GP8_PUSH_PREPOSITION", "1")
-    print(f"   (GP8_PUSH_PREPOSITION={preposition_env!r} — build path is shared "
-          f"by both execute modes)")
     for x, y in ((0.45, 0.15), (0.50, 0.0), (0.55, -0.15), (0.60, 0.10)):
         cur = backswing_for(skill, ctx, x, y + 0.10, bin_xyz)   # parked at stale bs
         bs = backswing_for(skill, ctx, x, y, bin_xyz)

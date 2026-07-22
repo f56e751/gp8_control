@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 
-    from gp8_control.skills.context import SkillContext, PickRequest
+    from gp8_control.skills.context import Intercept, SkillContext, PickRequest
     from gp8_control.tracking import TrackedObject
 
 
@@ -52,6 +52,26 @@ class ManipulationSkill(ABC):
         (e.g. a class out of the throw envelope) so the selector falls back.
         """
         return True
+
+    def placement_veto(
+        self, target: "TrackedObject", intercept: "Intercept"
+    ) -> "str | None":
+        """Reason this skill refuses to RUN ``target`` at ``intercept`` — or None.
+
+        Consulted by the app's target selection AFTER
+        ``earliest_reachable_intercept`` succeeds, with the concrete intercept
+        geometry. A non-None reason makes selection SKIP the object this epoch
+        with no motion dispatched: the object is NOT dropped (it stays in the
+        queue so camera dedup keeps anchoring it — popping would respawn it as
+        a ghost track) and the veto is re-evaluated fresh every epoch (a class
+        re-vote may re-route it to a skill that has no objection). Unlike
+        :meth:`can_handle` (class routing, bypassed by FORCE_SKILL), this is a
+        geometric/feasibility gate and always applies.
+
+        Default: no veto. Override for placements the skill could technically
+        reach but would execute badly (e.g. push's squeezed backswing).
+        """
+        return None
 
     def idle_target(self) -> "np.ndarray":
         """Joint pose the post-action chain returns to when there is NO next
@@ -119,6 +139,31 @@ class ManipulationSkill(ABC):
         active, timed sweep with no forgiveness, so it needs the honest timeline.
         """
         return move_time * self.ctx.cfg.PICK_FEASIBILITY_FACTOR
+
+    def intercept_time_budget(
+        self,
+        target: "TrackedObject",
+        current_joint: "np.ndarray",
+        T_aim: "np.ndarray",
+        T_grasp: "np.ndarray",
+        aim_joint: "np.ndarray",
+        grasp_joint: "np.ndarray",
+        move_time: float,
+    ) -> float:
+        """Candidate-specific "commit now → contact" horizon for intercept placement.
+
+        Called by ``SkillContext.earliest_reachable_intercept`` once per
+        fixed-point iteration with the candidate's CONCRETE geometry (the
+        intercept-Y under evaluation baked into ``T_grasp``/``T_aim`` and their
+        IK solutions), so a skill can price the route it will ACTUALLY drive
+        instead of a generic scalar proxy.
+
+        Base default delegates to the scalar :meth:`t_to_contact` (throw keeps
+        its legacy ``move_time * factor`` heuristic untouched). PUSH overrides
+        this to solve its real backswing pose and route from geometry + motion
+        profiles only — no empirical timing constants.
+        """
+        return self.t_to_contact(move_time)
 
     # ------------------------------------------------------------------
     # Shared helpers (used by concrete skills)

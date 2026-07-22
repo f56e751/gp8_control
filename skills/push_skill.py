@@ -34,10 +34,14 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 
 from gp8_control.skills.base import ManipulationSkill, SkillResult
-from gp8_control.trajectory.trajectory_primitive import trajectory, trajectory_3points
+from gp8_control.trajectory.trajectory_primitive import (
+    trajectory,
+    trajectory_3points,
+    opt_time,
+)
 
 if TYPE_CHECKING:
-    from gp8_control.skills.context import PickRequest
+    from gp8_control.skills.context import Intercept, PickRequest
     from gp8_control.tracking import TrackedObject
 
 
@@ -65,7 +69,7 @@ PUSH_CLASSES: set[str] = {
 # fallback was throw-legacy and removed 2026-07-14).
 PUSH_BIN_TARGET_MAP: dict[str, tuple] = {
     "transparent": (1.2, -0.30, 0.0),  
-    "metal":       (0.95,  0.60, 0.0),
+    "metal":       (0.80,  0.60, 0.0),
 }
 
 
@@ -120,33 +124,41 @@ PUSH_CHAIN_PARK_LIFT: float = 0.0
 # — the observed double up-down bob at push start.
 PUSH_APPROACH_VIA_XY: float = 0.30
 
-# Pre-position mode (execute() path). When ON the approach
-# (current → [aim hover via] → stroke start) is dispatched as its OWN
-# blocking move as soon as the cycle is planned (status POSITIONING) and the
-# FIRED trajectory contains only stroke + chain — t_contact becomes
-# stroke-only (~0.18 s run-up at the full retreat), a short,
-# geometry-independent fire horizon, and ``wait_for_arrival`` re-estimates
-# the ETA AFTER positioning so any positioning overrun is absorbed instead
-# of shifting the hit.
-# DEFAULT OFF (HW 2026-07-14): the serialized pipeline (position → settle →
-# fire) raises the minimum catchable ETA ~0.1–0.2 s over flow's overlapped
-# approach — at the 0.48 m/s belt that whiffed tightly spaced cans BEHIND —
-# and with a steady belt the accuracy gain reduces to execution
-# repeatability only. Flow's approach is floor-gated too (shared
-# _build_gated_approach), so flow no longer belt-strikes. Set
-# GP8_PUSH_PREPOSITION=1 to re-enable for slow-belt / sparse lines.
-PUSH_PREPOSITION: bool = os.environ.get("GP8_PUSH_PREPOSITION", "0") != "0"
+# ---- Minimal timing model (2026-07-22 rewrite) -------------------------------
+# All empirical timing constants were removed from the push timeline. The two
+# timing equations are now purely kinematic/planned:
+#
+#   placement budget  = position_s + t_runup      (intercept_time_budget)
+#   fire lead         = t_contact                 (read off the BUILT trajectory)
+#
+# where position_s is the planned duration of the route execute() will actually
+# drive (current → [aim via] → backswing, opt_time), t_runup is the run-up
+# profile's rest→contact time at the FULL retreat, and t_contact is the exact
+# built-trajectory timestamp at which the paddle crosses the contact point.
+# The removed terms (BUILD_BUDGET 0.04, PREPOS_TAIL 0.05, SETTLE_BUDGET 0.03,
+# LEAD_RESIDUAL 0.20, OPT_TIME_TO_REAL multiplier, qmode dispatch seed 40 ms,
+# GP8_FIXED_DELAY_PUSH override, and the whole opt-in pre-position mode) live
+# on the pre-rewrite commits. If HW tests show a CONSISTENT early/late bias,
+# re-add ONLY the term the logs prove — ideally as a runtime measurement, not
+# a constant (see ~/gp8_pick_log.push.csv fire_early_ms — summarised by
+# tools/analyze_pick_log.py — plus the GP8_MOTION_LOG_DIR CSVs).
 
-# ---- Intercept-placement budget (t_to_contact) -------------------------------
-# Model-side twins of the FIRE-side lead terms. An accurate fire lead cannot
-# save an intercept the arm was never going to be ready at: if the PLACEMENT
-# model under-budgets the pipeline, the planner parks the ambush too far
-# upstream and the stroke fires late no matter how good the lead is (HW
-# 2026-07-14: the missing ~0.2 s residual alone is ~10 cm at 0.48 m/s —
-# exactly the observed late whiffs on tightly spaced cans).
-PUSH_BUILD_BUDGET: float = 0.04   # ARM build (stroke ~30 IK solves + chain synthesis)
-PUSH_PREPOS_TAIL: float = 0.05    # positioning dispatch's final_joint tail knot (stream)
-PUSH_SETTLE_BUDGET: float = 0.03  # settle-guard poll on a healthy stack (~15 ms servo lag)
+# ---- PUSH_PERCEPTION_LAG — the first logs-proven term (2026-07-22 evening) ---
+# Strike experiments (21 objects, 4 belt speeds 0.19–0.46 m/s, CSV + eye
+# protocol) showed every model-perfect fire landing 0.20–0.35 s LATE in
+# reality: the perception map TRAILS the real object. detection_viewer's
+# vision-vs-encoder speed fit (12 passes) split the bias: encoder scale is only
+# +1.6% (≈60–130 ms over the 4–8 s dead-reckon), so the bulk (~0.2 s) is
+# pipeline latency — constant in TIME, speed- and bin-independent. One constant
+# covers both parts to ±50 ms across the tested envelope. Upgrade to
+# (lag + 0.016×det_age) ONLY if analyze_pick_log's residual-vs-age slope proves
+# it (expect ≈ +16 ms/s if the scale part matters). Applied at three PUSH-LOCAL
+# sites — fire lead, intercept_time_budget, stale-stroke guard — so throw's map
+# and timing are untouched. NOTE: the wait-resample fix (item 4) is deferred;
+# until it lands, batch-FIRST objects carry a +~250 ms entry-edge anchor drift
+# and are PREDICTED to now miss ~5–11 cm AHEAD (that prediction is the next
+# run's model check).
+PUSH_PERCEPTION_LAG: float = 0.28
 
 # Safe transit height (m, absolute TCP Z) for the chain when it parks at the
 # NEXT push's backswing (a LOW pose). The chain is a JOINT-space
@@ -193,6 +205,14 @@ PUSH_TRANSIT_HZ: float = 100.0
 # VEL_MAX (1.4 m/s = the highest speed validated clean at accel 5).
 PUSH_TRANSIT_ACCEL_MAX: float = float(os.environ.get("GP8_PUSH_ARC_ACCEL", "5.0"))
 PUSH_TRANSIT_VEL_MAX: float = float(os.environ.get("GP8_PUSH_ARC_VEL", "1.4"))
+
+# Budget-side arc pricing (intercept_time_budget): a direct transit whose BOTH
+# endpoints sit below this TCP-Z is treated as floor-gate-bound — its duration
+# is floored by the arc envelope above instead of the raw opt_time. Backswing/
+# chain parks live at ~0.02–0.05 m; hover/home poses are well above. Only the
+# LOW→LOW near-park case (the chain → re-selected-backswing scenario that fired
+# −451/−506 ms late on 2026-07-22) needs the honest floor.
+PUSH_BUDGET_LOW_TRANSIT_Z: float = 0.15
 
 # Paddle bottom geometry in the TOOL frame (tool X = down/approach, Y =
 # push-facing, Z = width) — the floor audit's 4-corner FK sweep. GUESSED
@@ -246,30 +266,25 @@ PUSH_RETREAT_DISTANCE: float = 0.2
 # from over-reaching toward the base.
 PUSH_RETREAT_MIN_X: float = 0.25
 
+# Selection-time gate (placement_veto): if the FULL-retreat backswing would
+# start at X below this, the object is SKIPPED at target selection — no
+# motion at all — instead of executed with a squeezed run-up. Contact speed
+# scales with sqrt(run-up), so a clamp-shortened (or no-runup fallback) push
+# lands weak and under-carries toward the bin; better to pass the object
+# than to scatter it. 0.30 keeps a 5 cm margin above the PUSH_RETREAT_MIN_X
+# clamp, so every push that DOES execute has the full PUSH_RETREAT_DISTANCE
+# run-up AND stays clear of the near-base region. The 0.25 clamp remains as
+# the hard backstop for paths that bypass selection (chain parks, tests).
+PUSH_EXEC_MIN_BACKSWING_X: float = 0.30
+
 # 6th joint angle (rad) for all push keyframes.  π/2 ≈ 90° clockwise
 # (viewed from above) so the TCP faces the push direction.
 PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 
-# Push arrival-lead (s): how far BEFORE the object's predicted arrival to end
-# the WAITING block. COMPUTED PER TRAJECTORY (``dynamic_arrival_lead``) since
-# the run-up port — the lead is no longer one opaque constant:
-#
-#   lead = _stroke_time_to(actual run-up)   # rest→contact time under the profile
-#        + qmode_ms_avg                     # measured per-dispatch overhead
-#        + PUSH_LEAD_RESIDUAL               # everything not computable (below)
-#
-# The first term adapts to each cycle's geometry (183 ms at the full 0.2 m
-# retreat, less when the min-X clamp shortens the run-up); the residual
-# absorbs servo tracking lag + build/IK compute + perception bias and is the
-# ONLY knob left to HW-tune: RAISE it if the stroke trails the object, LOWER
-# it if the stroke leads. 0.18 = the operator-validated 19:30 2026-07-06
-# value; retuned to 0.20 on HW after the 19:30-state restore (each +0.02
-# hits ~4 mm earlier at 0.19 m/s belt).
-PUSH_LEAD_RESIDUAL = float(os.environ.get("GP8_PUSH_LEAD_RESIDUAL", "0.20"))
+# (Push arrival-lead: no constant anymore. The WAITING block ends exactly
+# ``t_contact`` — the built trajectory's paddle-crosses-contact timestamp —
+# before the object's predicted arrival. See the minimal-timing note above.)
 
-# Legacy escape hatch: when GP8_FIXED_DELAY_PUSH is set it OVERRIDES the
-# computed lead entirely (old fixed-lead behaviour — useful to A/B the model).
-_FIXED_DELAY_PUSH_ENV = os.environ.get("GP8_FIXED_DELAY_PUSH")
 # ABSOLUTE base-frame Z (m) of the push stroke AT THE CONTACT POINT (neutral
 # paddle). Eye-calibrated 2026-07-06 with tests/push_height_test.py: the old
 # 0.07 (derived from the GRASP_Z belt-surface model) struck can TOPS on
@@ -317,7 +332,7 @@ SWING_ANGLE: float = np.radians(20.0)
 # singularity), which flips the joint-6 IK branch at the swing end.
 SWING_BIAS: float = np.radians(-5.0)
 
-# Swing mode (env-selectable at launch, like GP8_FIXED_DELAY_PUSH). Two
+# Swing mode (env-selectable at launch, like GP8_PUSH_STROKE_MODE). Two
 # contact styles for the stroke orientation:
 #   * "scoop" — impact-synced progressive swing: leaning back
 #     (SWING_BIAS - SWING_ANGLE) at the stroke start, exactly NEUTRAL at the
@@ -393,34 +408,24 @@ def _stroke_start_lift() -> float:
 class PushSkill(ManipulationSkill):
     """Time one continuous swing so the paddle meets the object on arrival.
 
-    ``execute`` runs the push cycle in one of two shapes, selected by
-    ``PUSH_PREPOSITION`` (env ``GP8_PUSH_PREPOSITION``, default OFF — see the
-    constant's comment for the HW rationale):
-
-    **PRE-POSITION MODE** (``GP8_PUSH_PREPOSITION=1``, opt-in) — the
-    approach is its own dispatch:
-
-      1. **ARM** — build stroke + chain only (``append_descent=False``);
-         ``t_contact`` off the built timestamps is stroke-only (~0.18 s
-         run-up) — a short, geometry-independent fire horizon.
-      2. **POSITIONING** — send the floor-gated approach (current →
-         [aim hover] → the stroke's first knot) NOW, blocking, and park there.
-      3. **WAITING** — the ETA is re-estimated AFTER positioning, so a
-         positioning overrun is absorbed instead of shifting the hit.
-      4. **PUSHING** — fire the pre-built stroke + chain.
-
-    **FLOW MODE** (default) — the operator-validated 19:30 2026-07-06
+    ``execute`` runs the FLOW shape (the operator-validated 19:30 2026-07-06
     configuration; the approach overlaps the object's travel, giving the
-    lowest minimum catchable ETA (matters for tightly spaced objects). Its
-    approach segment is floor-gated too. No backswing parking:
+    lowest minimum catchable ETA — matters for tightly spaced objects). The
+    approach segment is floor-gated. No backswing parking:
 
       1. **ARM** — compose the ENTIRE motion up front (approach → backswing →
          run-up stroke → chain) and read the exact contact time off the built
          trajectory timestamps.
-      2. **WAITING** — sleep until (arrival − contact time − dispatch −
-         residual), holding the current park pose (JGPC zero-order-hold).
+      2. **WAITING** — sleep until (arrival − t_contact), holding the current
+         park pose (JGPC zero-order-hold). MINIMAL TIMING: the built contact
+         timestamp IS the whole fire lead — no dispatch/residual corrections
+         (see the minimal-timing note at the top of this file).
       3. **PUSHING** — fire the pre-built trajectory; paddle and object meet
          mid-flow. (adv4ncr 250Hz stream: no queue mode to re-enter.)
+
+    (The opt-in pre-position mode — approach as its own blocking dispatch —
+    was removed in the 2026-07-22 minimal-timing rewrite; it lives on the
+    pre-rewrite commits.)
 
     Public planning/build methods mirror ``ThrowSkill`` so external code can
     reuse push logic.
@@ -431,6 +436,11 @@ class PushSkill(ManipulationSkill):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._last_push_meta: dict = {}
+        # Converged placement-budget parts per track id, captured by
+        # intercept_time_budget() during selection and popped by execute()
+        # into the cycle CSV — the data that says whether the constant-free
+        # placement model matches what the cycle actually did.
+        self._budget_by_track: dict[int, dict] = {}
 
     # ------------------------------------------------------------------
     # Routing
@@ -439,79 +449,204 @@ class PushSkill(ManipulationSkill):
         """Accept objects whose class_name is in PUSH_CLASSES."""
         return target.class_name in PUSH_CLASSES
 
+    def placement_veto(
+        self, target: "TrackedObject", intercept: "Intercept"
+    ) -> "str | None":
+        """Refuse placements whose FULL-retreat backswing is un-executable.
+
+        Uses the UNCLAMPED full-retreat backswing point (grasp XY minus the
+        full PUSH_RETREAT_DISTANCE along the push direction) — the same
+        geometry ``backswing_pose`` starts from — so a veto fires exactly when
+        execute() would otherwise degrade the run-up. Two gates, one policy
+        (full run-up or skip):
+
+        * near-base: backswing X below ``PUSH_EXEC_MIN_BACKSWING_X`` (the
+          min-X clamp / no-runup fallback region);
+        * reach edge: backswing XY outside the ``cfg.MAX_REACH`` disc
+          (typical late downstream catch — backswing IK would fail and the
+          stroke would start AT the object from standstill).
+
+        Pure XY arithmetic: cheap enough to re-evaluate every selection
+        epoch. The IK-fail no-runup fallback stays as the backstop for the
+        residual (radius-OK but orientation-infeasible) cases.
+        """
+        bin_xyz = PUSH_BIN_TARGET_MAP.get(target.class_name)
+        if bin_xyz is None:
+            # Mirrors execute()'s no-bin abort, one stage earlier: with no bin
+            # there is nowhere to push, so don't commit the pick at all.
+            return f"no push bin mapping for class '{target.class_name}'"
+        T_aim2 = np.eye(4)
+        T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+        push_dir = self._compute_push_direction(intercept.T_grasp, T_aim2)
+        backswing_x = (
+            float(intercept.T_grasp[0, 3])
+            - PUSH_RETREAT_DISTANCE * float(push_dir[0])
+        )
+        if backswing_x < PUSH_EXEC_MIN_BACKSWING_X:
+            return (
+                f"backswing x={backswing_x:+.3f} < "
+                f"{PUSH_EXEC_MIN_BACKSWING_X:.2f} (run-up squeezed near base)"
+            )
+        backswing_y = (
+            float(intercept.T_grasp[1, 3])
+            - PUSH_RETREAT_DISTANCE * float(push_dir[1])
+        )
+        backswing_r = float(np.hypot(backswing_x, backswing_y))
+        max_reach = float(self.ctx.cfg.MAX_REACH)
+        if backswing_r > max_reach:
+            return (
+                f"backswing ({backswing_x:+.3f},{backswing_y:+.3f}) outside "
+                f"reach disc (r={backswing_r:.3f} > {max_reach:.2f})"
+            )
+        return None
+
     def arrival_lead(self) -> float:
-        """Nominal arrival lead, assuming the full PUSH_RETREAT_DISTANCE run-up.
-
-        Kept for the base-class interface; ``execute`` uses
-        :meth:`dynamic_arrival_lead` with the cycle's ACTUAL run-up length
-        (min-X clamp aware) instead.
+        """Nominal arrival lead: the run-up profile's rest→contact time at the
+        full retreat. Kept for the base-class interface only — ``execute``
+        uses the BUILT trajectory's exact ``t_contact`` as the fire lead.
         """
-        return self.dynamic_arrival_lead(PUSH_RETREAT_DISTANCE)
-
-    def dynamic_arrival_lead(self, contact_offset: float) -> float:
-        """Per-trajectory arrival lead (see the PUSH_LEAD_RESIDUAL comment).
-
-        Push has NO suction to forgive a late hit (unlike throw, whose object
-        is already cup-held), so this must cover the FULL post-wait latency:
-        the computable parts — the run-up profile's rest→contact time for
-        THIS cycle's geometry, plus the measured dispatch overhead — and the
-        hand-tuned residual (servo lag, build/IK compute, perception bias).
-        ``GP8_FIXED_DELAY_PUSH``, when set, overrides the whole computation
-        with the legacy fixed lead.
-        """
-        if _FIXED_DELAY_PUSH_ENV is not None:
-            return float(_FIXED_DELAY_PUSH_ENV)
-        t_dispatch = self.ctx.traj_ctrl.qmode_ms_avg / 1000.0
-        return self._stroke_time_to(contact_offset) + t_dispatch + PUSH_LEAD_RESIDUAL
+        return self._stroke_time_to(PUSH_RETREAT_DISTANCE)
 
     def t_to_contact(self, move_time: float) -> float:
-        """Honest push timeline (overrides the base legacy heuristic).
+        """Legacy scalar fallback (base-interface signature).
 
-        Push contact is an ACTIVE, timed sweep with NO suction forgiveness, so the
-        intercept MUST be placed where the object will be at the REAL strike time,
-        not where the bare positioning estimate lands.
+        The live placement path is :meth:`intercept_time_budget`, which prices
+        the candidate's REAL backswing route. This fallback — for any caller
+        that only has the solver's suction-grasp ``move_time`` — keeps the same
+        constant-free shape: positioning estimate + run-up pre-travel.
+        """
+        return max(0.0, float(move_time)) \
+            + self._stroke_time_to(PUSH_RETREAT_DISTANCE)
 
-        The budget mirrors the FIRE-side lead term by term — the placement /
-        fire asymmetry (residual & serial costs in the lead but not here) is
-        what aimed tightly spaced cans too far upstream and produced the late
-        whiffs (HW 2026-07-14, 0.48 m/s belt)::
+    def intercept_time_budget(
+        self,
+        target: "TrackedObject",
+        current_joint: np.ndarray,
+        T_aim: np.ndarray,
+        T_grasp: np.ndarray,
+        aim_joint: np.ndarray,
+        grasp_joint: np.ndarray,
+        move_time: float,
+    ) -> float:
+        """Constant-free "commit now → contact" horizon for THIS candidate.
 
-            T_build                  ARM build before any motion (PUSH_BUILD_BUDGET)
-          + n_disp × T_setup         stream dispatch overhead (qmode_ms_avg);
-                                     1 dispatch in flow, 2 in pre-position
-          + T_position               approach: opt_time × OPT_TIME_TO_REAL
-          [+ T_tail + T_settle]      pre-position only: positioning final-knot
-                                     tail + settle-guard poll
-          + T_pre_travel             run-up rest→contact (``_stroke_time_to`` —
-                                     accelerating from rest, NOT constant-speed
-                                     d/v which understated it by ~80 ms)
-          + PUSH_LEAD_RESIDUAL       servo lag + perception bias — the SAME
-                                     knob the fire lead adds
+        Called inside the intercept fixed-point loop for every evaluated Y.
+        ``move_time`` (the solver's current→aim→suction-grasp proxy) is
+        ignored: it ends at the suction grasp pose and knows nothing about the
+        bin-dependent push heading. Instead this method prices the route
+        ``execute`` will actually drive, from geometry + motion profiles only:
 
-        A bigger budget only slides the intercept downstream (the planner's
-        fixed-point loop re-solves where the object will be); objects whose
-        downstream slide leaves the workspace are dropped as uncatchable
-        instead of being whiffed into the next can.
+          position_s   planned duration of current → [aim via] → backswing
+                       (same direct/via routing rule as execute, min-X clamp
+                       via the shared retreat solver; opt_time under M1/M2)
+        + t_runup      run-up rest→contact at the FULL retreat
+                       (``_stroke_time_to`` — the run-up-shortening min-X case
+                       is slated for removal, so timing assumes 0.2 m)
 
-        With GP8_FIXED_DELAY_PUSH set, the fire lead is overridden wholesale
-        and the placement budget mirrors that (the fixed lead already covers
-        pre-travel + residual + the fire dispatch).
+        No build/dispatch/settle/residual constants and no OPT_TIME_TO_REAL
+        multiplier — if the logs prove a consistent bias, restore that ONE
+        term from measurement (see the minimal-timing note at file top).
+
+        A backswing that IK-fails here falls back to the no-runup pose (stroke
+        from the object itself → t_runup = 0), mirroring execute's fallback.
+        The converged parts are stashed per track id for the cycle CSV.
         """
         ctx = self.ctx
-        t_setup = ctx.traj_ctrl.qmode_ms_avg / 1000.0          # per-dispatch overhead (stream)
-        t_position = move_time * ctx.cfg.OPT_TIME_TO_REAL
-        if _FIXED_DELAY_PUSH_ENV is not None:
-            t = PUSH_BUILD_BUDGET + t_setup + t_position \
-                + float(_FIXED_DELAY_PUSH_ENV)
+        zero6 = np.zeros(6)
+        cur6 = np.asarray(current_joint, dtype=float)[:6]
+        t_runup = self._stroke_time_to(PUSH_RETREAT_DISTANCE)
+
+        bin_xyz = PUSH_BIN_TARGET_MAP.get(target.class_name)
+        if bin_xyz is None:
+            # No bin → execute will abort this object anyway (only reachable
+            # via GP8_FORCE_SKILL on an unmapped class). Keep a finite,
+            # constant-free estimate so selection stays well-defined.
+            return max(0.0, float(move_time)) + t_runup
+
+        T_aim2 = np.eye(4)
+        T_aim2[:3, :3] = T_aim[:3, :3]
+        T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+
+        # Same backswing solve execute() runs (min-X clamp + no-runup
+        # fallback inside), so position_s prices the real stroke-start pose.
+        # quiet: the fixed-point loop calls this up to ~30×/candidate — IK
+        # fallbacks here must not spam warnings (execute logs the real one).
+        _, q_park, T_park = self._compute_retreat_poses(
+            T_grasp, T_aim2, T_aim, aim_joint, grasp_joint, quiet=True,
+        )
+        q_park6 = np.asarray(q_park, dtype=float)[:6]
+        runup_s = float(
+            np.hypot(*(T_grasp[:2, 3] - T_park[:2, 3]))
+        )
+        # Timing model: FULL-retreat run-up (see docstring). Only a truly
+        # degenerate no-runup fallback (runup ≈ 0) zeroes the term.
+        t_run = t_runup if runup_s > 1e-3 else 0.0
+
+        # Approach routing — the same XY-gap rule execute() applies.
+        T_cur = ctx.robot.forward_kinematics(cur6)
+        xy_gap = float(np.hypot(*(T_cur[:2, 3] - T_park[:2, 3])))
+        gated = False
+        if xy_gap < PUSH_APPROACH_VIA_XY:
+            position_s = float(
+                opt_time(cur6, zero6, q_park6, zero6, ctx.M1[:6], ctx.M2[:6])
+            )
+            via = False
+            # FLOOR-GATE PRICING: a LOW→LOW direct transit (chain park → this
+            # candidate's backswing) sags and gets replaced by the Cartesian
+            # arc at build time, whose duration is FLOORED by the HW tracking
+            # envelope — ~440 ms where opt_time says ~150 (the −451/−506 ms
+            # late-fire rows). Price that floor here so the intercept lands
+            # far enough downstream to fire ON TIME. Closed-form only (no
+            # IK/audit — this runs ~30×/candidate): same path model as
+            # _build_arc_transit's _pos_at (straight lerp + lift·sin bump).
+            if xy_gap > 0.03 and max(
+                float(T_cur[2, 3]), float(T_park[2, 3])
+            ) < PUSH_BUDGET_LOW_TRANSIT_Z:
+                u = np.linspace(0.0, 1.0, 21)
+                p0, p1 = T_cur[:3, 3], T_park[:3, 3]
+                pts = p0[None, :] + (p1 - p0)[None, :] * u[:, None]
+                pts[:, 2] += PUSH_TRANSIT_ARC_LIFT * np.sin(np.pi * u)
+                arc_len = float(
+                    np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))
+                )
+                t_env = max(
+                    float(np.pi * np.sqrt(
+                        arc_len / (2.0 * max(PUSH_TRANSIT_ACCEL_MAX, 1e-6))
+                    )),
+                    float(
+                        np.pi * arc_len
+                        / (2.0 * max(PUSH_TRANSIT_VEL_MAX, 1e-6))
+                    ),
+                )
+                if t_env > position_s:
+                    position_s = t_env
+                    gated = True
         else:
-            t_pre_travel = self._stroke_time_to(PUSH_RETREAT_DISTANCE)
-            t = (PUSH_BUILD_BUDGET + t_setup + t_position
-                 + t_pre_travel + PUSH_LEAD_RESIDUAL)
-        if PUSH_PREPOSITION:
-            # Second (positioning) dispatch + its tail knot + settle poll —
-            # the serial extras flow mode does not pay.
-            t += t_setup + PUSH_PREPOS_TAIL + PUSH_SETTLE_BUDGET
-        return t
+            aim6 = np.asarray(aim_joint, dtype=float)[:6]
+            position_s = float(
+                opt_time(cur6, zero6, aim6, zero6, ctx.M1[:6], ctx.M2[:6])
+                + opt_time(aim6, zero6, q_park6, zero6, ctx.M1[:6], ctx.M2[:6])
+            )
+            via = True
+
+        track_id = getattr(target, "track_id", None)
+        if track_id is not None:
+            self._budget_by_track[int(track_id)] = {
+                "position_s": position_s,
+                "runup_s": t_run,
+                "via": via,
+                "gated": gated,
+            }
+            # Bounded: drop oldest entries (dict preserves insertion order).
+            while len(self._budget_by_track) > 64:
+                self._budget_by_track.pop(next(iter(self._budget_by_track)))
+
+        # The fire is scheduled PUSH_PERCEPTION_LAG before the MAP-object's
+        # arrival (see the fire lead); budget the same lag here so the intercept
+        # lands far enough downstream that the earlier fire time is still in
+        # the future at wait entry — without this, tight/chained cycles hit an
+        # already-past alarm and the correction silently degrades to "fire now".
+        return position_s + t_run + PUSH_PERCEPTION_LAG
 
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
@@ -519,22 +654,19 @@ class PushSkill(ManipulationSkill):
     def execute(self, request: "PickRequest") -> SkillResult:
         """Arm the motion, sleep to the fire time, then fire.
 
-        PRE-POSITION MODE (``GP8_PUSH_PREPOSITION=1``, opt-in): build stroke
-        + chain (``append_descent=False``, so ``t_contact`` is stroke-only),
-        dispatch the floor-gated approach NOW as its own blocking move
-        (status POSITIONING) parking at the built stroke's first knot, then
-        WAIT and fire.
-
-        FLOW MODE (default): build approach + stroke + chain as ONE
+        FLOW shape, MINIMAL timing: build approach + stroke + chain as ONE
         trajectory (dispatch=False) with the full approach inside
-        ``t_contact``, WAIT, then fire the whole motion.
-
-        Both modes: WAITING — ``wait_for_arrival(offset = t_contact +
-        dispatch + residual)``; the stale-stroke guard runs before firing;
-        cleanup after.
+        ``t_contact``, WAIT — ``wait_for_arrival(offset = t_contact)``, the
+        built contact timestamp being the ENTIRE fire lead (no correction
+        terms) — then fire the whole motion. The stale-stroke guard runs
+        before firing; cleanup after.
         """
         ctx = self.ctx
         _t_exec0 = time.time()   # pipeline diagnostic (see the [pipeline] log)
+        # Fresh cycle-log meta: build_push_trajectory replaces this dict wholesale,
+        # but an abort BEFORE the build (no-bin) would otherwise log the PREVIOUS
+        # cycle's values into its CSV row.
+        self._last_push_meta = {}
         target = request.target
         current_joint = request.current_joint
         aim_joint = request.aim_joint
@@ -562,6 +694,7 @@ class PushSkill(ManipulationSkill):
             # For now abort cleanly — only reachable via GP8_FORCE_SKILL on an
             # unmapped class, so it doesn't affect normal metal routing.
             ctx.log.warn(f"no push bin for {target.class_name}; abort")
+            self._log_push_cycle(target, outcome="abort", abort_reason="no-bin")
             return self._abort(f"no push bin mapping for {target.class_name}")
         T_aim2 = np.eye(4)
         T_aim2[:3, :3] = T_aim[:3, :3]
@@ -579,8 +712,8 @@ class PushSkill(ManipulationSkill):
         # ACTUAL run-up length: the stroke starts at grasp_retreat, so contact
         # happens contact_offset metres in. Measured from the poses (NOT the
         # PUSH_RETREAT_DISTANCE constant) so the min-X clamp's shortened
-        # retreat yields the right impact waypoint / swing sync — and the
-        # right per-trajectory arrival lead below.
+        # retreat yields the right impact waypoint / swing sync. (Timing uses
+        # the BUILT t_contact, which already reflects this geometry.)
         contact_offset = float(
             np.hypot(*(T_grasp[:2, 3] - T_grasp_retreat[:2, 3]))
         )
@@ -617,7 +750,7 @@ class PushSkill(ManipulationSkill):
         )
 
         # Match the aim via-point's wrist to the push-facing backswing pose so
-        # the POSITIONING move keeps joint 6 put. request.aim_joint carries the
+        # the approach segment keeps joint 6 put. request.aim_joint carries the
         # generic PICK_WRIST_J6 baseline (the belt-wide push-facing MEAN);
         # copying the EXACT wrist removes the remaining few-degree detour
         # during the descent. wait_joint IS the backswing solution now (the
@@ -626,20 +759,14 @@ class PushSkill(ManipulationSkill):
         aim_joint = aim_joint.copy()
         aim_joint[-1] = wait_joint[-1]
 
-        # ---- 1. ARM (+ POSITIONING in pre-position mode) ----
-        # Both modes pre-build the fired motion NOW: it moves the stroke's
-        # ~30 IK solves OFF the post-wait critical path, and t_contact comes
-        # from the ACTUAL built trajectory (clamp included). Push has no
-        # suction seal to form, so no stationary settle is needed before the
-        # stroke — the modes differ only in WHERE the approach rides:
-        #   * PRE-POSITION (opt-in, GP8_PUSH_PREPOSITION=1): the approach is
-        #     its OWN blocking dispatch (status POSITIONING) and the fired
-        #     motion is stroke + chain only — t_contact becomes stroke-only
-        #     (short, geometry-independent fire horizon).
-        #   * FLOW (default): the 19:30 2026-07-06 operator-validated shape
-        #     — approach(current → [aim via] → backswing) + stroke + chain
-        #     is ONE dispatch, fired so the paddle crosses the contact point
-        #     exactly at the object's arrival.
+        # ---- 1. ARM ----
+        # Pre-build the fired motion NOW: it moves the stroke's ~30 IK solves
+        # OFF the post-wait critical path, and t_contact comes from the ACTUAL
+        # built trajectory (clamp included). Push has no suction seal to form,
+        # so no stationary settle is needed before the stroke. FLOW shape (the
+        # 19:30 2026-07-06 operator-validated configuration): approach(current
+        # → [aim via] → backswing) + stroke + chain is ONE dispatch, fired so
+        # the paddle crosses the contact point exactly at the object's arrival.
         T_cur = ctx.robot.forward_kinematics(
             np.asarray(current_joint, dtype=float)[:6]
         )
@@ -662,126 +789,39 @@ class PushSkill(ManipulationSkill):
                 next_grasp, next_cand
             )
 
-        if PUSH_PREPOSITION:
-            # ARM FIRST (stroke + chain only) so POSITIONING can park at the
-            # BUILT stroke's first knot. Parking at grasp_retreat_joint is
-            # NOT equivalent: the deep no-runup fallback returns the raw
-            # suction-grasp pose while the stroke's first knot is the
-            # push-oriented lifted pose (~4 cm + wrist apart). Flow mode's
-            # seam bridge catches that cliff INSIDE the dispatch, but a
-            # stroke-only dispatch has no bridge — parking anywhere but the
-            # built first knot would command a 10 ms cliff at fire time.
-            traj_push, vel_push, ts_push, final_joint, t_contact = (
-                self.build_push_trajectory(
-                    current_joint, grasp_retreat_joint, T_grasp_retreat,
-                    T_aim2, next_grasp=next_grasp, append_chain=True,
-                    append_descent=False, push_distance=push_distance,
-                    contact_offset=contact_offset, chain_park=chain_park,
-                    approach_via=None, dispatch=False,
-                )
+        traj_push, vel_push, ts_push, final_joint, t_contact = (
+            self.build_push_trajectory(
+                current_joint, grasp_retreat_joint, T_grasp_retreat,
+                T_aim2, next_grasp=next_grasp, append_chain=True,
+                append_descent=True, push_distance=push_distance,
+                contact_offset=contact_offset, chain_park=chain_park,
+                approach_via=approach_via, dispatch=False,
             )
-            q_park = traj_push[:, 0].copy()
-            # POSITIONING: the same floor-gated approach build that flow mode
-            # runs inside build_push_trajectory (shared helper), dispatched
-            # standalone and BLOCKING — the arm is parked at the stroke start
-            # when this returns and holds it through WAITING (JGPC
-            # zero-order-hold). current_joint is still the true pose here:
-            # nothing has moved since the epoch read it (the previous cycle's
-            # dispatch was blocking, and the arm parks on ZOH between cycles).
-            ctx.set_status("POSITIONING", target.class_name)
-            traj_pos, vel_pos, ts_pos = self._build_gated_approach(
-                current_joint, q_park, via=approach_via,
-            )
-            _t_pos_planned = float(ts_pos[-1])
-            ctx.traj_ctrl.send_trajectory_queue(
-                traj_pos, vel_pos, ts_pos, final_joint=q_park,
-            )
-            # SETTLE GUARD (HW finding 2026-07-14): the dispatch returns at
-            # the END OF THE COMMAND STREAM, not at physical arrival. On the
-            # validated driver config the servo trails by only ~15 ms, but a
-            # silently degraded link/limiter — e.g. the bare-relaunch
-            # axis_increment_factor=0.1 trap (~10% speed cap + bent EE paths)
-            # — leaves the arm FAR from the park with no other symptom, and
-            # the stroke would fire from the wrong pose. Verify arrival; a
-            # healthy stack settles in well under 100 ms.
-            if not ctx.traj_ctrl._wait_for_position(
-                q_park, tolerance=0.05, timeout_sec=1.0
-            ):
-                _q_now = ctx.traj_ctrl.current_joints
-                _gap = (
-                    float(np.max(np.abs(
-                        np.asarray(_q_now, dtype=float)[:6] - q_park[:6]
-                    )))
-                    if _q_now is not None else float("nan")
-                )
-                ctx.log.error(
-                    f"POSITIONING did not settle within 1 s (max joint gap "
-                    f"{_gap:.3f} rad) — the servo is not tracking the stream. "
-                    f"Check the driver's axis_increment_factor (bare relaunch "
-                    f"= 0.1 commissioning cap) / RT link before pushing."
-                )
-                return self._abort(
-                    "positioning never settled — driver/link degraded?"
-                )
-        else:
-            traj_push, vel_push, ts_push, final_joint, t_contact = (
-                self.build_push_trajectory(
-                    current_joint, grasp_retreat_joint, T_grasp_retreat,
-                    T_aim2, next_grasp=next_grasp, append_chain=True,
-                    append_descent=True, push_distance=push_distance,
-                    contact_offset=contact_offset, chain_park=chain_park,
-                    approach_via=approach_via, dispatch=False,
-                )
-            )
+        )
 
         # ---- 2. WAITING: sleep until the FIRE time ----
-        # offset = the built trajectory's contact time + dispatch overhead +
-        # residual → dispatching at (arrival − offset) makes paddle and object
-        # meet mid-flow. The arm holds its park pose until then (JGPC ZOH).
-        if _FIXED_DELAY_PUSH_ENV is not None:
-            lead = float(_FIXED_DELAY_PUSH_ENV)
-        else:
-            lead = (
-                t_contact
-                + ctx.traj_ctrl.qmode_ms_avg / 1000.0
-                + PUSH_LEAD_RESIDUAL
-            )
+        # Fire lead = built contact timestamp + PUSH_PERCEPTION_LAG. The map
+        # trails the REAL object by the measured lag (see the constant's block),
+        # so dispatching at (map arrival − t_contact − lag) makes paddle and
+        # real object meet. With the lag folded into ``lead``, an on-schedule
+        # fire logs fire_early_ms ≈ 0 (residual semantics; the CSV's
+        # applied_lag_ms column records what was folded in).
+        lead = t_contact + PUSH_PERCEPTION_LAG
         _route = "via-hover" if approach_via is not None else "direct"
-        _approach_txt = (
-            f"stroke-only; pre-positioned {_xy_gap * 100:.0f}cm {_route}"
-            if PUSH_PREPOSITION
-            else f"approach {_xy_gap * 100:.0f}cm {_route}"
-        )
         ctx.log.info(
-            f"Push FIRE lead {lead * 1000:.0f}ms = traj contact "
-            f"{t_contact * 1000:.0f}ms ({_approach_txt}) + dispatch "
-            f"{ctx.traj_ctrl.qmode_ms_avg:.0f}ms + residual "
-            f"{PUSH_LEAD_RESIDUAL * 1000:.0f}ms"
-            + (" [OVERRIDDEN by GP8_FIXED_DELAY_PUSH]" if _FIXED_DELAY_PUSH_ENV else "")
+            f"Push FIRE lead {lead * 1000:.0f}ms = contact {t_contact * 1000:.0f}"
+            f"ms + perception lag {PUSH_PERCEPTION_LAG * 1000:.0f}ms "
+            f"(approach {_xy_gap * 100:.0f}cm {_route})"
         )
         # PIPELINE DIAGNOSTIC: measured serial time from execute entry to
-        # wait entry vs the t_to_contact budget's non-motion terms — the data
-        # that says whether PUSH_BUILD_BUDGET / PUSH_PREPOS_TAIL /
-        # PUSH_SETTLE_BUDGET match this machine. Flow mode: expect ≈ build
-        # only. Pre-position: expect ≈ build + planned positioning + tail +
-        # settle + dispatch.
+        # wait entry (chain pre-plan + ARM build). NOT added to any timing
+        # equation — logged so a nonzero build cost is visible evidence if
+        # the fire ever trends late.
         _pipe = time.time() - _t_exec0
-        if PUSH_PREPOSITION:
-            _serial = _pipe - _t_pos_planned
-            ctx.log.info(
-                f"[pipeline] exec→wait {_pipe * 1000:.0f}ms = positioning "
-                f"(planned {_t_pos_planned * 1000:.0f}ms) + serial "
-                f"{_serial * 1000:.0f}ms (budget build "
-                f"{PUSH_BUILD_BUDGET * 1000:.0f} + tail "
-                f"{PUSH_PREPOS_TAIL * 1000:.0f} + settle "
-                f"{PUSH_SETTLE_BUDGET * 1000:.0f} + dispatch "
-                f"{ctx.traj_ctrl.qmode_ms_avg:.0f})"
-            )
-        else:
-            ctx.log.info(
-                f"[pipeline] exec→wait {_pipe * 1000:.0f}ms "
-                f"(budget build {PUSH_BUILD_BUDGET * 1000:.0f}ms)"
-            )
+        ctx.log.info(
+            f"[pipeline] exec→wait {_pipe * 1000:.0f}ms "
+            f"(build+plan; not modelled in the fire lead)"
+        )
         ctx.set_status("WAITING", target.class_name)
         ctx.wait_for_arrival(target, T_grasp[1, 3], offset=lead)
 
@@ -793,21 +833,81 @@ class PushSkill(ManipulationSkill):
         # heading's Y sign is geometry-dependent (for an intercept UPSTREAM of the bin
         # the stroke actually sweeps downstream-in-Y), so compare against the
         # most-DOWNSTREAM (smallest-Y) stroke end, not just grasp_retreat. Drop
-        # cleanly (same cleanup as the queue-fail path). The timeline fix (skill-aware
-        # t_to_contact) should make this rare; this is the hard safety net.
+        # cleanly (same cleanup as the queue-fail path). The skill-aware placement
+        # budget (intercept_time_budget) should make this rare; hard safety net.
         stroke_end_y = T_grasp_retreat[1, 3] + push_distance * push_dir_exec[1]
         stroke_min_y = min(float(T_grasp_retreat[1, 3]), float(stroke_end_y))
-        obj_y_now = ctx.object_y_now(target, time.time(), ctx.conveyor.current)
-        if obj_y_now < stroke_min_y:
+        _t_guard = time.time()
+        _v_guard = ctx.conveyor.current
+        obj_y_map = ctx.object_y_now(target, _t_guard, _v_guard)
+        # Judge the REAL object, not the trailing map: the map runs
+        # PUSH_PERCEPTION_LAG behind, so the true position is lag×v downstream.
+        obj_y_real = obj_y_map - _v_guard * PUSH_PERCEPTION_LAG
+        if obj_y_real < stroke_min_y:
             ctx.log.warn(
                 f"Push abort: id={target.track_id} {target.class_name} already past the "
-                f"stroke (y={obj_y_now:+.3f} < stroke_min {stroke_min_y:+.3f}); "
-                f"skipping stale stroke"
+                f"stroke (real y={obj_y_real:+.3f} < stroke_min {stroke_min_y:+.3f}, "
+                f"map y={obj_y_map:+.3f}); skipping stale stroke"
             )
+            # A stale-stroke abort IS the timing scoreboard's worst case, so it
+            # gets a CSV row too: the same fire-instant fields a fired row logs
+            # (build meta is already this cycle's — the build ran above), plus
+            # past_stroke_m, how far beyond the last catchable belt-Y the REAL
+            # object was. fire_delta_m stays MAP-frame (comparable with fired
+            # rows); subtracting ``lead`` keeps residual semantics. Budget is
+            # popped HERE because the fire path's pop never runs.
+            _delta_ab = obj_y_map - float(T_grasp[1, 3])
+            self._last_push_meta.update({
+                "fire_delta_m": _delta_ab,
+                "fire_early_ms": (
+                    (_delta_ab / _v_guard - lead) * 1000.0
+                    if _v_guard > 1e-3 else None
+                ),
+                "past_stroke_m": stroke_min_y - obj_y_real,
+                "det_age_ms": (_t_guard - target.detect_time) * 1000.0,
+                "lead_ms": lead * 1000.0,
+                "exec_to_wait_ms": _pipe * 1000.0,
+                **{
+                    f"budget_{k}": v
+                    for k, v in self._budget_by_track.pop(
+                        int(getattr(target, "track_id", -1)), {}
+                    ).items()
+                },
+            })
+            self._log_push_cycle(target, outcome="abort", abort_reason="stale-stroke")
             return self._abort("object passed stroke span; push aborted")
 
         # ---- 3. PUSHING: FIRE the pre-built motion ----
         ctx.log_action_timing(target, T_grasp[1, 3], "push-fire")
+        # Fire-instant scoreboard for the cycle CSV: an on-schedule fire happens
+        # with the MAP-object exactly v×lead (= t_contact + applied lag)
+        # upstream of the contact point, so
+        #   fire_early_ms = (delta/v − lead)  [>0 early, <0 late]
+        # is the RESIDUAL after the applied correction — ≈0 means "fired
+        # exactly as the corrected schedule intended".
+        _t_fire = time.time()
+        _v_fire = ctx.conveyor.current
+        _delta_fire = (
+            ctx.object_y_now(target, _t_fire, _v_fire) - float(T_grasp[1, 3])
+        )
+        self._last_push_meta.update({
+            "fire_delta_m": _delta_fire,
+            "fire_early_ms": (
+                (_delta_fire / _v_fire - lead) * 1000.0
+                if _v_fire > 1e-3 else None
+            ),
+            # Dead-reckon horizon: fire_early_ms is only as trustworthy as the
+            # last detection is fresh (object_y_now extrapolates from detect_time).
+            "det_age_ms": (_t_fire - target.detect_time) * 1000.0,
+            "lead_ms": lead * 1000.0,
+            "exec_to_wait_ms": _pipe * 1000.0,
+            **{
+                f"budget_{k}": v
+                for k, v in self._budget_by_track.pop(
+                    int(getattr(target, "track_id", -1)), {}
+                ).items()
+            },
+        })
         ctx.set_status("PUSHING", target.class_name)
         ctx.traj_ctrl.send_trajectory_queue(
             traj_push, vel_push, ts_push, final_joint=final_joint,
@@ -832,6 +932,7 @@ class PushSkill(ManipulationSkill):
         T_aim: np.ndarray,
         aim_joint: np.ndarray,
         grasp_joint: np.ndarray,
+        quiet: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute the backswing pose behind T_grasp opposite the push direction.
 
@@ -897,11 +998,12 @@ class PushSkill(ManipulationSkill):
             # Backswing pose out of the workspace (typical far-downstream
             # intercept: the retreat lands beyond reach) — fall back to a
             # no-retreat push from the object itself (standstill start).
-            ctx.log.warn(
-                f"Backswing IK unreachable at retreat "
-                f"({T_grasp_retreat[0, 3]:+.3f}, {T_grasp_retreat[1, 3]:+.3f}); "
-                f"pushing without run-up"
-            )
+            if not quiet:
+                ctx.log.warn(
+                    f"Backswing IK unreachable at retreat "
+                    f"({T_grasp_retreat[0, 3]:+.3f}, {T_grasp_retreat[1, 3]:+.3f}); "
+                    f"pushing without run-up"
+                )
             return self._no_runup_fallback(
                 T_grasp, push_dir, aim_joint, grasp_joint
             )
@@ -1036,8 +1138,9 @@ class PushSkill(ManipulationSkill):
            direct descent that sags below its own endpoints is replaced by a
            Cartesian arc (``_build_arc_transit``); the via-hover route is
            audited warn-only. Built by the shared ``_build_gated_approach``
-           helper, which pre-position mode also dispatches standalone as its
-           POSITIONING move (with ``append_descent=False`` here).
+           helper. ``append_descent=False`` skips this segment (offline
+           callers, e.g. tests/audit_push_floor.py, arming a stroke from a
+           parked pose).
 
         2. **Push stroke** (grasp → push_end): rule-based Cartesian straight
            line for ``push_distance`` m parallel to the belt surface, paced by
@@ -1072,16 +1175,12 @@ class PushSkill(ManipulationSkill):
         # ================================================================
         # Segment 1: Descent  (aim → grasp, 6-DOF time-optimal) — OPTIONAL
         # ================================================================
-        # Skipped (append_descent=False) when the arm has ALREADY descended to
-        # the push-start pose during POSITIONING and is parked there waiting.
-        # Then only the stroke remains, so the object's arrival fires the
-        # contact immediately — the descent no longer eats into the
-        # arrival-timing budget (the dynamic arrival lead).
+        # Skipped (append_descent=False) by offline callers arming a stroke
+        # from an already-parked pose; execute() always includes it (flow).
         n_desc = 0
         desc_end_t = 0.0
         if append_descent:
-            # Built + floor-gated by the shared helper (also dispatched
-            # standalone as pre-position mode's POSITIONING move): the direct
+            # Built + floor-gated by the shared helper: the direct
             # route is audited with _transit_sag and replaced by a Cartesian
             # arc when it sags; the via-hover route is audited warn-only.
             traj_desc, vel_desc, ts_desc = self._build_gated_approach(
@@ -1459,7 +1558,9 @@ class PushSkill(ManipulationSkill):
             "push_speed": PUSH_SPEED,
             "contact_offset": contact_offset,
             "v_contact": v_contact,
+            "stroke_clamp": getattr(self, "_last_stroke_clamp", 1.0),
             "t_contact": t_contact,
+            "approach_s": desc_end_t,
             "theta": theta,
             "stroke_mode": PUSH_STROKE_MODE,
             "swing_mode": PUSH_SWING_MODE,
@@ -1881,6 +1982,11 @@ class PushSkill(ManipulationSkill):
         # Match the trajectory's DOF (stroke is now full 6-DOF).
         m1 = np.asarray(ctx.M1[: traj.shape[0]], dtype=float)
 
+        # Cumulative time-stretch applied to THIS build's stroke (1.0 = limits
+        # never bound). Stashed for the cycle CSV so "the strike felt slow" is
+        # checkable against data (see stroke_clamp_x).
+        self._last_stroke_clamp = 1.0
+
         for _ in range(2):
             dt_seg = np.maximum(np.diff(ts), 1e-9)
             seg_vel = np.abs(np.diff(traj, axis=1)) / dt_seg[None, :]  # (DOF, n-1)
@@ -1889,6 +1995,7 @@ class PushSkill(ManipulationSkill):
                 break
             scale = ratio * 1.05                       # +5% margin
             ts = ts * scale
+            self._last_stroke_clamp *= scale
 
             # Re-derive joint velocities at the stretched time scale
             # (np.gradient — the grid is uniform but the joint PROGRESS along
@@ -2295,34 +2402,119 @@ class PushSkill(ManipulationSkill):
     # ------------------------------------------------------------------
     # Per-cycle timing log (mirrors throw_skill._log_throw_cycle)
     # ------------------------------------------------------------------
-    def _log_push_cycle(self, target: "TrackedObject") -> None:
-        """Append one push-cycle timing row to PICK_LOG_CSV for offline analysis.
+    def _log_push_cycle(
+        self,
+        target: "TrackedObject",
+        outcome: str = "ok",
+        abort_reason: str = "",
+    ) -> None:
+        """Append one push-cycle timing row for offline analysis
+        (``tools/analyze_pick_log.py``).
 
         Logs push-specific parameters (speed, distance, angle, step counts)
-        alongside the shared conveyor/timing fields.
+        alongside the shared conveyor/timing fields. ``outcome`` is ``"ok"``
+        for a fired cycle and ``"abort"`` for the no-bin / stale-stroke early
+        exits — abort rows carry the same scoreboard fields (computed at the
+        would-be fire instant), so they land on the same fire_early_ms axis.
+
+        Rows go to a PUSH-ONLY sibling of ``PICK_LOG_CSV``
+        (``~/gp8_pick_log.csv`` → ``~/gp8_pick_log.push.csv``): throw logs a
+        DIFFERENT column set to the shared file, and ``_append_csv_row`` only
+        writes a header into a new/empty file — mixing both skills in one CSV
+        misaligns every row of whichever skill didn't write first.
         """
         ctx = self.ctx
         path = ctx.cfg.PICK_LOG_CSV
         if not path:
             return
+        stem, ext = os.path.splitext(path)
+        path = f"{stem}.push{ext or '.csv'}"
 
         meta = self._last_push_meta or {}
 
         # No io_ms: push is contact-based (no suction IO to time). The old code
         # read ctx.traj_ctrl.last_throw here, which push never writes — so it
         # logged a stale value left by the previous THROW. Dropped.
+
+        def _ms(x, nd: int = 0):
+            """ms-ish numeric cell: None/'' → '' (CSV blank); nd=0 → int."""
+            if x is None or x == "":
+                return ""
+            v = round(float(x), nd)
+            return int(v) if nd == 0 else v
+
         row = {
             "iso_time": datetime.datetime.now().isoformat(timespec="milliseconds"),
             "skill": "push",
             "class": target.class_name,
+            "outcome": outcome,
+            "abort_reason": abort_reason,
             "belt_mps": round(ctx.conveyor.current, 4),
             "push_speed_mps": meta.get("push_speed", ""),
             "push_distance_m": meta.get("push_distance", ""),
+            # "Slow strike" quantifiers: planned Cartesian speed AT CONTACT
+            # (a min-X-shortened run-up can't reach full PUSH_SPEED) and the
+            # joint-limit clamp's cumulative time stretch (1.0 = untouched).
+            "v_contact_mps": (
+                "" if meta.get("v_contact") is None
+                else round(float(meta["v_contact"]), 3)
+            ),
+            "stroke_clamp_x": (
+                "" if meta.get("stroke_clamp") is None
+                else round(float(meta["stroke_clamp"]), 3)
+            ),
             "theta_deg": round(np.degrees(meta.get("theta", 0.0)), 1),
             "swing_mode": meta.get("swing_mode", ""),
             "swing_deg": round(np.degrees(meta.get("swing", 0.0)), 1),
             "n_descent": meta.get("n_descent", ""),
             "n_stroke": meta.get("n_stroke", ""),
             "chain_dest": meta.get("chain_dest", ""),
+            # ---- Minimal-timing scoreboard (2026-07-22) ----
+            # fire_early_ms: RESIDUAL timing error at the fire instant after
+            # the applied lead, (delta/v − lead) — >0 fired early, <0 late
+            # (model-side). lead = t_contact + applied_lag, so ≈0 means "fired
+            # exactly as the corrected schedule intended". The budget_* columns
+            # are the placement model's converged parts for this cycle; compare
+            # budget_position_ms against approach_ms (what the built trajectory
+            # actually planned) to see if the constant-free position estimate
+            # holds.
+            "t_contact_ms": _ms(meta.get("t_contact", 0.0) * 1000.0),
+            "lead_ms": _ms(meta.get("lead_ms")),
+            "applied_lag_ms": _ms(PUSH_PERCEPTION_LAG * 1000.0),
+            "approach_ms": _ms(meta.get("approach_s", 0.0) * 1000.0),
+            "budget_position_ms": _ms(
+                None if meta.get("budget_position_s") is None
+                else meta["budget_position_s"] * 1000.0
+            ),
+            "budget_runup_ms": _ms(
+                None if meta.get("budget_runup_s") is None
+                else meta["budget_runup_s"] * 1000.0
+            ),
+            "budget_via": (
+                "" if meta.get("budget_via") is None
+                else int(bool(meta.get("budget_via")))
+            ),
+            # 1 = the placement budget applied the floor-gate arc envelope
+            # (LOW→LOW direct transit). Expect budget_position ≈ approach on
+            # these rows — the fix for the −451/−506 ms chained late-fires.
+            "budget_gated": (
+                "" if meta.get("budget_gated") is None
+                else int(bool(meta.get("budget_gated")))
+            ),
+            "exec_to_wait_ms": _ms(meta.get("exec_to_wait_ms")),
+            "fire_delta_m": (
+                "" if meta.get("fire_delta_m") is None
+                else round(float(meta["fire_delta_m"]), 4)
+            ),
+            "fire_early_ms": _ms(meta.get("fire_early_ms")),
+            # Dead-reckon age of the object's last detection at the (would-be)
+            # fire instant — large values mean fire_early_ms rests on a long
+            # extrapolation, so filter on this before trusting the bias.
+            "det_age_ms": _ms(meta.get("det_age_ms")),
+            # Abort rows only: metres past the last catchable stroke-Y.
+            "past_stroke_m": (
+                "" if meta.get("past_stroke_m") is None
+                else round(float(meta["past_stroke_m"]), 4)
+            ),
         }
         self._append_csv_row(path, row, ctx.log)
