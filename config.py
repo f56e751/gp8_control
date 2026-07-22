@@ -187,6 +187,11 @@ class Config:
     THROW_GOAL_RADIUS: float = field(
         default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_RADIUS", "0.10"))
     )
+    # Optional JSON list of throw bins. Empty keeps the existing single-goal
+    # behavior; launch exposes this as ``throw_bins:=...``.
+    THROW_BINS: str = field(
+        default_factory=lambda: os.environ.get("GP8_THROW_BINS", "")
+    )
 
     # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
     PICK_LOG_CSV: str = field(
@@ -237,6 +242,18 @@ class Config:
     # drift-spawned twin (~8 cm after a 4 s loop stall) while keeping objects
     # spaced a normal belt gap apart distinct.
     OBJECT_MERGE_EPS_Y_MAX: float = 0.10
+
+    # Per-object camera-speed diagnostic. Fit each object's apparent speed from
+    # the (t, y) anchors accumulated in the camera box, but keep control timing
+    # on the conveyor encoder speed; the fit is logged only for calibration.
+    # Fitted only when there are >= MIN_ANCHORS spanning >= MIN_SPAN_S with fit
+    # RMS <= MAX_RMS, and the result is clamped to belt*(1 +/- CLAMP_FRAC) — a
+    # fit outside that band is rejected as a likely mis-association.
+    OBJECT_VEL_WINDOW_S: float = 1.5      # only anchors newer than this are fit [s]
+    OBJECT_VEL_MIN_ANCHORS: int = 4       # need >= this many detections to fit
+    OBJECT_VEL_MIN_SPAN_S: float = 0.3    # anchors must span >= this in time [s]
+    OBJECT_VEL_MAX_RMS: float = 0.02      # reject the fit if residual RMS > this [m]
+    OBJECT_VEL_CLAMP_FRAC: float = 0.25   # accept v_est only within belt*(1 +/- this)
 
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
     # whose ETA < move_time * factor — i.e. objects that will reach the

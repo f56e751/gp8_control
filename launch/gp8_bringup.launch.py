@@ -202,6 +202,15 @@ def generate_launch_description():
         default_value=EnvironmentVariable("GP8_THROW_GOAL_RADIUS", default_value="0.10"),
         description="Horizontal acceptance radius for predicted throw landing [m].",
     )
+    throw_bins_arg = DeclareLaunchArgument(
+        "throw_bins",
+        default_value=EnvironmentVariable("GP8_THROW_BINS", default_value=""),
+        description=(
+            "Optional JSON throw-bin list: "
+            "[{\"name\":\"left\",\"x\":1.2,\"y\":0.3,\"z\":0.08,\"radius\":0.1}]. "
+            "Empty keeps throw_goal_x/y/radius behavior."
+        ),
+    )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
     # the included adv4ncr stack's robot_state_publisher and by move_group
@@ -392,6 +401,7 @@ def generate_launch_description():
             "GP8_THROW_GOAL_X": LaunchConfiguration("throw_goal_x"),
             "GP8_THROW_GOAL_Y": LaunchConfiguration("throw_goal_y"),
             "GP8_THROW_GOAL_RADIUS": LaunchConfiguration("throw_goal_radius"),
+            "GP8_THROW_BINS": LaunchConfiguration("throw_bins"),
         },
     )
 
@@ -429,6 +439,7 @@ def generate_launch_description():
         throw_goal_x_arg,
         throw_goal_y_arg,
         throw_goal_radius_arg,
+        throw_bins_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,

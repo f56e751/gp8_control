@@ -119,6 +119,11 @@ class GP8App:
             drift_frac=self.cfg.OBJECT_MATCH_DRIFT_FRAC,
             eps_y_max=self.cfg.OBJECT_MATCH_EPS_Y_MAX,
             merge_eps_y_max=self.cfg.OBJECT_MERGE_EPS_Y_MAX,
+            vel_window_s=self.cfg.OBJECT_VEL_WINDOW_S,
+            vel_min_anchors=self.cfg.OBJECT_VEL_MIN_ANCHORS,
+            vel_min_span_s=self.cfg.OBJECT_VEL_MIN_SPAN_S,
+            vel_max_rms=self.cfg.OBJECT_VEL_MAX_RMS,
+            vel_clamp_frac=self.cfg.OBJECT_VEL_CLAMP_FRAC,
         )
 
     # ------------------------------------------------------------------
@@ -213,7 +218,14 @@ class GP8App:
             M1=self.M1,
             M2=self.M2,
             max_reach=self.cfg.MAX_REACH,
-            target_distance=self.cfg.TARGET_DISTANCE,
+            # Previous behavior kept the NN's bin-distance input fixed at 1.2 m,
+            # regardless of the configured throw-goal position:
+            # target_distance=self.cfg.TARGET_DISTANCE,
+            # Keep the existing theta/coordinate-alignment convention, but make
+            # the distance input match the bin's base-frame XY radius.
+            target_distance=float(np.hypot(
+                self.cfg.THROW_GOAL_X, self.cfg.THROW_GOAL_Y,
+            )),
             decoding=self.cfg.throw_decoding(),
             max_pick_lead=self.cfg.MAX_PICK_LEAD,
         )

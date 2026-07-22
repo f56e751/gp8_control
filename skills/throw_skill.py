@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -82,6 +83,7 @@ class ThrowSkill(ManipulationSkill):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._last_throw_meta: dict = {}
+        self._throw_bins = self._parse_throw_bins(ctx.cfg.THROW_BINS)
         self._visualizer = ThrowVisualizer(
             ctx.node,
             ctx.robot,
@@ -89,6 +91,41 @@ class ThrowSkill(ManipulationSkill):
             goal_xy=(ctx.cfg.THROW_GOAL_X, ctx.cfg.THROW_GOAL_Y),
             goal_radius=ctx.cfg.THROW_GOAL_RADIUS,
         )
+
+    @staticmethod
+    def _parse_throw_bins(raw: str) -> list[tuple[str, np.ndarray, float]]:
+        if not raw.strip():
+            return []
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("throw_bins must be a JSON list")
+        bins = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise ValueError(f"throw_bins[{i}] must be an object")
+            name = str(item.get("name", f"bin{i + 1}"))
+            xyz = np.asarray([item["x"], item["y"], item["z"]], dtype=float)
+            radius = float(item.get("radius", 0.10))
+            if not np.all(np.isfinite(xyz)) or not np.isfinite(radius) or radius <= 0.0:
+                raise ValueError(f"throw_bins[{i}] has invalid coordinates/radius")
+            bins.append((name, xyz, radius))
+        return bins
+
+    def _select_throw_bin(self, T_grasp: np.ndarray):
+        """Choose once from the planned final grasp; the throw flow stays unchanged."""
+        if not self._throw_bins:
+            return None
+        grasp_xy = np.asarray(T_grasp[:2, 3], dtype=float)
+        distances = [float(np.linalg.norm(xyz[:2] - grasp_xy))
+                     for _, xyz, _ in self._throw_bins]
+        index = int(np.argmin(distances))
+        selected = self._throw_bins[index]
+        self.ctx.log.info(
+            f"[bin-select] grasp=({grasp_xy[0]:+.3f},{grasp_xy[1]:+.3f}) "
+            f"candidates={[f'{b[0]}:{d:.3f}m' for b, d in zip(self._throw_bins, distances)]} "
+            f"selected={selected[0]}"
+        )
+        return selected
 
     def t_to_contact(self, move_time: float) -> float:
         """Throw pick budget = positioning estimate + a GUARANTEED parked
@@ -313,6 +350,13 @@ class ThrowSkill(ManipulationSkill):
                         f"{float(track[2][-1]):.2f}s"
                     )
 
+        # The tracking trajectory's final joint is already known before pickup,
+        # so choose the nearest bin once from its predicted final grasp pose.
+        bin_grasp = T_grasp
+        if track is not None:
+            bin_grasp = ctx.robot.forward_kinematics(track[0][:, -1][:6])
+        selected_bin = self._select_throw_bin(bin_grasp)
+
         # Drive to the wait pose and (for the parked pick) prime suction SUCTION_LEAD
         # before the object's arrival. Returns arrival_lead() before the object
         # reaches the intercept.
@@ -369,39 +413,59 @@ class ThrowSkill(ManipulationSkill):
         # Lift + throw.
         ctx.set_status("THROWING", target.class_name)
 
+        if selected_bin is None:
+            goal_x = float(ctx.cfg.THROW_GOAL_X)
+            goal_y = float(ctx.cfg.THROW_GOAL_Y)
+            goal_radius = float(ctx.cfg.THROW_GOAL_RADIUS)
+        else:
+            _, selected_xyz, goal_radius = selected_bin
+            goal_x, goal_y = map(float, selected_xyz[:2])
+        model_distance = float(np.hypot(goal_x, goal_y))
+        self._visualizer.set_goal((goal_x, goal_y), goal_radius)
+
         # Match the coordinate convention used to train the FCN: theta is the
         # base-origin azimuth of the throw target, and the grasp/aim XY inputs
         # are rotated by -theta inside PickThrowPlanner.  Do NOT use the
         # point-to-point bearing (goal - grasp) here; that rotates coordinates
         # about the wrong reference and produced a ~44 deg release-direction
-        # error on hardware.  TARGET_DISTANCE intentionally remains the
-        # separately configured fixed model input (currently 1.2 m).
+        # error on hardware. The NN distance is the selected bin's base-frame
+        # XY radius, matching the existing single-goal convention.
         theta = float(np.arctan2(
-            ctx.cfg.THROW_GOAL_Y,
-            ctx.cfg.THROW_GOAL_X,
+            goal_y,
+            goal_x,
         ))
         ctx.log.info(
             f"Throw frame: theta={np.degrees(theta):+.2f}deg (goal azimuth), "
             f"grasp=({T_grasp[0, 3]:+.3f},{T_grasp[1, 3]:+.3f}), "
-            f"goal=({ctx.cfg.THROW_GOAL_X:+.3f},{ctx.cfg.THROW_GOAL_Y:+.3f}), "
-            f"model_distance={ctx.cfg.TARGET_DISTANCE:.3f}m"
+            f"goal=({goal_x:+.3f},{goal_y:+.3f}), "
+            f"model_distance={model_distance:.3f}m"
         )
 
-        # Throw target. If the class has a fixed bin coord in THROW_BIN_TARGET_MAP,
-        # override T_aim2 with that absolute base-frame XYZ so the NN aims at the
-        # bin. Otherwise fall back to the legacy plan_throw_landing (secondary's
-        # predicted position, or T_aim hover when no secondary).
-        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
-        if bin_xyz is not None:
+        # A selected runtime bin behaves exactly like the existing fixed bin;
+        # without throw_bins, preserve the legacy per-class/fallback flow.
+        if selected_bin is not None:
+            bin_name, bin_xyz, _ = selected_bin
             T_aim2 = np.eye(4)
             T_aim2[:3, :3] = T_aim[:3, :3]
-            T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+            T_aim2[:3, 3] = bin_xyz
             ctx.log.info(
-                f"Throw target for {target.class_name}: fixed bin "
+                f"Throw target: selected bin {bin_name} "
                 f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
             )
         else:
-            T_aim2 = self.plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
+            bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+            if bin_xyz is not None:
+                T_aim2 = np.eye(4)
+                T_aim2[:3, :3] = T_aim[:3, :3]
+                T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+                ctx.log.info(
+                    f"Throw target for {target.class_name}: fixed bin "
+                    f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
+                )
+            else:
+                T_aim2 = self.plan_throw_landing(
+                    T_grasp, theta, T_aim, time.time(), secondary,
+                )
 
         aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
         if aim_joint2 is None:
@@ -409,7 +473,9 @@ class ThrowSkill(ManipulationSkill):
             aim_joint2, T_aim2 = aim_joint, T_aim
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
-        params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
+        params = ctx.planner.compute_throw_params(
+            T_grasp, T_aim2, theta, target_distance=model_distance,
+        )
         # Chain the follow-through toward the NEXT object's grasp (best-effort) so the arm
         # OVERLAPS the next approach with this throw instead of parking far and re-driving
         # serially. Symmetric + stateless: the next epoch still SELECTS + DRIVES fresh from
