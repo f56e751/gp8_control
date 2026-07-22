@@ -192,6 +192,16 @@ class Config:
     # spaced a normal belt gap apart distinct.
     OBJECT_MERGE_EPS_Y_MAX: float = 0.10
 
+    # 검출↔트랙 연관 방식. "hungarian"(기본): 프레임의 검출 전체×트랙 전체의
+    # 비용(창-정규화 거리 합 = "전체 거리")을 scipy 최적 할당으로 한 번에
+    # 최소화 — 허용창이 겹칠 만큼 붙어 오는 이웃 물체들의 트랙 교차(스왑)를
+    # 방지한다. "greedy": 구 선착순 매칭 (검출마다 창 안 첫 트랙). 두 방식의
+    # 게이트(창 밖 = 매칭 불가)는 동일하므로, 물체 간격이 창보다 넓으면 결과도
+    # 동일하다. env GP8_TRACK_ASSOC.
+    TRACK_ASSOC: str = field(
+        default_factory=lambda: _env_default("GP8_TRACK_ASSOC", "hungarian")
+    )
+
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
     # whose ETA < move_time * factor — i.e. objects that will reach the
     # intercept before the arm can finish positioning. opt_time is known to

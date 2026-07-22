@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from gp8_control.tracking import TrackedObject
 
@@ -59,8 +60,12 @@ class DetectionIntake:
     same one.
     """
 
+    #: 게이트 밖(매칭 불가) 셀의 비용 — 할당 결과가 이 값이면 미매칭으로 처리.
+    _INFEASIBLE = 1e6
+
     def __init__(self, eps: float, drift_frac: float = 0.25,
-                 eps_y_max: float = 0.20, merge_eps_y_max: float = 0.10) -> None:
+                 eps_y_max: float = 0.20, merge_eps_y_max: float = 0.10,
+                 assoc: str = "hungarian") -> None:
         #: spatial match radius [m] — OBJECT_MATCH_EPSILON on the app Config.
         self.eps = eps
         #: belt-direction tolerance growth per second of dead reckoning, as a
@@ -70,6 +75,42 @@ class DetectionIntake:
         self.eps_y_max = eps_y_max
         #: tighter cap for the merge pass (Config.OBJECT_MERGE_EPS_Y_MAX).
         self.merge_eps_y_max = merge_eps_y_max
+        #: 검출↔트랙 연관 방식 (Config.TRACK_ASSOC): "hungarian" | "greedy".
+        self.assoc = assoc
+
+    def _associate_hungarian(self, tracks, dets, v, detect_time):
+        """프레임 전역 최적 연관 (Hungarian / scipy linear_sum_assignment).
+
+        "전체 거리" = 채택된 (트랙, 검출) 짝들의 창-정규화 거리의 합. 이 합이
+        최소가 되는 짝 조합을 한 번에 고르므로, 허용창이 겹치는 이웃 물체에서
+        선착순(greedy) 매칭이 일으키는 트랙 교차(스왑)가 생기지 않는다.
+
+        게이트는 greedy(_matches)와 동일 — x는 ±eps, y는 나이 비례 창 밖이면
+        매칭 불가. 비용 = hypot(dx/eps, dy/eps_y) + (클래스 불일치 시 +0.25:
+        위치가 비슷할 때만 판가름하는 소프트 페널티 — 캔·병이 나란히 올 때 도움).
+        리턴: (pairs=[(track, det_dict)], unmatched=[det_dict]).
+        """
+        if not tracks or not dets:
+            return [], list(dets)
+        C = np.full((len(tracks), len(dets)), self._INFEASIBLE)
+        for i, o in enumerate(tracks):
+            age = detect_time - o.detect_time
+            ox = float(o.T_grasp_base[0, 3])
+            oy = float(o.T_grasp_base[1, 3] - v * age)
+            eps_y = self._eps_y(age, v)
+            for j, dd in enumerate(dets):
+                ndx = abs(ox - dd["x"]) / self.eps
+                ndy = abs(oy - dd["y"]) / eps_y
+                if ndx < 1.0 and ndy < 1.0:
+                    cost = float(np.hypot(ndx, ndy))
+                    if dd["cls"] != o.class_name:
+                        cost += 0.25
+                    C[i, j] = cost
+        rows, cols = linear_sum_assignment(C)
+        ok = [(i, j) for i, j in zip(rows, cols) if C[i, j] < self._INFEASIBLE]
+        matched_j = {j for _, j in ok}
+        return ([(tracks[i], dets[j]) for i, j in ok],
+                [dd for j, dd in enumerate(dets) if j not in matched_j])
 
     def _grown_eps_y(self, age: float, v: float, cap: float) -> float:
         """Belt-direction window for a track last seen ``age`` s ago.
@@ -141,60 +182,87 @@ class DetectionIntake:
 
         added = 0
         refreshed = 0
+
+        dets = []
         for d in detections:
-            base_aim = d.get("base_aim", [0.0, 0.0, 0.0])
             base_grasp = d.get("base_grasp", [0.0, 0.0, 0.0])
-            det_x = float(base_grasp[0])
-            det_y = float(base_grasp[1])
-            det_class = d.get("class", "?")
-            conf = float(d.get("confidence", -1.0))
-            match = next((o for o in existing if _matches(o, det_x, det_y)), None)
-            if match is not None:
-                # Re-anchor the existing track to this fresh detection instead of
-                # adding a duplicate. Resetting the extrapolation reference
-                # (detect_time + pose) every frame keeps drift below ``eps`` so a
-                # 2nd "object" never spawns at the same spot. Class kept as-is.
-                match.T_aim_base = _make_transform(_R_GRASP_DEFAULT, base_aim)
-                match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, base_grasp)
-                match.detect_time = detect_time
-                match.cam_pos = tuple(d.get("cam", [0.0, 0.0, 0.0]))
-                match.conf = conf
-                # Class is VOTED, not latched: add this frame's confidence-weighted
-                # vote and adopt the running argmax. The spawn frame is often the
-                # noisy entry-edge frame (low conf), so a PET that misfired as metal
-                # on spawn is corrected here once consistent higher-confidence
-                # transparent detections outweigh it — instead of being pushed
-                # forever. Log only the flip (no per-frame spam).
-                prev_class = match.class_name
-                voted = match.vote_class(det_class, conf)
-                if voted != prev_class:
-                    match.class_name = voted
-                    if logger is not None:
-                        logger.warn(
-                            f"[track-RECLASS] id={match.track_id} {prev_class} -> "
-                            f"{voted} (votes {_fmt_votes(match.class_votes)}; "
-                            f"det {det_class} conf={conf:.2f})"
-                        )
-                refreshed += 1
+            dets.append(dict(
+                aim=d.get("base_aim", [0.0, 0.0, 0.0]),
+                grasp=base_grasp,
+                x=float(base_grasp[0]), y=float(base_grasp[1]),
+                cls=d.get("class", "?"),
+                conf=float(d.get("confidence", -1.0)),
+                cam=d.get("cam", [0.0, 0.0, 0.0]),
+            ))
+
+        def _reanchor(match: TrackedObject, dd: dict) -> None:
+            # Re-anchor the existing track to this fresh detection instead of
+            # adding a duplicate. Resetting the extrapolation reference
+            # (detect_time + pose) every frame keeps drift below the window so a
+            # 2nd "object" never spawns at the same spot.
+            nonlocal refreshed
+            match.T_aim_base = _make_transform(_R_GRASP_DEFAULT, dd["aim"])
+            match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, dd["grasp"])
+            match.detect_time = detect_time
+            match.cam_pos = tuple(dd["cam"])
+            match.conf = dd["conf"]
+            # Class is VOTED, not latched: add this frame's confidence-weighted
+            # vote and adopt the running argmax (spawn frame is often the noisy
+            # entry-edge frame). Log only the flip (no per-frame spam).
+            prev_class = match.class_name
+            voted = match.vote_class(dd["cls"], dd["conf"])
+            if voted != prev_class:
+                match.class_name = voted
+                if logger is not None:
+                    logger.warn(
+                        f"[track-RECLASS] id={match.track_id} {prev_class} -> "
+                        f"{voted} (votes {_fmt_votes(match.class_votes)}; "
+                        f"det {dd['cls']} conf={dd['conf']:.2f})"
+                    )
+            refreshed += 1
+
+        # ---- 검출 ↔ 트랙 연관 ----
+        # hungarian(기본): 프레임 전역 최적 할당 — "전체 거리"(짝별 창-정규화
+        # 거리 합) 최소 조합. greedy: 구 선착순 (검출마다 창 안 첫 트랙).
+        if self.assoc == "hungarian":
+            pairs, unmatched = self._associate_hungarian(
+                existing, dets, v, detect_time)
+        else:
+            pairs, unmatched = [], []
+            for dd in dets:
+                m = next((o for o in existing if _matches(o, dd["x"], dd["y"])), None)
+                (pairs.append((m, dd)) if m is not None else unmatched.append(dd))
+
+        for match, dd in pairs:
+            _reanchor(match, dd)
+
+        for dd in unmatched:
+            # 한 프레임에 같은 물체가 두 박스로 잡히는 중복 검출 흡수: 이미
+            # 매칭됐거나 방금 스폰된 트랙과 겹치면 스폰 대신 재앵커한다
+            # (hungarian은 1:1 할당이라 두 번째 박스가 여기로 온다 — 구 greedy가
+            # 같은 트랙을 두 번 재앵커하던 동작의 보존).
+            fb = next((o for o in existing if _matches(o, dd["x"], dd["y"])), None)
+            if fb is not None:
+                _reanchor(fb, dd)
                 continue
             new_obj = TrackedObject(
-                T_aim_base=_make_transform(_R_GRASP_DEFAULT, base_aim),
-                T_grasp_base=_make_transform(_R_GRASP_DEFAULT, base_grasp),
-                class_name=det_class,
+                T_aim_base=_make_transform(_R_GRASP_DEFAULT, dd["aim"]),
+                T_grasp_base=_make_transform(_R_GRASP_DEFAULT, dd["grasp"]),
+                class_name=dd["cls"],
                 detect_time=detect_time,
-                cam_pos=tuple(d.get("cam", [0.0, 0.0, 0.0])),
-                conf=conf,
+                cam_pos=tuple(dd["cam"]),
+                conf=dd["conf"],
             )
             # Seed the class vote with the spawn frame's confidence so a confident
             # spawn class isn't flipped by one stray frame, but a low-confidence one
             # (the usual misfire) is easily outvoted. class_name stays det_class here.
-            new_obj.vote_class(det_class, conf)
+            new_obj.vote_class(dd["cls"], dd["conf"])
             queue.add(new_obj)
             existing.append(new_obj)  # dedupe within the same intake too
             if logger is not None:
                 logger.info(
                     f"[track-NEW] id={new_obj.track_id} class={new_obj.class_name} "
-                    f"x={det_x:+.3f} y={det_y:+.3f} conf={conf:.2f}"
+                    f"x={dd['x']:+.3f} y={dd['y']:+.3f} conf={dd['conf']:.2f}"
                 )
             added += 1
 
