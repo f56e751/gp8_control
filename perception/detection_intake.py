@@ -81,6 +81,11 @@ class DetectionIntake:
         self.vel_clamp_frac = vel_clamp_frac
         #: track_ids already logged as speed-deviating (one line per object).
         self._vel_logged: set = set()
+        #: optional callback(v_fit) — CameraSpeedTracker.observe 등, 품질 게이트를
+        #: 통과한 물체별 속도 fit의 소비자. 벨트-밴드 클램프 **이전에** 호출한다:
+        #: camera 모드에선 클램프 기준(벨트 속도)이 바로 이 소비자의 추정치라,
+        #: 클램프 뒤에 보고하면 잘못된 초기 fallback에 갇혀 수렴하지 못한다.
+        self.speed_sink = None
 
     def _update_velocity(self, obj, t: float, y: float, v_belt: float,
                          logger=None) -> None:
@@ -111,6 +116,8 @@ class DetectionIntake:
         rms = float(np.sqrt(np.mean((ys - A @ coef) ** 2)))
         if rms > self.vel_max_rms:
             return                            # noisy/inconsistent — keep fallback
+        if self.speed_sink is not None:       # 클램프 이전 보고 (docstring 참고)
+            self.speed_sink(v_fit, obj.track_id)
         if v_belt > 0.02:                     # clamp to belt band (skip if belt ~0)
             lo, hi = v_belt * (1 - self.vel_clamp_frac), v_belt * (1 + self.vel_clamp_frac)
             if not (lo <= v_fit <= hi):

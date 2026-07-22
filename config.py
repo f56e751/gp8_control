@@ -33,6 +33,18 @@ class Config:
     CONVEYOR_SPEED: float = 0.083
     CONVEYOR_TOPIC: str = "/conveyor/speed"
     CONVEYOR_STALE_SECONDS: float = 2.0
+    # Belt-speed source. "encoder" (기본, 기존 그대로): ConveyorSpeedTracker가
+    # CONVEYOR_TOPIC(엔코더 노드 발행)을 구독. "camera": 엔코더 없이
+    # CameraSpeedTracker가 지나가는 물체들의 per-object 속도 fit(detection_intake)
+    # 을 집계해 벨트 속도를 추론하고, CONVEYOR_TOPIC에 발행까지 대신한다
+    # (camera_debug 역보정/belt_viz 호환 — 엔코더 노드와 동시 사용 금지).
+    # env GP8_CONVEYOR_SOURCE / launch conveyor_source:=.
+    CONVEYOR_SOURCE: str = field(
+        default_factory=lambda: _env_default("GP8_CONVEYOR_SOURCE", "encoder")
+    )
+    # camera 모드 갱신 배치: 서로 다른 물체 이만큼이 fit을 내면 그들의 중앙값으로
+    # 1회 갱신 (한 물체는 한 배치에만 기여). 1 = 물체마다 갱신.
+    CONVEYOR_CAMERA_BATCH_N: int = 3
     TARGET_DISTANCE: float = 1.2
 
     # Fixed lead (s) folded into the throw-landing projection so the aim

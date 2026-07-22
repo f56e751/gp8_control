@@ -10,6 +10,7 @@ itself stays small — domain logic lives in ``perception/``,
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -24,7 +25,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.conveyor import ConveyorSpeedTracker
+from gp8_control.conveyor import CameraSpeedTracker, ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -141,19 +142,40 @@ class GP8App:
         )
 
         self.traj_ctrl = TrajectoryController(self._node)
-        self.moveit_ctrl = MoveItController(self._node)
+        # MoveItController는 현재 어디서도 호출되지 않는다 (초기 자세 이동도
+        # trajectory()로 처리). 기본은 생성하지 않아 move_group 의존과 그
+        # __init__의 30초 대기를 없앤다. 옛 동작이 필요하면 GP8_USE_MOVEIT=1.
+        self.moveit_ctrl = (
+            MoveItController(self._node)
+            if os.environ.get("GP8_USE_MOVEIT", "0").lower() in ("1", "true", "yes")
+            else None
+        )
         # camera_debug node owns the perception stream + corrections; we just
         # subscribe to its corrected detection list.
         self._node.create_subscription(
             String, "/camera_debug/detections",
             self._on_camera_debug_detections, 10,
         )
-        self.conveyor = ConveyorSpeedTracker(
-            self._node,
-            self.cfg.CONVEYOR_TOPIC,
-            self.cfg.CONVEYOR_SPEED,
-            self.cfg.CONVEYOR_STALE_SECONDS,
-        )
+        # Belt-speed source (cfg.CONVEYOR_SOURCE): 기본 "encoder"는 기존
+        # ConveyorSpeedTracker 그대로. "camera"는 엔코더 없이 지나가는 물체들의
+        # 속도 fit(detection_intake._update_velocity)을 집계해 추론 —
+        # speed_sink로 fit을 공급받고, CONVEYOR_TOPIC 발행도 대신한다.
+        if str(self.cfg.CONVEYOR_SOURCE).strip().lower() == "camera":
+            self.conveyor = CameraSpeedTracker(
+                self._node,
+                self.cfg.CONVEYOR_TOPIC,
+                self.cfg.CONVEYOR_SPEED,
+                self.cfg.CONVEYOR_STALE_SECONDS,
+                batch_n=self.cfg.CONVEYOR_CAMERA_BATCH_N,
+            )
+            self.detection_intake.speed_sink = self.conveyor.observe
+        else:
+            self.conveyor = ConveyorSpeedTracker(
+                self._node,
+                self.cfg.CONVEYOR_TOPIC,
+                self.cfg.CONVEYOR_SPEED,
+                self.cfg.CONVEYOR_STALE_SECONDS,
+            )
 
         self.traj_ctrl.wait_for_servers()
         # Now that every subscription + service/action client exists and servers
