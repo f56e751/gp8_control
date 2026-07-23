@@ -186,14 +186,24 @@ def _precompute_cycles(ctx, skill, robot, cfg, points, targets, idle_joint,
     ctx.traj_ctrl = cap
     try:
         prev_end = np.asarray(idle_joint, dtype=float)
+        kept, skipped = [], []
         for j, c in enumerate(viable):
             nxt = viable[j + 1]["q_grasp"] if j + 1 < len(viable) else None
             cap.throw = None
             skill.build_throw_trajectory(c["q_press"], c["res"], c["lift"],
                                          next_grasp=nxt)
             if cap.throw is None:
-                sys.exit(f"cycle {c['no']}: 던지기 궤적이 로봇 한계 게이트에 "
-                         "걸림 — 기동 전 중단")
+                # 안전 게이트(관절 한계 / Cartesian 엔벨로프)에 걸린 사이클은
+                # **통째로 제외**한다 — 접근·하강·흡착도 만들지 않으므로 실행 단계가
+                # 이 지점을 아예 건드리지 않는다. 궤적만 빼고 픽을 남기면 물체를
+                # 집은 채 던지지 못하는 상태가 되므로 반드시 사이클 단위로 뺀다.
+                # prev_end 도 갱신하지 않아 다음 사이클의 접근이 '직전에 실제로
+                # 끝난 자세'에서 이어진다 (연속성 유지 — 안전상 필수).
+                x_, y_, z_ = c["point"]
+                print(f"  [SKIP] cycle {c['no']} ({x_:+.3f}, {y_:+.3f}, {z_:+.3f}) "
+                      f"→ 던지기 궤적이 안전 게이트에 걸림 — 이 지점은 픽도 하지 않음")
+                skipped.append(c)
+                continue
             c["throw"] = cap.throw
             c["expected_start"] = prev_end
             c["approach"] = trajectory(prev_end, zero6, c["q_hover"], zero6,
@@ -201,9 +211,21 @@ def _precompute_cycles(ctx, skill, robot, cfg, points, targets, idle_joint,
             c["descent"] = trajectory(c["q_hover"], zero6, c["q_press"], zero6,
                                       pos_M1, pos_M2, hertz=cfg.TRAJ_HZ)
             prev_end = cap.throw["final_joint"]
+            kept.append(c)
     finally:
         ctx.traj_ctrl = real_ctrl
-    return viable
+
+    if skipped:
+        print(f"\n  ** 안전 게이트로 제외된 지점 {len(skipped)}개 "
+              f"(로봇은 나머지 {len(kept)}개만 수행) **")
+        for c in skipped:
+            x_, y_, z_ = c["point"]
+            t_ = c["target"]
+            print(f"     cycle {c['no']}: ({x_:+.3f}, {y_:+.3f}, {z_:+.3f}) → "
+                  f"({t_[0]:+.2f}, {t_[1]:+.2f}, {t_[2]:+.2f})")
+    if not kept:
+        sys.exit("안전 게이트를 통과한 사이클이 없음 — 로봇을 움직이지 않고 종료")
+    return kept
 
 
 # ---------------------------------------------------------------------------

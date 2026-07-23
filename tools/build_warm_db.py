@@ -59,6 +59,13 @@ TARGETS: list[tuple[float, float, float]] = [
     (1.50, 0.225, 0.0), (1.50, 0.075, 0.0), (1.50, -0.075, 0.0), (1.50, -0.225, 0.0),
     (1.75, 0.225, 0.0), (1.75, 0.075, 0.0), (1.75, -0.075, 0.0), (1.75, -0.225, 0.0),
     (2.00, 0.225, 0.0), (2.00, 0.075, 0.0), (2.00, -0.075, 0.0), (2.00, -0.225, 0.0),
+    # 높이가 있는 bin (2026-07-23 사용자): run_static_pick_throw.sh 의 현재 TARGETS —
+    # XY는 위와 같고 착지 z만 다르다(1.75줄 0.04 / 2.00줄 0.10). entry 조회는 XY
+    # 최근접이라 z만 다른 목표도 위 z=0 entry로 warm start가 되긴 하지만, 그 해의
+    # Cartesian 엔벨로프 안전성은 '자기 z'에 대해서만 검증된 것이라 실제 사용하는
+    # 높이로 별도 entry를 만들어 둔다 (빌더 게이트가 그 z에서 직접 검증).
+    (1.50, 0.225, 0.04), (1.50, 0.075, 0.04), (1.50, -0.075, 0.04), (1.50, -0.225, 0.04),
+    (1.75, 0.225, 0.10), (1.75, 0.075, 0.10), (1.75, -0.075, 0.10), (1.75, -0.225, 0.10),
 ]
 # base-frame 던지기 시작 TCP [x, y, z] (m) — grasp(z=GRASP_Z) + THROW_LIFT 상승.
 # intercept 존: x는 벨트 밴드 [0.25, 0.65], y는 reach 원판 [-y_b, +y_b] 대표점.
@@ -73,23 +80,51 @@ P_STARTS: list[tuple[float, float, float]] = [
 # 스킬 상수 미러 (robust_throw_skill.py 와 동일해야 함)
 THROW_LIFT = 0.10          # grasp TCP + 이만큼 상승 = 던지기 시작
 LANDING_GATE = 0.03        # 윈도우 dense 착탄오차 상한 (m)
+# Cartesian 안전 엔벨로프 — robust_throw_skill.MIN_TCP_X / MIN_TCP_Z 미러.
+# 스윙 아크의 TCP가 기둥/베이스(x ≤ 0.20)나 바닥/벨트(z ≤ 0.04)로 들어가는 해는
+# 실기 dispatch 게이트에서 어차피 기각되므로 DB에 넣지 않는다. 이 검사가 없으면
+# 바닥을 파는 해가 entry로 저장되고, 런타임이 그걸 warm start로 써서 다시 바닥을
+# 파는 해로 수렴 → dispatch 기각, 이 악순환이 생긴다 (2026-07-23 실측: 12건 중 8건).
+MIN_TCP_X = 0.20
+MIN_TCP_Z = 0.04
 # 오프라인 multistart 초기해 — 런타임(robust_throw_skill.INIT_VARIANTS_ROS)보다
 # 의도적으로 넓게. 빌더는 (target,p_start)별로 게이트 통과한 것 중 min-J 해만
 # 저장하므로(main의 best dict) 변형이 많을수록 더 나은 basin을 고를 확률이 커진다
 # (2026-07-23 사용자 "최대한 다양한 초기값으로 최적화 뒤 best 저장"). dq_swing =
 # [S,L,U,R,B,T] 오프셋(플래너 규약); 지배축은 L(어깨)·U(elbow)·B(wrist pitch),
 # S(yaw)는 조준. 축 강조/스윙 진폭/시간(T0)/release비(chi0)/yaw부호를 교차.
-INIT_VARIANTS = (
-    None,                                                              # auto (yaw=target y 부호)
-    dict(dq_swing=[0.0, 0.9, 0.3, 0.0, 0.7, 0.0], T0=0.6),             # 어깨 위주, 빠름
-    dict(dq_swing=[0.0, 0.5, 0.9, 0.0, 0.2, 0.0], T0=1.1, chi0=0.7),   # elbow 위주, 느림·늦은 release
-    dict(dq_swing=[-0.13, 0.7, 0.6, 0.0, 0.4, 0.0]),                   # -yaw
-    dict(dq_swing=[0.13, 0.7, 0.6, 0.0, 0.4, 0.0]),                    # +yaw
-    dict(dq_swing=[0.0, 0.6, 0.6, 0.0, 0.9, 0.0], T0=0.8, chi0=0.5),   # wrist(B) 위주
-    dict(dq_swing=[0.0, 1.1, 0.7, 0.0, 0.8, 0.0], T0=1.0, chi0=0.55),  # 큰 스윙 (원거리 reach)
-    dict(dq_swing=[0.0, 1.0, 0.2, 0.0, 0.5, 0.0], T0=0.7, chi0=0.45),  # 어깨 위주, 더 빠름·이른 release
-    dict(dq_swing=[0.0, 0.4, 1.0, 0.0, 0.3, 0.0], T0=1.2, chi0=0.6),   # elbow 큰폭, 느림
-)
+def _make_init_variants(n: int = 24, seed: int = 0) -> tuple:
+    """넓은 multistart 초기해 집합 (격자에서 시드 고정 샘플링).
+
+    2026-07-23 사용자 "초기값 많이 해보고 최적값 고르는 넓은 탐색". 빌더는
+    (target, p_start)별로 게이트를 통과한 것 중 min-J 해만 저장하므로(main의 best
+    dict), 변형이 많을수록 더 나은 basin을 고를 확률이 커진다.
+
+    **오프셋 범위는 새 관절 한계에 맞춰 재설계했다.** q_L ≤ +45°인데 lift 자세의
+    q_L이 이미 22~34°라 L 여유가 0.19~0.40 rad뿐 — 구 변형들의 L 오프셋(0.4~1.1)은
+    전부 한계를 넘어 무의미하다. 그래서 스윙을 **U(elbow)·B(wrist) 주도**로 짠다
+    (여유: U ~0.73~1.05 rad, B는 상한 +135° 유지라 ~1.5 rad로 넉넉 — wrist snap을
+    살리는 쪽이 정확도에 유리하다). dq_swing = [S,L,U,R,B,T] 오프셋(플래너 규약).
+
+    시드 고정이라 spawn 워커들이 같은 목록을 재현한다 (vi 인덱스 일관성 필수).
+    """
+    import random
+    grid = [dict(dq_swing=[sy, l, u, 0.0, b, 0.0], T0=t0, chi0=c0)
+            for sy in (-0.13, 0.0, 0.13)      # 조준 yaw (±/중립)
+            for l in (0.05, 0.15, 0.28)       # 어깨: 한계 여유 안에서만
+            for u in (0.35, 0.60, 0.90)       # elbow: 주 구동축
+            for b in (0.20, 0.55, 0.90)       # wrist pitch: 상한 여유가 커 넓게
+            for t0 in (0.6, 0.9, 1.2)         # 스윙 소요시간 초기값
+            for c0 in (0.45, 0.60)]           # release 시점 비율
+    random.Random(seed).shuffle(grid)
+    return (None,) + tuple(grid[:max(0, n - 1)])
+
+
+# 12 = breadth/속도 절충 (2026-07-23 사용자 "너무 오래걸린다"). solve 1건 ~7s가
+# 하한이라 총시간 ≈ 조합수 × 변형수 × 7s ÷ 워커 — 변형 수가 유일한 실질 레버다
+# (워커는 이미 최대, expand:True로 이미 2× 가속, GPU 백엔드 없음). 24 -> 12로
+# 2160 -> 1080 solve, ~35분 -> ~18분. 넓히려면 이 숫자만 올리면 된다.
+INIT_VARIANTS = _make_init_variants(12)
 
 
 # ============================================================================
@@ -110,7 +145,7 @@ def _gates(res: dict, p_target) -> "str | None":
     """robust_throw_skill._solution_gates 와 동일 기준 (독립 재검증)."""
     import numpy as np
     from throw_nlp import _spline_eval
-    from throwing import GP8_QD_MAX, landing_error, launch_state
+    from throwing import GP8_QD_MAX, fk_pos, landing_error, launch_state
 
     if res.get("pos_viol_dense", 0.0) > 1e-3:
         return f"pos_viol_dense {res['pos_viol_dense']:.1e}"
@@ -130,6 +165,14 @@ def _gates(res: dict, p_target) -> "str | None":
     e_max = float(np.max(errs))
     if not np.isfinite(e_max) or e_max > LANDING_GATE:
         return f"landing window max {e_max * 1e3:.0f}mm > {LANDING_GATE * 1e3:.0f}mm"
+    # Cartesian 엔벨로프: 스윙 아크 전 구간의 TCP (플래너 규약 fk_pos — 로봇 FK와
+    # 0.000mm 일치 검증됨). 아크는 lift 자세(z≈0.162)에서 출발하므로 예외 구간 없이
+    # 전 샘플을 본다. 위반 사유 문자열은 'cartesian' 접두어로 main()이 집계한다.
+    T = np.array([fk_pos(q_of(t)) for t in np.linspace(0.0, res["t_f"], 300)])
+    x_min, z_min = float(T[:, 0].min()), float(T[:, 2].min())
+    if x_min <= MIN_TCP_X or z_min <= MIN_TCP_Z:
+        return (f"cartesian x_min={x_min:+.4f} z_min={z_min:+.4f} "
+                f"(한계 x>{MIN_TCP_X:.2f}, z>{MIN_TCP_Z:.2f})")
     return None
 
 
@@ -301,6 +344,36 @@ def main() -> None:
     print(f"\nwrote {out_path}: {len(entries)} entries "
           f"(신규 {len(best)}, 기존 유지 {len(existing)}, "
           f"{len(rejected)} attempts rejected) in {time.time() - t_all:.0f}s")
+
+    # ---- Cartesian 엔벨로프 위반 보고 (2026-07-23 사용자 요청) ----
+    # 바닥/기둥을 침범한 해가 몇 건이나 나왔는지, 그리고 '전 변형이 위반해서 결국
+    # entry를 못 만든' 조합이 어디인지 보고한다 — 후자가 실기에서 던지지 못하는 조합.
+    cart = [r for r in rejected if str(r.get("why", "")).startswith("gate: cartesian")]
+    if cart:
+        import re as _re
+        zs, xs = [], []
+        for r in cart:
+            m = _re.search(r"x_min=([-+0-9.]+) z_min=([-+0-9.]+)", r["why"])
+            if m:
+                xs.append(float(m.group(1))); zs.append(float(m.group(2)))
+        per_combo: dict = {}
+        for r in cart:
+            per_combo.setdefault((r["ti"], r["si"]), 0)
+            per_combo[(r["ti"], r["si"])] += 1
+        no_entry = [k for k in per_combo if k not in best]
+        print(f"\n[Cartesian 엔벨로프 위반] {len(cart)}/{len(jobs)} solves "
+              f"(x≤{MIN_TCP_X} 또는 z≤{MIN_TCP_Z}) — DB에서 제외됨")
+        if zs:
+            print(f"  최저 TCP z = {min(zs):+.4f} m,  최소 TCP x = {min(xs):+.4f} m")
+        print(f"  위반이 나온 (target,start) 조합: {len(per_combo)}/{len(new_combos)}")
+        if no_entry:
+            print(f"  ** 전 변형이 위반해 entry 생성 실패: {len(no_entry)}조합 **")
+            for ti, si in sorted(no_entry):
+                print(f"     target{ti}={TARGETS[ti]}  start{si}={P_STARTS[si]}")
+        else:
+            print("  (모든 조합이 위반하지 않는 대안 해를 찾아 entry 확보)")
+    else:
+        print("\n[Cartesian 엔벨로프] 위반 solve 없음")
 
     # ---- 검증 1: 로드 라운드트립 (_load_warm_db 로직 복제: params subset 비교) ----
     with open(out_path, "rb") as f:

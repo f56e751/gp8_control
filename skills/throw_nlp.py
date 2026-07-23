@@ -44,6 +44,8 @@ GP8 투척 궤적 NLP — CasADi(IPOPT) + clamped cubic B-Spline.
      위치·속도·가속도 전부 hard constraint).
 """
 
+import os
+
 import casadi as cs
 import numpy as np
 from scipy.interpolate import BSpline
@@ -89,6 +91,16 @@ W_ACC = 1e6                     # 착탄오차 penalty 스케일 (m² 오차 →
 W_OMEGA_LADDER = (10.0, 0.0)
 W_SENS = f"omega-pen-ladder-{int(W_OMEGA_LADDER[0])}"  # warm DB 유효성 마커 (w_sens 키)
 T_BOUNDS = (0.3, 1.5)           # t_f 탐색 범위
+
+# --- 솔버 성능 노브 (env) — '해의 정의'가 아니라 수렴 판정/반복 예산이라
+# 공식화 해시(_formulation_params)에 들어가지 않는다. 기본값은 종전 동작 그대로.
+# 오프라인 warm DB 빌드처럼 넓은 multistart를 돌릴 때는 낮은 max_iter + 느슨한 tol이
+# 전체 처리량을 크게 올린다: IPOPT는 '실패' 후보를 max_iter까지 완주하고서야
+# 포기하므로 실패가 성공보다 비싸고, 나쁜 basin이 많을수록 벽시계를 지배한다.
+# cold 경로의 tol 기본 1e-8은 과하다 — 해는 어차피 호출측 게이트(착탄 30mm·위치·
+# 속도)가 독립 재검증하고, polish 경로는 이미 1e-4로 푼다. 실기 런타임은 기본값 유지.
+IPOPT_TOL = float(os.environ.get("GP8_NLP_TOL", "1e-8"))
+IPOPT_MAX_ITER = int(os.environ.get("GP8_NLP_MAX_ITER", "3000"))
 REFINE_TOL = 1e-6               # 위치 한계 dense 검증 허용 위반 (rad) — IPOPT의
                                 #   제약 잔차(~1e-8)보다 느슨해야 활성 bound에서
                                 #   가짜 미수렴 경고가 안 남 (물리적으론 6e-5°)
@@ -132,6 +144,13 @@ Q_LO[0], Q_HI[0] = np.deg2rad(-60.0), np.deg2rad(60.0)
 # q_L 음수 = 뒤로 (TCP x 감소; −15°에서 x ~0.55m). L은 부호 안 뒤집히는 축이라
 # URDF 컨벤션도 동일하게 q_L ≥ −15°.
 Q_LO[1] = np.deg2rad(-15.0)
+# L 상한: **q_L ≤ +45°** (2026-07-23 사용자 규칙). L은 SIGN=+1이라 플래너=로봇
+# 규약이 같아 그대로 로봇 J2 ≤ +45°를 뜻한다. 실기 한계(+145°)보다 훨씬 안쪽이라
+# dispatch 게이트 정합은 자동 충족되고, 목적은 자세 제한 — q_L이 커질수록 팔이
+# 앞/아래로 기울어 스윙 아크가 바닥을 파고든다(2026-07-23 plan-only 실측: TCP z가
+# −0.076m까지 하강해 12건 중 8건이 Cartesian 엔벨로프 게이트에 걸림).
+# 이력: datasheet +150 → 실기정합 +144 → 자세제한 +45.
+Q_HI[1] = np.deg2rad(45.0)
 # U(팔 2번째 pitch 관절, index 2): URDF 컨벤션 [−113°, +45°] (하한 datasheet,
 # 상한 = 팔올림 금지). 한때 30°로 조였으나(2026-07-22) 원거리 −y 코너(bin11)가
 # 낮은 스윙만 가능해져 바닥 충돌로 도달 불가 → 45°로 복원 (2026-07-22 사용자
@@ -139,8 +158,18 @@ Q_LO[1] = np.deg2rad(-15.0)
 # corr(z_TCP, −q_U)=0.99)라 뒤집으면 플래너 범위 [−45°, +113°] — 하한만 여기서
 # 덮고 상한 +113°는 GP8_Q_MAX(정정된 datasheet)에서 옴.
 Q_LO[2] = np.deg2rad(-45.0)
+# U 상한: **로봇 J3 ≥ −60°** (2026-07-23 사용자 규칙). U는 SIGN=−1이라
+# 로봇 J3 = −q_U → J3 ≥ −60° ⟺ **q_U ≤ +60°**. Q_LO[2]=−45°와 합쳐 플래너
+# [−45°, +60°] = 로봇 J3 [−60°, +45°].
+# 이력: datasheet +113°(로봇 J3 −113°까지 허용 → 실기 한계 −70°를 43° 초과,
+# 정적 스윕에서 2건 abort) → 실기정합 +69°(=−70°+1° 여유) → 사용자 규칙 +60°.
+# 시뮬은 datasheet 한계라 이 조임이 없다 — 실기 전용 항.
+Q_HI[2] = np.deg2rad(60.0)
 # R(전완 roll, index 3) |q_R| ≤ 80° — 전완이 뒤집히지 않도록 (2026-07-15 사용자 규칙).
 Q_LO[3], Q_HI[3] = np.deg2rad(-80.0), np.deg2rad(80.0)
+# B(손목 pitch, index 4) 상한은 GP8_Q_MAX 그대로 +135° (= 로봇 J5 −135°). 2026-07-23에
+# 잠시 +75°(로봇 J5 ≥ −75°)로 조였다가 사용자 요청으로 원복 — wrist snap을 막으면
+# 던지기 정확도가 나빠지는 것으로 관측된 이력이 있다. 하한만 B ≥ +10°(B_LO_DEG) 유지.
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +477,7 @@ def _polish_solve(u_pos, rt, q_start, v0, vf, p_target, warm_data, drag):
         P, taus = _assemble_nlp(opti, P_free, t_f, t_star, q0, v0p, vfp, tgt,
                                 u_pos, rt, dragp, womega)
         opti.solver("ipopt", {"print_time": False, "expand": True},
-                    {"max_iter": 3000, "print_level": 0, "sb": "yes",
+                    {"max_iter": IPOPT_MAX_ITER, "print_level": 0, "sb": "yes",
                      "tol": 1e-4, "mu_init": 1e-6, "warm_start_init_point": "yes",
                      "warm_start_bound_push": 1e-9,
                      "warm_start_mult_bound_push": 1e-9,
@@ -571,7 +600,8 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
         # expand: MX→SX 그래프 전개 — 같은 수식·같은 iterate 경로로 평가만 ~2× 빨라짐
         # (2026-07-15 실측 14.0→7.1s, 해 완전 동일). jit은 컴파일 10분+라 부적합.
         opti.solver("ipopt", {"print_time": False, "expand": True},
-                    {"max_iter": 3000, "print_level": 5 if verbose else 0, "sb": "yes"})
+                    {"max_iter": IPOPT_MAX_ITER, "tol": IPOPT_TOL,
+                     "print_level": 5 if verbose else 0, "sb": "yes"})
         # ω² penalty 가중치 사다리 (강→약, 첫 수렴 rung 채택; 마지막 0.0은 정확도+시간만
         # → ω 도입 이전 검증된 공식화라 basin이 feasible하면 항상 수렴)
         last_exc = None

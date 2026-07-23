@@ -94,7 +94,7 @@ THROW_LIFT: float = 0.10
 
 # HOVER_DESCEND 픽 대기 높이: grasp TCP + 이 값 [m]. 도착 전 벨트 위 물체가
 # 파킹된 컵과 충돌하지 않도록 위에서 기다린다.
-HOVER_ABOVE: float = 0.03
+HOVER_ABOVE: float = 0.05
 # 프레스 목표 TCP Z [m, base 절대 높이]. 물체 도착 순간 이 높이까지 내려 찍는다.
 # 운영자 지정(2026-07-20). 주의: 벨트 접촉 실측 TCP Z(GRASP_Z 0.062, 터치 0.067)
 # 보다 ~3cm 낮음 — 컵 bellows/물체 압축으로 흡수되는 것을 전제로 한 값이므로,
@@ -126,6 +126,17 @@ THROW_WINDOW_T: float = float(throw_nlp.RELEASE_TIME)
 # penalty 공식화라 착탄 정확도는 solver 보장이 아님 — 나쁜 basin은 윈도우
 # 일부에서 착탄 불능(inf)이 나올 수 있어 dispatch 전 반드시 확인 (실기 안전).
 LANDING_GATE: float = 0.03
+
+# Dispatch 직전 Cartesian 안전 엔벨로프 (base frame TCP, m) — 운영자 지정
+# 2026-07-23. 던지기 궤적의 TCP가 이 밖으로 나가면 **실행하지 않고 에러로 보고**한다.
+#   x ≤ MIN_TCP_X : 기둥/베이스 쪽으로 파고듦
+#   z ≤ MIN_TCP_Z : 바닥/벨트 충돌
+# 이 게이트가 유일한 방어선인 이유: throw_nlp의 기둥 회피는 release 창 끝까지만
+# 활성이고(감속 꼬리 전 구간에 걸면 무충돌 basin까지 잘려 multistart가 전멸),
+# TCP 바닥 클리어런스는 아예 hard 제약이 아니다("hard로 걸면 0/148 전멸" —
+# throw_nlp.py 제약 3b 주석). 즉 감속 꼬리가 지하로 다이브하는 해가 정상 수렴한다.
+MIN_TCP_X: float = 0.20
+MIN_TCP_Z: float = 0.04
 
 # cold multistart 초기해 변형 (lift 높이 시작 z≈0.7 기준). IPOPT는 local
 # solver라 한 초기해의 basin이 infeasible하면 실패만 반환 → 순차 재시도.
@@ -796,6 +807,54 @@ class RobustThrowSkill(ManipulationSkill):
                 f"limit violation at sample {k} "
                 f"({np.rad2deg(traj_throw[j, k]):+.1f}°, "
                 f"limits [{np.rad2deg(jl[j, 0]):+.1f}, {np.rad2deg(jl[j, 1]):+.1f}]°)"
+            )
+            return
+
+        # SAFETY GATE 2 (Cartesian, 로봇 규약 FK): TCP가 기둥/베이스(x ≤ MIN_TCP_X)나
+        # 바닥/벨트(z ≤ MIN_TCP_Z)로 들어가면 디스패치하지 않는다.
+        # z는 픽 자세(프레스 TCP z=PRESS_Z, 0.04보다 낮음)에서 출발하므로, lift가
+        # 처음 MIN_TCP_Z를 넘어선 '이후' 구간에만 적용한다 — 출발점 자체는 위반이
+        # 아니고, 한 번 벗어난 뒤 다시 내려오는 것(=꼬리 다이브)만 잡는다.
+        # x는 전 구간 적용 (픽/던지기 어느 단계에서도 베이스에 파고들 이유가 없다).
+        n_s = traj_throw.shape[1]
+        tcp = np.stack(
+            [np.asarray(ctx.robot.forward_kinematics(traj_throw[:, k]),
+                        dtype=float)[:3, 3] for k in range(n_s)], axis=1)   # (3, n)
+        bad: list[tuple[int, str]] = []
+        cleared = np.nonzero(tcp[2] > MIN_TCP_Z)[0]
+        if cleared.size == 0:
+            bad.append((0, f"궤적 전체가 z ≤ {MIN_TCP_Z:.3f}m (lift가 바닥을 못 벗어남)"))
+        else:
+            k0 = int(cleared[0])
+            dip = np.nonzero(tcp[2, k0:] <= MIN_TCP_Z)[0]
+            if dip.size:
+                k = k0 + int(dip[0])
+                bad.append((k, f"TCP z={tcp[2, k]:+.4f}m ≤ {MIN_TCP_Z:.3f}m (바닥/벨트)"))
+        near = np.nonzero(tcp[0] <= MIN_TCP_X)[0]
+        if near.size:
+            k = int(near[0])
+            bad.append((k, f"TCP x={tcp[0, k]:+.4f}m ≤ {MIN_TCP_X:.3f}m (기둥/베이스)"))
+        if bad:
+            k, why = min(bad)                      # 가장 이른 위반 지점
+            n_viol = int(np.count_nonzero((tcp[0] <= MIN_TCP_X) | (tcp[2] <= MIN_TCP_Z)))
+            T_bad = np.asarray(ctx.robot.forward_kinematics(traj_throw[:, k]),
+                               dtype=float)
+            seg = ("lift" if k < l_traj.shape[1]
+                   else "throw" if k < l_traj.shape[1] + arc_traj.shape[1] else "chain")
+            ctx.log.error(
+                f"NLP throw ABORTED (not dispatched): Cartesian 안전 엔벨로프 위반 — "
+                f"{why} @ sample {k}/{n_s} (t={timestep_throw[k]:.3f}s, {seg} 구간, "
+                f"위반 샘플 {n_viol}개)"
+            )
+            ctx.log.error(
+                "  위반 지점 TCP SE3 (base frame):\n"
+                + "\n".join("    [" + "  ".join(f"{v:+10.5f}" for v in row) + "]"
+                            for row in T_bad)
+            )
+            ctx.log.error(
+                "  위반 지점 관절 (robot frame, deg): "
+                + ", ".join(f"J{j + 1}={np.rad2deg(traj_throw[j, k]):+.1f}"
+                            for j in range(6))
             )
             return
 
