@@ -268,14 +268,30 @@ PUSH_RETREAT_MIN_X: float = 0.25
 
 # Selection-time gate (placement_veto): if the FULL-retreat backswing would
 # start at X below this, the object is SKIPPED at target selection — no
-# motion at all — instead of executed with a squeezed run-up. Contact speed
-# scales with sqrt(run-up), so a clamp-shortened (or no-runup fallback) push
-# lands weak and under-carries toward the bin; better to pass the object
-# than to scatter it. 0.30 keeps a 5 cm margin above the PUSH_RETREAT_MIN_X
-# clamp, so every push that DOES execute has the full PUSH_RETREAT_DISTANCE
-# run-up AND stays clear of the near-base region. The 0.25 clamp remains as
-# the hard backstop for paths that bypass selection (chain parks, tests).
-PUSH_EXEC_MIN_BACKSWING_X: float = 0.30
+# motion at all — instead of executed with a squeezed run-up. A clamp-shortened
+# (or no-runup fallback) push can land weak and under-carry toward the bin;
+# better to pass the object than to scatter it. The 0.25 clamp remains as the
+# hard backstop for paths that bypass selection (chain parks, tests).
+#
+# HOW LOW CAN THIS GO — the run-up saturates. In scoop mode (PUSH_ACCEL 12,
+# PUSH_SPEED 2.0) the stroke reaches full speed after v²/2a = 0.167 m, so the
+# last 3.3 cm of the 0.20 m retreat is pure cruise: any clamped run-up ≥0.167 m
+# hits at EXACTLY the same 2.0 m/s. Confirmed on HW — all 85 cycles of the
+# 2026-07-23 run logged v_contact = 2.00 m/s. Translated to this gate's
+# unclamped backswing X, the zero-loss boundary is 0.25 − 0.033×dir_x ≈
+# 0.22–0.24, i.e. the original 0.30 carried ~6 cm of pure margin and vetoed
+# objects that would have been struck at full strength.
+# ⚠ sweep mode (PUSH_SWEEP_ACCEL 5) never saturates over 0.20 m (~1.41 m/s at
+# contact), so there the sqrt(run-up) argument DOES hold and a shorter run-up
+# is genuinely weaker — revisit this value if sweep becomes the default.
+#
+# History: 0.30 (= 0.25 clamp + 5 cm, no measurement behind the 5 cm) →
+# **0.27** (2026-07-23 operator: "step it down gradually"; still ~2 cm above
+# the zero-loss boundary, so executed pushes keep full contact speed while the
+# veto rate drops). If the veto still filters too much, the principled fix is
+# to test the CLAMPED run-up against 0.167 m directly instead of tuning this
+# constant — see _stroke_accel()/PUSH_SPEED, which already know the mode.
+PUSH_EXEC_MIN_BACKSWING_X: float = 0.24
 
 # 6th joint angle (rad) for all push keyframes.  π/2 ≈ 90° clockwise
 # (viewed from above) so the TCP faces the push direction.
