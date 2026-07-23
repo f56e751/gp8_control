@@ -23,15 +23,18 @@ G_VEC = np.array([0.0, 0.0, -G])
 # datasheet 치수 (m): base→L축 높이 d1, S→L offset a1, 상완 a2,
 # U→R offset a3, 전완 d4, 손목→flange d6.  reach 검증: a1+a2+d4 ≈ 0.725 (spec 0.727)
 # tool: flange에 단 suction gripper 길이 — TCP(=물체 위치)는 그리퍼 끝
-# 0.220 = 그리퍼 22cm 교체 (운영자 지정 2026-07-22; 구 24.5cm). 손목→TCP =
-# d6 0.080 + tool 0.220 = 0.300. robots/gp8.py(home EE x=0.680) 및
-# urdf/gp8_mujoco_suction_tool.xacro와 항상 함께 맞출 것 — 안 맞으면 전 자세
-# 상수 오프셋이 착탄/프레스 높이에 그대로 실린다 (2026-07-21 5mm 사례).
+# 0.22 = 실물 실측 (flange 면→suction 끝 22cm, 사용자 확인 2026-07-16; TCP = link6에서
+# 0.30). 구 0.24는 시뮬 URDF 기준 교정 v2였음 — 실물이 기준이므로 교체. 이 값이
+# 바뀌면 FK 전체가 바뀌므로 warm DB·학습 모델 재생성 필요 (공식화 해시에 포함됨).
 GP8_DIMS = dict(d1=0.330, a1=0.040, a2=0.345, a3=0.040, d4=0.340, d6=0.080, tool=0.220)
 
-# GP8 hardware limits (datasheet). 실기 파라미터 확인 후 필요시 교체.
-GP8_Q_MIN = np.deg2rad([-170.0, -65.0, -113.0, -190.0, -135.0, -360.0])
-GP8_Q_MAX = np.deg2rad([170.0, 150.0, 255.0, 190.0, 135.0, 360.0])
+# GP8 hardware limits (datasheet), **planner 부호 컨벤션**. 실기 파라미터 확인 후 필요시 교체.
+# 주의: planner는 U/R/B/T 부호가 URDF와 반대 (sim SIGN=[1,1,-1,-1,-1,-1]) —
+# 비대칭 범위는 뒤집어 넣어야 함. U datasheet [-113,+255](URDF) → planner [-255,+113]
+# (2026-07-22 정정; 구버전은 무반전 [-113,+255]로 잘못된 쪽에 걸려 있었음.
+#  R/B/T는 대칭 범위라 반전 무관, L은 안 뒤집히는 축.)
+GP8_Q_MIN = np.deg2rad([-170.0, -65.0, -255.0, -190.0, -135.0, -360.0])
+GP8_Q_MAX = np.deg2rad([170.0, 150.0, 113.0, 190.0, 135.0, 360.0])
 GP8_QD_MAX = np.deg2rad([455.0, 385.0, 520.0, 550.0, 550.0, 1000.0])
 
 # joint chain: (직전 translation xyz, 회전축) — zero pose에서 상완 수직, 전완 +x 수평
@@ -92,6 +95,17 @@ def ik_position(p_des, q_seed, iters=300, tol=1e-10):
         dq = Jv.T @ np.linalg.solve(Jv @ Jv.T + 1e-8 * np.eye(3), e)
         q += np.clip(dq, -0.2, 0.2)
     return q, np.linalg.norm(p_des - fk_pos(q)) < 1e-8
+
+
+def launch_state(q, qd, off=0.02):
+    """발사점 상태 (p_eff, v_eff): TCP에서 그리퍼 로드 축(흡착면 법선)으로
+    off[m] 연장한 점 — 흡착된 물체 CoM 근사 (2026-07-22 사용자 스펙 2cm).
+    v_eff는 그 점의 강체 속도 (ω×r 포함) — revolute Jacobian을 p_eff 기준으로."""
+    origins, axes, p = fk_frames(q)
+    rod = p - origins[4]                     # wrist(B 원점)→TCP = 로드 축 방향
+    p_eff = p + off * rod / np.linalg.norm(rod)
+    Jv = np.stack([np.cross(a, p_eff - o) for a, o in zip(axes, origins)], axis=1)
+    return p_eff, Jv @ np.asarray(qd, float)
 
 
 def landing_error(p, v, p_target):

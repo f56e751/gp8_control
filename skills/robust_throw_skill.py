@@ -51,7 +51,7 @@ if _THR_DIR not in sys.path:
 import throw_nlp  # noqa: E402
 from throw_nlp import Q_HI, Q_LO, _spline_eval, solve_throw_nlp  # noqa: E402
 from throwing import (GP8_DIMS, GP8_QD_MAX, fk_pos, ik_position,  # noqa: E402
-                      jacobian, landing_error)
+                      jacobian, landing_error, launch_state)
 
 if TYPE_CHECKING:
     from gp8_control.skills.context import PickRequest
@@ -165,7 +165,11 @@ def _formulation_params() -> dict:
                 qdd_lim=throw_nlp.QDD_LIM.tolist(),
                 t_bounds=tuple(throw_nlp.T_BOUNDS),
                 degree=throw_nlp.DEGREE,
-                dims=dict(GP8_DIMS))
+                dims=dict(GP8_DIMS),
+                # flight 모델 마커 (rk4x8-anisodrag-grip20mm): 항력/RK4 비행·발사점
+                # (GRIP_OFF)·τ 변수가 목적함수와 제약 구성(opti.ng)을 바꾸므로
+                # entry의 basin/dual 유효성 키에 포함. 없는 구버전 = "parabola".
+                flight=getattr(throw_nlp, "FLIGHT_MODEL", "parabola"))
 
 
 def _load_warm_db(log) -> list:
@@ -672,12 +676,17 @@ class RobustThrowSkill(ManipulationSkill):
         if qd_ratio > 1.0:
             return f"속도한계 초과 max|q̇|/limit={qd_ratio:.2f}"
         # ③ 착탄 게이트: 윈도우 dense 착탄오차 — penalty 공식화라 solver 보장이
-        #    아니고, 나쁜 basin은 윈도우 일부에서 inf가 나옴 (실기 필수 게이트)
+        #    아니고, 나쁜 basin은 윈도우 일부에서 inf가 나옴 (실기 필수 게이트).
+        #    발사점은 NLP와 동일하게 launch_state(TCP + 로드축 GRIP_OFF, ω×r 포함
+        #    강체속도) — bare TCP로 재검증하면 2cm/ω×r 만큼 어긋나 정상 해가 착탄
+        #    게이트에 잘못 걸린다. drag는 실물 미배선(None=무항력)이라 게이트도
+        #    항력 없는 폐형 landing_error로 일관 (NLP도 drag=0 = 포물선 등가).
         rt = res["release_time"]
         errs = []
         for t in res["t_star"] + np.linspace(-rt / 2, rt / 2, 11):
             q, qd = q_of(t), qd_of(t)
-            errs.append(landing_error(fk_pos(q), jacobian(q)[0] @ qd, p_target))
+            p_eff, v_eff = launch_state(q, qd)
+            errs.append(landing_error(p_eff, v_eff, p_target))
         e_max = float(np.max(errs))
         if not np.isfinite(e_max) or e_max > LANDING_GATE:
             return f"착탄 게이트 초과 (window max {e_max * 1e3:.0f}mm > {LANDING_GATE * 1e3:.0f}mm)"

@@ -27,7 +27,8 @@ GP8 투척 궤적 NLP — CasADi(IPOPT) + clamped cubic B-Spline.
   4. 시간 변수    : release_time/2 ≤ t* ≤ t_f − release_time/2 (윈도우가 [0,t_f] 안).
 
 목적 함수 (하드웨어 한계만 hard, 정확도는 penalty — 스펙 원형):
-  J = w1·t_f + w2·∫_{t*−rt/2}^{t*+rt/2} (W_ACC·J_acc + W_SENS·J_sens) dt
+  J = w1·t_f + w2·∫_{t*−rt/2}^{t*+rt/2} W_ACC·J_acc dt,  윈도우 노드 ω_tcp=0 hard
+  (구 W_SENS·J_sens 페널티는 2026-07-22 ω=0 제약으로 대체)
   J_acc  = ‖x_land(q,q̇) − target‖²  포물선 궤적 오차 (calc_landing_error).
            W_ACC=1e7 (실측 선정): 속도 hard constraint가 문제를 정칙화해서
            착탄 0.01~0.02mm를 6~10s에 달성 (구 1e9 시절 42s의 원인이던
@@ -70,15 +71,23 @@ RELEASE_TIME = 0.05             # 윈도우 총 길이 (s). 긴 윈도우는 W_A
 B_LO_DEG = 10.0                 # q_B ≥ 10° (위치 하한의 B 성분 — 2026-07-15 사용자 수정)
 QDD_LIM = 5.0 * GP8_QD_MAX      # 가속도 한계 = 5×속도한계
 W1, W2 = 0.5, 1.0               # 시간 / 윈도우 정확도 가중치 (스펙의 w1, w2)
-W_SENS = 10.0                   # sensitivity 비용 스케일
-W_ACC = 1e5                     # 착탄오차 penalty 스케일 (m² 오차 → 비용).
-# 사용자 요구 (2026-07-15): 정확도는 hard constraint가 아니라 목적함수 penalty로.
-# 너무 크면 사실상 hard로 작동해 수렴성(조건수)을 죽임 — rt=0.05 구스윕 (2026-07-16,
+W_ACC = 1e6                     # 착탄오차 penalty 스케일 (m² 오차 → 비용).
+# 2026-07-22 1e5→1e6 상향 (사용자 "랜딩 오차=0 제약식 가중치를 높여" — 정확도
+# 최우선). ω를 hard→penalty로 완화(아래)해 문제가 부드러워진 덕에 1e6도 수렴 가능.
+# 이력: 1e4(2026-07-16 스윕 선정)→1e5(2026-07-21)→1e6(2026-07-22).
+# 너무 크면 사실상 hard로 작동해 수렴성(조건수)을 죽임 — rt=0.05 스윕 (2026-07-16,
 # 최악 쌍 수렴/윈도우오차): 1e7 0/6, 1e5 2/6·1.8mm, 1e4 5/6·6.2mm, 1e3 6/6·41mm.
-# 2026-07-21 재스윕 (정확도 상향 요구; 실제 정적 테스트 조합 4종, 실기와 같은
-# multistart 기준): 1e4 4/4·6.7mm/5.2s, 3e4 4/4·(1건 나쁜 basin inf), 1e5
-# 4/4·2.1mm/6.8s → 1e5로 상향. 나쁜 basin은 어느 가중치서든 가능하고 착탄
-# 게이트(30mm)+multistart가 걸러낸다. (rt=0.01 시절엔 1e7이 0.01mm — stiff해도 수렴.)
+# (rt=0.01 시절엔 1e7이 0.01mm/6~10s — 짧은 윈도우라 stiff해도 수렴했음.)
+# ω_tcp → 0 은 hard 등식이 아니라 ω² penalty (2026-07-22 사용자): 윈도우 노드마다
+# W_OMEGA·‖ω_tcp‖² 를 목적에 더한다. W_OMEGA는 opti.parameter라 아래 '가중치 사다리'로
+# 강→약 시도 — 강한 가중치로 안 풀리면 다음 rung으로 내려가고, 마지막 0.0은 ω를
+# 포기(정확도+시간만)해 ω 도입 이전의 검증된 공식화로 환원 → 항상 해 확보.
+# **약한 penalty로 운영** (2026-07-22 사용자 "ω penalty 약하게 유지"): 실측상
+# ω→0은 GRIP_OFF(발사점=CoM, v=jtimes로 ω×r 이미 정확 보정)와 중복이면서 wrist
+# snap을 막아 정확도(33→46mm)·먼 코너 도달성을 오히려 해쳤음. rung 10 = 과한
+# 회전만 살짝 억제(ω~1 rad/s 허용), 안 풀리면 0(GRIP_OFF만).
+W_OMEGA_LADDER = (10.0, 0.0)
+W_SENS = f"omega-pen-ladder-{int(W_OMEGA_LADDER[0])}"  # warm DB 유효성 마커 (w_sens 키)
 T_BOUNDS = (0.3, 1.5)           # t_f 탐색 범위
 REFINE_TOL = 1e-6               # 위치 한계 dense 검증 허용 위반 (rad) — IPOPT의
                                 #   제약 잔차(~1e-8)보다 느슨해야 활성 bound에서
@@ -94,6 +103,19 @@ MAX_REFINE = 6                  # adaptive refinement 최대 반복
 COL_R = 0.18
 COL_H = 0.55
 
+# 공기저항 flight 모델 (2026-07-21 사용자 스펙): 물체의 top-down point cloud에서
+# 뽑은 축별 유효 단면적 기반 '비등방 2차 항력' — v̇ = g − c ⊙ (|v|·v),
+# c_i = ρ_air·C_d·A_i/(2m) [1/m]. 폐형 포물선 대신 RK4 N_FLIGHT 스텝으로 비행을
+# 적분하고, 비행시간 τ를 윈도우 노드별 '변수'로 두고 z(τ)=z_tgt 등식으로 정의.
+# c=0이면 RK4가 등가속도를 '정확히' 적분하므로 (2차 다항) 기존 포물선과 일치.
+# 목적은 항력 최소화가 아니라 '보상' — 항력 포함 착지점이 target과 일치하는 궤적.
+N_FLIGHT = 8
+GRIP_OFF = 0.02   # 발사점 = TCP + 로드 축 방향 2cm (흡착 물체 CoM 근사 —
+#   2026-07-22 사용자 스펙. 판정이 CoM 기준이라 TCP 조준 시 ω×r 오버슛 bias가
+#   생기는 문제의 계획단 보정: p_eff를 심볼릭으로 만들고 v=jtimes(p_eff)라
+#   그 점의 강체 속도(ω×r 포함)가 자동으로 비행 초기조건이 됨)
+FLIGHT_MODEL = f"rk4x{N_FLIGHT}-anisodrag-grip{int(1e3*GRIP_OFF)}mm"  # 유효성 마커
+
 # clamped uniform knot vector (정규화 시간 u∈[0,1])
 KNOTS = np.concatenate([np.zeros(DEGREE),
                         np.linspace(0.0, 1.0, N_CTRL - DEGREE + 1),
@@ -103,9 +125,19 @@ KNOTS = np.concatenate([np.zeros(DEGREE),
 POS_LIMIT_MODE = "hull"   # 제어점 convex hull (2026-07-16) — warm DB 무효화 마커
 Q_LO = GP8_Q_MIN.copy(); Q_LO[4] = np.deg2rad(B_LO_DEG)
 Q_HI = GP8_Q_MAX.copy()
-# U(팔 2번째 pitch 관절, index 2) 위로 꺾임 ≤ 45° — 팔을 너무 높이 들지 않도록 (사용자 규칙).
-# 플래너 컨벤션은 '위 = 음수 q_U' (corr(z_TCP, −q_U)=0.99) → 하한 −45°.
-# (URDF/Yaskawa 부호 q_U_urdf = −q_U_planner 로는 q_U ≤ +45°에 해당)
+# S(베이스 yaw, index 0): |q_S| ≤ 60° (2026-07-23 사용자 규칙 — datasheet ±170°에서
+# 축소). S는 SIGN=+1이라 planner/URDF 부호가 같아 그대로 적용된다.
+Q_LO[0], Q_HI[0] = np.deg2rad(-60.0), np.deg2rad(60.0)
+# L(어깨 pitch, index 1): 뒤로 젖힘 ≤ 15° (2026-07-22 사용자 규칙). FK 확인:
+# q_L 음수 = 뒤로 (TCP x 감소; −15°에서 x ~0.55m). L은 부호 안 뒤집히는 축이라
+# URDF 컨벤션도 동일하게 q_L ≥ −15°.
+Q_LO[1] = np.deg2rad(-15.0)
+# U(팔 2번째 pitch 관절, index 2): URDF 컨벤션 [−113°, +45°] (하한 datasheet,
+# 상한 = 팔올림 금지). 한때 30°로 조였으나(2026-07-22) 원거리 −y 코너(bin11)가
+# 낮은 스윙만 가능해져 바닥 충돌로 도달 불가 → 45°로 복원 (2026-07-22 사용자
+# "U를 45도로 완화해"). 플래너 컨벤션은 '위 = 음수 q_U' (q_U_urdf = −q_U_planner,
+# corr(z_TCP, −q_U)=0.99)라 뒤집으면 플래너 범위 [−45°, +113°] — 하한만 여기서
+# 덮고 상한 +113°는 GP8_Q_MAX(정정된 datasheet)에서 옴.
 Q_LO[2] = np.deg2rad(-45.0)
 # R(전완 roll, index 3) |q_R| ≤ 80° — 전완이 뒤집히지 않도록 (2026-07-15 사용자 규칙).
 Q_LO[3], Q_HI[3] = np.deg2rad(-80.0), np.deg2rad(80.0)
@@ -208,6 +240,17 @@ def fk_col_points_sym(q):
     return [wrist, wrist + 0.5 * (tcp - wrist), wrist + 0.75 * (tcp - wrist), tcp]
 
 
+def fk_omega_sym(q, qd):
+    """TCP 각속도 ω(q,q̇) = Σ q̇ᵢ·zᵢ(q) (base frame) — throwing.jacobian의 Jw·q̇."""
+    axis_v = {"x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0], "z": [0.0, 0.0, 1.0]}
+    R = cs.MX.eye(3)
+    w = cs.MX.zeros(3)
+    for (xyz, ax), i in zip(_CHAIN, range(6)):
+        w = w + qd[i] * (R @ cs.DM(axis_v[ax]))
+        R = R @ _rot_sym(ax, q[i])
+    return w
+
+
 # ---------------------------------------------------------------------------
 # 모듈 3: 목적 함수 구성 요소 (CasADi Function으로 모듈화)
 # ---------------------------------------------------------------------------
@@ -215,64 +258,81 @@ _OBJ_SYM = None
 
 
 def make_objective_functions_sym():
-    """calc_landing_error(q,q̇,tgt), calc_throwing_sensitivity(q,q̇,tgt) —
-    target을 세 번째 '입력'으로 받는 심볼릭 버전 (모듈 캐시). 파라메트릭 polish
-    솔버(target = opti.parameter)와 고정-target 래퍼가 같은 몸체를 공유한다.
-
-    독립 심볼 (q, q̇)로 식을 세우고 Function으로 감싸므로, NLP에서는 제어점의
-    식(q_i(P,t*,t_f))을 그대로 넣어도 CasADi가 chain rule로 자동미분한다.
+    """(q, q̇, τ, tgt, c) 입력의 심볼릭 Function 3종 (모듈 캐시):
+      calc_landing_error(q,q̇,τ,tgt,c)        — 항력 포함 RK4 비행 후 ‖xy−tgt_xy‖²
+      calc_z_residual(q,q̇,τ,tgt,c)           — z(τ) − tgt_z (비행시간 τ 정의 등식)
+      calc_throwing_sensitivity(q,q̇,τ,tgt,c) — ‖∂xy/∂q‖²+‖∂xy/∂q̇‖² (τ 고정 근사)
+    c(3-vector) = ρ·C_d·A_axis/(2m): top-down PC에서 산출 (sim의 drag_coeffs_from_pc).
+    c=0이면 등가속 비행 = 구 폐형 포물선과 동일 (RK4가 2차 다항을 정확히 적분).
+    TODO: 사용자 파일 수식 삽입 지점 — 항력/탄도 모델 교체는 f(state)만 바꾸면 됨.
     """
     global _OBJ_SYM
     if _OBJ_SYM is not None:
         return _OBJ_SYM
     q = cs.MX.sym("q", 6)
     qd = cs.MX.sym("qd", 6)
+    tau = cs.MX.sym("tau")
     tgt = cs.MX.sym("tgt", 3)
+    cdrag = cs.MX.sym("cdrag", 3)
 
-    p = fk_tcp_sym(q)                    # TCP 위치
-    v = cs.jtimes(p, q, qd)              # TCP 속도 = Jv(q)·q̇ (자동미분)
+    pts = fk_col_points_sym(q)           # [wrist, ·, ·, tcp]
+    wrist, tcp = pts[0], pts[3]
+    rod_len = _CHAIN[5][0][0]            # d6+tool (로드 축 길이 — 상수)
+    p = tcp + (GRIP_OFF / rod_len) * (tcp - wrist)   # 발사점 = TCP+2cm(로드 축)
+    v = cs.jtimes(p, q, qd)              # 발사점 강체 속도 (ω×r 자동 포함)
 
-    # ---- 탄도 모델: 착탄점 x_land(q, q̇) ----
-    # TODO: 사용자 파일 수식 삽입 지점 — 현재는 논문 Eq.(2),(3) (항력 무시 포물선,
-    #       착지 평면 z = tgt[2], 비행시간 = 이차방정식의 양의 근)
-    disc = v[2]**2 + 2.0 * G * (p[2] - tgt[2])
-    s = cs.sqrt(cs.fmax(disc, 1e-9))     # 판별식 guard (반복 중 일시적 음수 방지)
-    tau = (v[2] + s) / G                 # 비행시간
-    x_land = p[0:2] + v[0:2] * tau       # 착탄점 (x, y)
+    g_vec = cs.DM([0.0, 0.0, -G])
 
-    # J_acc: 포물선 궤적 오차 (target까지의 착탄 오차 제곱)
-    err2 = cs.sumsqr(x_land - tgt[0:2])
+    def f(state):                        # 비행 동역학: ṗ=v, v̇=g − c⊙(|v|v)
+        vv = state[3:6]
+        sp = cs.sqrt(cs.sumsqr(vv) + 1e-9)
+        return cs.vertcat(vv, g_vec - cdrag * sp * vv)
 
-    # J_sens: 투척 민감도 = ‖∂x_land/∂q‖² + ‖∂x_land/∂q̇‖²
-    # TODO: 사용자 파일 수식 삽입 지점 — 현재는 CasADi jacobian(자동미분)으로 계산.
-    #       논문 Eq.(1)의 Ballistic×Kinematic chain과 수학적으로 동일한 값.
-    S_q = cs.jacobian(x_land, q)         # ∂x_land/∂q   (2×6)
-    S_qd = cs.jacobian(x_land, qd)       # ∂x_land/∂q̇  (2×6)
+    s = cs.vertcat(p, v)
+    h = tau / N_FLIGHT
+    for _ in range(N_FLIGHT):            # 고정 스텝 RK4
+        k1 = f(s)
+        k2 = f(s + h / 2 * k1)
+        k3 = f(s + h / 2 * k2)
+        k4 = f(s + h * k3)
+        s = s + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+    xy = s[0:2]
+    err2 = cs.sumsqr(xy - tgt[0:2])      # J_acc: 착지 xy 오차²
+    zres = s[2] - tgt[2]                 # τ 정의: z(τ) = tgt_z
+    S_q = cs.jacobian(xy, q)             # J_sens (τ 고정 근사 — 지배항)
+    S_qd = cs.jacobian(xy, qd)
     sens = cs.sumsqr(S_q) + cs.sumsqr(S_qd)
 
-    _OBJ_SYM = (cs.Function("calc_landing_error", [q, qd, tgt], [err2]),
-                cs.Function("calc_throwing_sensitivity", [q, qd, tgt], [sens]))
+    _OBJ_SYM = (cs.Function("calc_landing_error", [q, qd, tau, tgt, cdrag], [err2]),
+                cs.Function("calc_z_residual", [q, qd, tau, tgt, cdrag], [zres]),
+                cs.Function("calc_throwing_sensitivity",
+                            [q, qd, tau, tgt, cdrag], [sens]))
     return _OBJ_SYM
 
 
-def make_objective_functions(p_target):
-    """고정-target 래퍼: calc_landing_error(q,q̇), calc_throwing_sensitivity(q,q̇)."""
-    F_err, F_sens = make_objective_functions_sym()
+def make_objective_functions(p_target, drag=None):
+    """고정-target 래퍼: calc_landing_error(q,q̇,τ), calc_throwing_sensitivity(q,q̇,τ)."""
+    F_err, F_z, F_sens = make_objective_functions_sym()
     q = cs.MX.sym("q", 6)
     qd = cs.MX.sym("qd", 6)
+    tau = cs.MX.sym("tau")
     t = cs.DM(np.asarray(p_target, float))
-    return (cs.Function("calc_landing_error", [q, qd], [F_err(q, qd, t)]),
-            cs.Function("calc_throwing_sensitivity", [q, qd], [F_sens(q, qd, t)]))
+    d = cs.DM(np.zeros(3) if drag is None else np.asarray(drag, float))
+    return (cs.Function("calc_landing_error", [q, qd, tau], [F_err(q, qd, tau, t, d)]),
+            cs.Function("calc_throwing_sensitivity", [q, qd, tau],
+                        [F_sens(q, qd, tau, t, d)]))
 
 
 # ---------------------------------------------------------------------------
 # NLP 조립 + 풀이 (adaptive refinement 루프 포함)
 # ---------------------------------------------------------------------------
-def _assemble_nlp(opti, P_free, t_f, t_star, q0, v0c, vfc, tgt, u_pos_nodes, rt):
+def _assemble_nlp(opti, P_free, t_f, t_star, q0, v0c, vfc, tgt, u_pos_nodes, rt,
+                  dragc, womega):
     """NLP 몸체 조립 (제약 1~5 + 기둥 회피 + 목적함수) — cold(_build_and_solve)와
-    캐시된 파라메트릭 polish 솔버(_polish_solve)가 공유. q0/v0c/vfc/tgt는 DM 상수
-    또는 opti.parameter — 동일 수식이라 파라미터화가 그대로 성립한다.
-    전체 제어점 행렬 P(6×N_CTRL) 식을 리턴."""
+    캐시된 파라메트릭 polish 솔버(_polish_solve)가 공유. q0/v0c/vfc/tgt/womega는
+    DM 상수 또는 opti.parameter — 동일 수식이라 파라미터화가 그대로 성립한다.
+    womega는 ω² penalty 가중치 (가중치 사다리로 조절 — parameter로 두면 그래프
+    재조립 없이 rung만 갈아끼움). 전체 제어점 행렬 P(6×N_CTRL) 식을 리턴."""
     u_head = KNOTS[DEGREE + 1]
     u_tail = 1.0 - KNOTS[len(KNOTS) - DEGREE - 2]
 
@@ -340,25 +400,34 @@ def _assemble_nlp(opti, P_free, t_f, t_star, q0, v0c, vfc, tgt, u_pos_nodes, rt)
     # 착탄 정확도는 penalty로 목적함수에 포함 (사용자 요구 — 스펙 원형).
     # 하드웨어 한계(위치/속도/가속도)와 기둥 회피만 hard constraint.
     # t*가 변수 → 노드 시각 u_i = (t*+offset)/t_f 가 심볼릭 (가변 시간 맵핑).
-    F_err, F_sens = make_objective_functions_sym()
+    F_err, F_z, F_sens = make_objective_functions_sym()
     offsets = np.linspace(-rt / 2, rt / 2, N_WIN)
     trap_w = np.full(N_WIN, rt / (N_WIN - 1)); trap_w[[0, -1]] *= 0.5
     J_win = cs.MX(0.0)
+    taus = []
     for off, w in zip(offsets, trap_w):
         # clamp: 제약4는 '해'에서만 u_i∈[0,1] 보장 — IPOPT 중간 iterate가 범위를
         # 벗어나면 basis≡0이 되어 목적이 붕괴(gradient 소실)하므로 방어적 clamp
         u_i = cs.fmin(cs.fmax((t_star + off) / t_f, 0.0), 1.0)
         q_i, qd_i, _ = spline_qs(P, u_i, t_f)
-        J_win = J_win + w * (W_ACC * F_err(q_i, qd_i, tgt)
-                             + W_SENS * F_sens(q_i, qd_i, tgt))
+        # 비행시간 τ_i: 변수 + z(τ)=z_tgt 등식으로 정의 (항력 때문에 폐형 근 없음)
+        tau_i = opti.variable()
+        taus.append(tau_i)
+        opti.subject_to(opti.bounded(0.05, tau_i, 1.5))
+        opti.subject_to(F_z(q_i, qd_i, tau_i, tgt, dragc) == 0)
+        # ω_tcp → 0 은 penalty (2026-07-22 사용자 — 구 hard 등식 완화): 윈도우 노드
+        # 무회전 release로 ω×r 오차원을 줄이되, hard로 걸면 basin이 죽어 안 풀리므로
+        # womega·‖ω‖²를 목적에 더한다 (womega는 parameter — 가중치 사다리로 강→약).
+        J_win = J_win + w * (W_ACC * F_err(q_i, qd_i, tau_i, tgt, dragc)
+                             + womega * cs.sumsqr(fk_omega_sym(q_i, qd_i)))
     opti.minimize(W1 * t_f + W2 * J_win)
-    return P
+    return P, taus
 
 
 _POLISH_SOLVERS = {}   # (rt, u_pos 노드 집합) → 조립된 파라메트릭 솔버 (재사용)
 
 
-def _polish_solve(u_pos, rt, q_start, v0, vf, p_target, warm_data):
+def _polish_solve(u_pos, rt, q_start, v0, vf, p_target, warm_data, drag):
     """캐시된 파라메트릭 솔버로 full warm start polish 한 번 풀기.
     CasADi 그래프를 (rt, 노드 집합)당 한 번만 조립하고 이후 호출은 parameter
     (q_start/v0/vf/target)와 초기값(primal+lam_g)만 갈아끼움 — 조립 오버헤드
@@ -374,7 +443,10 @@ def _polish_solve(u_pos, rt, q_start, v0, vf, p_target, warm_data):
         v0p = opti.parameter(6)
         vfp = opti.parameter(6)
         tgt = opti.parameter(3)
-        P = _assemble_nlp(opti, P_free, t_f, t_star, q0, v0p, vfp, tgt, u_pos, rt)
+        dragp = opti.parameter(3)
+        womega = opti.parameter()
+        P, taus = _assemble_nlp(opti, P_free, t_f, t_star, q0, v0p, vfp, tgt,
+                                u_pos, rt, dragp, womega)
         opti.solver("ipopt", {"print_time": False, "expand": True},
                     {"max_iter": 3000, "print_level": 0, "sb": "yes",
                      "tol": 1e-4, "mu_init": 1e-6, "warm_start_init_point": "yes",
@@ -382,24 +454,37 @@ def _polish_solve(u_pos, rt, q_start, v0, vf, p_target, warm_data):
                      "warm_start_mult_bound_push": 1e-9,
                      "warm_start_slack_bound_push": 1e-9})
         h = dict(opti=opti, P_free=P_free, t_f=t_f, t_star=t_star,
-                 q0=q0, v0=v0p, vf=vfp, tgt=tgt, P=P)
+                 q0=q0, v0=v0p, vf=vfp, tgt=tgt, drag=dragp, womega=womega,
+                 P=P, taus=taus)
         _POLISH_SOLVERS[key] = h
     opti = h["opti"]
     opti.set_value(h["q0"], np.asarray(q_start, float))
     opti.set_value(h["v0"], np.asarray(v0, float))
     opti.set_value(h["vf"], np.asarray(vf, float))
     opti.set_value(h["tgt"], np.asarray(p_target, float))
+    opti.set_value(h["drag"], np.asarray(drag, float))
     free_idx = list(range(2, N_CTRL - 2)) + [N_CTRL - 1]
-    opti.set_initial(h["P_free"], warm_data["P"][:, free_idx])
-    opti.set_initial(h["t_f"], warm_data["t_f"])
-    opti.set_initial(h["t_star"], warm_data["t_star"])
     lam = warm_data.get("lam_g")
-    if lam is not None and np.size(lam) == opti.ng:  # 제약 구성 동일할 때만 유효
-        opti.set_initial(opti.lam_g, np.asarray(lam, float).ravel())
-    sol = opti.solve()   # 실패 시 예외 전파 — 호출측이 cold multistart로 fallback
-    return dict(P=np.array(sol.value(h["P"])), t_f=float(sol.value(h["t_f"])),
-                t_star=float(sol.value(h["t_star"])), J=float(sol.value(opti.f)),
-                lam_g=np.array(sol.value(opti.lam_g)).ravel())
+    # ω² penalty 가중치 사다리 (강→약, 첫 수렴 rung 채택; 마지막 0.0은 항상 수렴)
+    last_exc = None
+    for w_om in W_OMEGA_LADDER:
+        opti.set_value(h["womega"], w_om)
+        opti.set_initial(h["P_free"], warm_data["P"][:, free_idx])
+        opti.set_initial(h["t_f"], warm_data["t_f"])
+        opti.set_initial(h["t_star"], warm_data["t_star"])
+        for t_i in h["taus"]:
+            opti.set_initial(t_i, 0.45)
+        if lam is not None and np.size(lam) == opti.ng:  # 제약 구성 동일할 때만 유효
+            opti.set_initial(opti.lam_g, np.asarray(lam, float).ravel())
+        try:
+            sol = opti.solve()   # 실패 시 다음 rung으로
+        except RuntimeError as e:
+            last_exc = e
+            continue
+        return dict(P=np.array(sol.value(h["P"])), t_f=float(sol.value(h["t_f"])),
+                    t_star=float(sol.value(h["t_star"])), J=float(sol.value(opti.f)),
+                    lam_g=np.array(sol.value(opti.lam_g)).ravel(), w_omega=float(w_om))
+    raise last_exc   # 사다리 전부 실패 — 호출측이 cold multistart로 fallback
 
 
 def _spline_eval(P, t_f):
@@ -413,7 +498,7 @@ def _spline_eval(P, t_f):
 
 def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
                     release_time=RELEASE_TIME, q_start=None, verbose=False,
-                    init=None, warm_data=None):
+                    init=None, warm_data=None, drag=None):
     """
     입력 (주어지는 값): p_grasp(=p0, 물체를 쥔 TCP 위치), p_target(착지 목표),
                         v0/vf(시작/종료 관절속도 6-vector — 기본 0, 일반형).
@@ -435,6 +520,7 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
     p_target = np.asarray(p_target, float)
     v0 = np.zeros(6) if v0 is None else np.asarray(v0, float)
     vf = np.zeros(6) if vf is None else np.asarray(vf, float)
+    drag = np.zeros(3) if drag is None else np.asarray(drag, float)  # c=0 → 무항력
     rt = release_time
 
     if q_start is None:
@@ -460,9 +546,11 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
         P_free = opti.variable(6, N_CTRL - 3)    # 독립 제어점: P₂..Pₙ₋₂, Pₙ
         t_f = opti.variable()
         t_star = opti.variable()
-        P = _assemble_nlp(opti, P_free, t_f, t_star, cs.DM(q_start), cs.DM(v0),
-                          cs.DM(vf), cs.DM(np.asarray(p_target, float)),
-                          u_pos_nodes, rt)
+        womega = opti.parameter()                # ω² penalty 가중치 (사다리로 조절)
+        P, taus = _assemble_nlp(opti, P_free, t_f, t_star, cs.DM(q_start),
+                                cs.DM(v0), cs.DM(vf),
+                                cs.DM(np.asarray(p_target, float)),
+                                u_pos_nodes, rt, cs.DM(drag), womega)
 
         # -- 초기값: 선형 보간 스윙 (refinement 재풀이 시엔 이전 해 warm start) --
         if warm is None:
@@ -474,24 +562,36 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
                                     [s_yaw, 0.7, 0.6, 0.0, 0.4, 0.0]), float)
             T0 = float(cfg.get("T0", 0.9))
             chi0 = float(cfg.get("chi0", 0.5))
-            q_end0 = q_start + dq
-            P0_full = np.linspace(q_start, q_end0, N_CTRL).T
-            opti.set_initial(P_free, P0_full[:, free_idx])
-            opti.set_initial(t_f, T0)
-            opti.set_initial(t_star, chi0 * T0)
+            P_init = np.linspace(q_start, q_start + dq, N_CTRL).T[:, free_idx]
+            tf_init, ts_init = T0, chi0 * T0
         else:
-            opti.set_initial(P_free, warm["P"][:, free_idx])
-            opti.set_initial(t_f, warm["t_f"])
-            opti.set_initial(t_star, warm["t_star"])
+            P_init = warm["P"][:, free_idx]
+            tf_init, ts_init = warm["t_f"], warm["t_star"]
 
         # expand: MX→SX 그래프 전개 — 같은 수식·같은 iterate 경로로 평가만 ~2× 빨라짐
         # (2026-07-15 실측 14.0→7.1s, 해 완전 동일). jit은 컴파일 10분+라 부적합.
         opti.solver("ipopt", {"print_time": False, "expand": True},
                     {"max_iter": 3000, "print_level": 5 if verbose else 0, "sb": "yes"})
-        sol = opti.solve()   # 실패 시 예외 전파 (자진신고)
-        return dict(P=np.array(sol.value(P)), t_f=float(sol.value(t_f)),
-                    t_star=float(sol.value(t_star)), J=float(sol.value(opti.f)),
-                    lam_g=np.array(sol.value(opti.lam_g)).ravel())
+        # ω² penalty 가중치 사다리 (강→약, 첫 수렴 rung 채택; 마지막 0.0은 정확도+시간만
+        # → ω 도입 이전 검증된 공식화라 basin이 feasible하면 항상 수렴)
+        last_exc = None
+        for w_om in W_OMEGA_LADDER:
+            opti.set_value(womega, w_om)
+            opti.set_initial(P_free, P_init)
+            opti.set_initial(t_f, tf_init)
+            opti.set_initial(t_star, ts_init)
+            for t_i in taus:
+                opti.set_initial(t_i, 0.45)
+            try:
+                sol = opti.solve()   # 실패 시 다음 rung으로
+            except RuntimeError as e:
+                last_exc = e
+                continue
+            return dict(P=np.array(sol.value(P)), t_f=float(sol.value(t_f)),
+                        t_star=float(sol.value(t_star)), J=float(sol.value(opti.f)),
+                        lam_g=np.array(sol.value(opti.lam_g)).ravel(),
+                        w_omega=float(w_om))
+        raise last_exc   # 사다리 전부 실패 (마지막 0.0도 실패 = 진짜 나쁜 basin)
 
     # ---- adaptive refinement 루프 (제약 3을 보수성 없이 전 구간 보장) ----
     u_pos = np.unique(np.concatenate([np.linspace(0.0, 1.0, 25), np.unique(KNOTS)]))
@@ -505,7 +605,8 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
                 # full warm start polish — 캐시된 파라메트릭 솔버 (조립 생략).
                 # refinement 재풀이(드묾)는 노드가 늘어 구성이 달라지므로 아래
                 # cold 경로(primal warm start)로.
-                out = _polish_solve(u_pos, rt, q_start, v0, vf, p_target, warm_data)
+                out = _polish_solve(u_pos, rt, q_start, v0, vf, p_target,
+                                    warm_data, drag)
             else:
                 out = _build_and_solve(u_pos, warm)
         except RuntimeError:
@@ -549,7 +650,7 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
     out["u_pos"] = u_pos            # warm DB entry용 (lam_g는 _build_and_solve가 기록)
 
     out.update(knots=KNOTS.copy(), degree=DEGREE, q_start=q_start,
-               p_target=p_target, release_time=rt, v0=v0, vf=vf)
+               p_target=p_target, release_time=rt, v0=v0, vf=vf, drag=drag)
     return out
 
 
@@ -563,7 +664,7 @@ if __name__ == "__main__":
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    from throwing import G_VEC, jacobian, landing_error
+    from throwing import G_VEC, jacobian, landing_error, launch_state
 
     P0_GRASP = np.array([0.30, 0.0, 0.50])
     TGT = np.array([1.80, 0.20, 0.0])
@@ -597,19 +698,19 @@ if __name__ == "__main__":
           f"B_min = {np.rad2deg(Q[:, 4].min()):.3f}°")
     print(f"      속도 max|q̇|/v_max = {np.max(np.abs(Qd)/GP8_QD_MAX):.2f} (hard, ≤1 이어야)")
 
-    # --- 윈도우 착탄 오차 + 민감도 ---
-    _, f_sens = make_objective_functions(TGT)
+    # --- 윈도우 착탄 오차 + TCP 각속도 (ω=0 hard — 2026-07-22 대체) ---
     for tr in t_st + np.linspace(-rt / 2, rt / 2, 5):
         q, qd = q_of(tr), qd_of(tr)
-        p = fk_frames(q)[2]; v = jacobian(q)[0] @ qd
+        p, v = launch_state(q, qd)           # 발사점(TCP+GRIP_OFF) — planner와 동일
+        w_tcp = jacobian(q)[1] @ qd
         print(f"  release t={tr:.4f}s → 착탄오차 {1e3*landing_error(p, v, TGT):6.2f} mm, "
-              f"J_sens={float(f_sens(q, qd)):.2f}")
+              f"|ω|={np.linalg.norm(w_tcp):.4f} rad/s")
 
     # --- 착탄오차 프로파일: t*가 argmin에 앉았는지 ---
     prof_t, prof = [], []
     for t in np.linspace(0.02, t_f, 500):
         q, qd = q_of(t), qd_of(t)
-        p = fk_frames(q)[2]; v = jacobian(q)[0] @ qd
+        p, v = launch_state(q, qd)
         if v[2]**2 + 2 * G * p[2] > 0 and np.dot((TGT - p)[:2], v[:2]) > 0:
             prof_t.append(t); prof.append(landing_error(p, v, TGT))
     prof_t, prof = np.array(prof_t), np.array(prof)
@@ -640,7 +741,7 @@ if __name__ == "__main__":
                     alpha=0.2 + 0.6 * m / (len(t_snap) - 1))
         for tr in t_st + np.linspace(-rt / 2, rt / 2, 5):
             q, qd = q_of(tr), qd_of(tr)
-            p = fk_frames(q)[2]; v = jacobian(q)[0] @ qd
+            p, v = launch_state(q, qd)
             tf_ = np.linspace(0, 0.7, 80)[:, None]
             fl = p[None] + v[None] * tf_ + 0.5 * G_VEC[None] * tf_**2
             fl = fl[fl[:, 2] >= -0.01]

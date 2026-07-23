@@ -53,6 +53,12 @@ TARGETS: list[tuple[float, float, float]] = [
     (1.50, 0.30, 0.0),      # 정적 테스트 target B
     (0.45, -0.40, 0.132),   # 벨트 중앙선 downstream fallback 조준점
     (0.55, -0.30, 0.132),   # 벨트 밴드 가장자리 downstream fallback 조준점
+    # tests/run_static_pick_throw.sh TARGETS 12개 (2026-07-23 사용자 요청 — 정적
+    # 스윕 그리드 x∈{1.5,1.75,2.0} × y∈{±0.225,±0.075}). 이걸 넣어야 static test가
+    # cold가 아니라 warm polish로 돈다 (기존 6 bin은 이 그리드에서 12~46cm 떨어짐).
+    (1.50, 0.225, 0.0), (1.50, 0.075, 0.0), (1.50, -0.075, 0.0), (1.50, -0.225, 0.0),
+    (1.75, 0.225, 0.0), (1.75, 0.075, 0.0), (1.75, -0.075, 0.0), (1.75, -0.225, 0.0),
+    (2.00, 0.225, 0.0), (2.00, 0.075, 0.0), (2.00, -0.075, 0.0), (2.00, -0.225, 0.0),
 ]
 # base-frame 던지기 시작 TCP [x, y, z] (m) — grasp(z=GRASP_Z) + THROW_LIFT 상승.
 # intercept 존: x는 벨트 밴드 [0.25, 0.65], y는 reach 원판 [-y_b, +y_b] 대표점.
@@ -67,11 +73,22 @@ P_STARTS: list[tuple[float, float, float]] = [
 # 스킬 상수 미러 (robust_throw_skill.py 와 동일해야 함)
 THROW_LIFT = 0.10          # grasp TCP + 이만큼 상승 = 던지기 시작
 LANDING_GATE = 0.03        # 윈도우 dense 착탄오차 상한 (m)
-INIT_VARIANTS = (          # robust_throw_skill.INIT_VARIANTS_ROS 미러
-    None,
-    dict(dq_swing=[0.0, 0.9, 0.3, 0.0, 0.7, 0.0], T0=0.6),
-    dict(dq_swing=[0.0, 0.5, 0.9, 0.0, 0.2, 0.0], T0=1.1, chi0=0.7),
-    dict(dq_swing=[-0.13, 0.7, 0.6, 0.0, 0.4, 0.0]),
+# 오프라인 multistart 초기해 — 런타임(robust_throw_skill.INIT_VARIANTS_ROS)보다
+# 의도적으로 넓게. 빌더는 (target,p_start)별로 게이트 통과한 것 중 min-J 해만
+# 저장하므로(main의 best dict) 변형이 많을수록 더 나은 basin을 고를 확률이 커진다
+# (2026-07-23 사용자 "최대한 다양한 초기값으로 최적화 뒤 best 저장"). dq_swing =
+# [S,L,U,R,B,T] 오프셋(플래너 규약); 지배축은 L(어깨)·U(elbow)·B(wrist pitch),
+# S(yaw)는 조준. 축 강조/스윙 진폭/시간(T0)/release비(chi0)/yaw부호를 교차.
+INIT_VARIANTS = (
+    None,                                                              # auto (yaw=target y 부호)
+    dict(dq_swing=[0.0, 0.9, 0.3, 0.0, 0.7, 0.0], T0=0.6),             # 어깨 위주, 빠름
+    dict(dq_swing=[0.0, 0.5, 0.9, 0.0, 0.2, 0.0], T0=1.1, chi0=0.7),   # elbow 위주, 느림·늦은 release
+    dict(dq_swing=[-0.13, 0.7, 0.6, 0.0, 0.4, 0.0]),                   # -yaw
+    dict(dq_swing=[0.13, 0.7, 0.6, 0.0, 0.4, 0.0]),                    # +yaw
+    dict(dq_swing=[0.0, 0.6, 0.6, 0.0, 0.9, 0.0], T0=0.8, chi0=0.5),   # wrist(B) 위주
+    dict(dq_swing=[0.0, 1.1, 0.7, 0.0, 0.8, 0.0], T0=1.0, chi0=0.55),  # 큰 스윙 (원거리 reach)
+    dict(dq_swing=[0.0, 1.0, 0.2, 0.0, 0.5, 0.0], T0=0.7, chi0=0.45),  # 어깨 위주, 더 빠름·이른 release
+    dict(dq_swing=[0.0, 0.4, 1.0, 0.0, 0.3, 0.0], T0=1.2, chi0=0.6),   # elbow 큰폭, 느림
 )
 
 
@@ -93,7 +110,7 @@ def _gates(res: dict, p_target) -> "str | None":
     """robust_throw_skill._solution_gates 와 동일 기준 (독립 재검증)."""
     import numpy as np
     from throw_nlp import _spline_eval
-    from throwing import GP8_QD_MAX, fk_pos, jacobian, landing_error
+    from throwing import GP8_QD_MAX, landing_error, launch_state
 
     if res.get("pos_viol_dense", 0.0) > 1e-3:
         return f"pos_viol_dense {res['pos_viol_dense']:.1e}"
@@ -105,8 +122,11 @@ def _gates(res: dict, p_target) -> "str | None":
     rt = res["release_time"]
     errs = []
     for t in res["t_star"] + np.linspace(-rt / 2, rt / 2, 11):
-        q, qd = q_of(t), qd_of(t)
-        errs.append(landing_error(fk_pos(q), jacobian(q)[0] @ qd, np.asarray(p_target)))
+        # 발사점은 NLP와 동일하게 launch_state (TCP + 로드축 GRIP_OFF, ω×r 포함)
+        # — 스킬의 _solution_gates 와 동일 기준. bare TCP로 재검증하면 2cm/ω×r
+        # 만큼 어긋나 정상 해가 착탄 게이트에 잘못 걸린다.
+        p_eff, v_eff = launch_state(q_of(t), qd_of(t))
+        errs.append(landing_error(p_eff, v_eff, np.asarray(p_target)))
     e_max = float(np.max(errs))
     if not np.isfinite(e_max) or e_max > LANDING_GATE:
         return f"landing window max {e_max * 1e3:.0f}mm > {LANDING_GATE * 1e3:.0f}mm"
@@ -189,7 +209,10 @@ def _formulation_params_standalone() -> dict:
                 qdd_lim=throw_nlp.QDD_LIM.tolist(),
                 t_bounds=tuple(throw_nlp.T_BOUNDS),
                 degree=throw_nlp.DEGREE,
-                dims=dict(GP8_DIMS))
+                dims=dict(GP8_DIMS),
+                # flight 모델 마커 — 로더(robust_throw_skill._formulation_params)와
+                # 동일 키. 항력/RK4·발사점·τ 변수가 공식화를 바꾸면 entry 무효.
+                flight=getattr(throw_nlp, "FLIGHT_MODEL", "parabola"))
 
 
 def main() -> None:
