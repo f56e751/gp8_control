@@ -701,6 +701,21 @@ class RobustThrowSkill(ManipulationSkill):
         e_max = float(np.max(errs))
         if not np.isfinite(e_max) or e_max > LANDING_GATE:
             return f"착탄 게이트 초과 (window max {e_max * 1e3:.0f}mm > {LANDING_GATE * 1e3:.0f}mm)"
+        # ④ Cartesian 안전 엔벨로프: 최적화가 끝난 '궤적'을 보고 기둥/베이스
+        #    (x ≤ MIN_TCP_X)나 바닥/벨트(z ≤ MIN_TCP_Z)를 침범하면 이 후보를 기각.
+        #    NLP는 바닥 클리어런스를 hard 제약으로 걸지 않고(걸면 basin이 전멸)
+        #    기둥 회피도 release 창까지만 활성이라, 감속 꼬리가 지하로 다이브하는
+        #    해가 정상 수렴한다 — 그래서 사후 검사로 거른다.
+        #    **여기서 기각해야 plan_nlp_throw가 다음 warm/cold 후보를 재시도한다.**
+        #    dispatch 직전 게이트(build_throw_trajectory)만 있으면 재시도 없이 그
+        #    사이클이 버려진다. 빌더(tools/build_warm_db._gates)와 동일 기준.
+        #    fk_pos는 플래너 규약 FK (로봇 FK와 0.000mm 일치 검증됨).
+        P_arc = np.array([fk_pos(q_of(t))
+                          for t in np.linspace(0.0, res["t_f"], 300)])
+        x_min, z_min = float(P_arc[:, 0].min()), float(P_arc[:, 2].min())
+        if x_min <= MIN_TCP_X or z_min <= MIN_TCP_Z:
+            return (f"Cartesian 엔벨로프 위반 (x_min={x_min:+.3f}m, "
+                    f"z_min={z_min:+.3f}m; 한계 x>{MIN_TCP_X:.2f}, z>{MIN_TCP_Z:.2f})")
         return None
 
     # ------------------------------------------------------------------
