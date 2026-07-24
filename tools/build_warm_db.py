@@ -46,13 +46,15 @@ DB_PATH = SKILLS_DIR / "warm_db.pkl"
 #    BIN_Z_OFFSET_DEFAULT)
 #  - 벨트 fallback z 0.132 = GRASP_Z + DETECTION_OFFSET_AIM(0.07, perception/extrinsics.py)
 #  - 벨트 밴드 x = REFERENCE_X_BASE(0.45) ± WORKSPACE_X_ABS(0.2) (캘리브레이션)
+# PAIRED 모드 (2026-07-24 사용자 "shuffle 안 할 테니 이 쌍 순서대로 최적화").
+# run_static_pick_throw.sh 가 --shuffle-points 없이 돌면 point[i]→TARGETS[i] 가
+# 고정 쌍이라, 각 target을 '그 target에 실제로 쓰이는 던지기 시작 자세'로 최적화할
+# 수 있다. True면 TARGETS[i]와 P_STARTS[i]를 1:1로 짝지어 len(TARGETS)개 조합만
+# 푼다(교차곱 아님). 이러면 런타임 lift 자세와 DB start가 일치해 polish가 즉시
+# 수렴하고(먼 start = 8~14s·나쁜 basin 문제 해소) Cartesian 게이트 기각도 사라진다.
+PAIRED = True
 TARGETS: list[tuple[float, float, float]] = [
     # tests/run_static_pick_throw.sh 의 현재 TARGETS 12개 (2026-07-24 사용자 지정).
-    # x가 커질수록 z도 오르는 계단형 배치 — 각 행이 한 높이의 bin 열이다.
-    # entry 조회는 XY 최근접이라 '실제 사용하는 z'로 직접 만들어 둬야 그 z에서
-    # Cartesian 엔벨로프 안전성이 빌더 게이트로 검증된다.
-    # (운영 bin/fallback 6개는 사용자 지시로 제외 — static 12개만; 라이브 컨베이어
-    #  운영 bin에 warm 커버가 필요하면 그 좌표를 여기 되살려 재빌드하면 된다.)
     (1.200, 0.225, 0.040), (1.200, 0.075, 0.040),
     (1.200, -0.075, 0.040), (1.200, -0.225, 0.040),
     (1.441, 0.225, 0.105), (1.441, 0.075, 0.105),
@@ -60,14 +62,18 @@ TARGETS: list[tuple[float, float, float]] = [
     (1.683, 0.225, 0.170), (1.683, 0.075, 0.170),
     (1.683, -0.075, 0.170), (1.683, -0.225, 0.170),
 ]
-# base-frame 던지기 시작 TCP [x, y, z] (m) — grasp(z=GRASP_Z) + THROW_LIFT 상승.
-# intercept 존: x는 벨트 밴드 [0.25, 0.65], y는 reach 원판 [-y_b, +y_b] 대표점.
-# start 1개 = target당 entry 1개 (2026-07-24 사용자 "18 entry로"). 18 targets ×
-# 1 start = 18 entries. warm start는 시작 자세 차이에 관대(수십 cm)하므로 대표
-# 중앙점 1개로 각 target을 커버한다 — 런타임의 실제 lift 자세가 이와 달라도
-# polish가 흡수한다. 다시 넓히려면 아래에 start 좌표를 추가하면 그만큼 entry가 는다.
+# base-frame 던지기 시작 TCP [x, y, z] (m). PAIRED 모드에서는 TARGETS와 1:1 대응.
+# 값 = run_static_pick_throw.sh POINTS[i] 의 (x, y) + 던지기 시작 z. 시작 z는
+# static_pick_throw 가 쓰는 것과 동일하게 계산: place(=press_z + PLACE_ABOVE_PRESS
+# 0.05) + THROW_LIFT 0.10. POINTS 의 press_z = 0.02 → 시작 z = 0.02+0.05+0.10 = 0.17.
+# 이 좌표가 plan_nlp_throw 의 p_lift 와 같아야 polish 가 그 자세에서 바로 출발한다.
 P_STARTS: list[tuple[float, float, float]] = [
-    (0.45, 0.00, 0.162),    # 중앙선 정중앙 (대표 start)
+    (0.40, 0.30, 0.17), (0.40, 0.20, 0.17),
+    (0.40, 0.10, 0.17), (0.40, 0.00, 0.17),
+    (0.40, -0.10, 0.17), (0.40, -0.20, 0.17),
+    (0.50, 0.30, 0.17), (0.50, 0.20, 0.17),
+    (0.50, 0.10, 0.17), (0.50, 0.00, 0.17),
+    (0.50, -0.10, 0.17), (0.50, -0.20, 0.17),
 ]
 
 # 스킬 상수 미러 (robust_throw_skill.py 와 동일해야 함)
@@ -291,15 +297,25 @@ def main() -> None:
             print(f"기존 DB 로드 실패({type(e).__name__}) — 전체 재계산")
 
     have = {_key(e["target"], e["p_start"]) for e in existing}
-    new_combos = [(ti, si, t, p)
+    if PAIRED:
+        # TARGETS[i] ↔ P_STARTS[i] 1:1 (교차곱 아님). ti/si는 로그·best 키 용도로
+        # 동일 인덱스를 쓴다 (한 쌍당 entry 1개).
+        if len(TARGETS) != len(P_STARTS):
+            sys.exit(f"PAIRED 모드: len(TARGETS)={len(TARGETS)} != "
+                     f"len(P_STARTS)={len(P_STARTS)} — 1:1 이어야 함")
+        combos = [(i, i, t, p) for i, (t, p) in enumerate(zip(TARGETS, P_STARTS))]
+        n_total = len(TARGETS)
+    else:
+        combos = [(ti, si, t, p)
                   for ti, t in enumerate(TARGETS)
-                  for si, p in enumerate(P_STARTS)
+                  for si, p in enumerate(P_STARTS)]
+        n_total = len(TARGETS) * len(P_STARTS)
+    new_combos = [(ti, si, t, p) for (ti, si, t, p) in combos
                   if _key(t, p) not in have]
     jobs = [(ti, si, vi, t, p)
             for (ti, si, t, p) in new_combos
             for vi in range(len(INIT_VARIANTS))]
-    n_total = len(TARGETS) * len(P_STARTS)
-    print(f"grid: {len(TARGETS)} targets x {len(P_STARTS)} starts = {n_total}조합 — "
+    print(f"grid: {'PAIRED ' if PAIRED else ''}{n_total}조합 — "
           f"신규 {len(new_combos)}조합 x {len(INIT_VARIANTS)} variants = "
           f"{len(jobs)} solves (기존 커버 {n_total - len(new_combos)}조합 생략), "
           f"{args.workers} workers")

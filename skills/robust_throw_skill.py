@@ -613,24 +613,60 @@ class RobustThrowSkill(ManipulationSkill):
         if cache_key in self._warm_cache:
             warm_cands.append(("cache", self._warm_cache[cache_key]))
         db = _load_warm_db(ctx.log)
-        if db:
-            near = sorted(db, key=lambda e: float(np.linalg.norm(
-                np.asarray(e["target"])[:2] - p_target[:2])))[:2]
-            warm_cands += [(f"db#{i}", e) for i, e in enumerate(near)]
-
         res, how = None, ""
-        for tag, ent in warm_cands:
-            try:
-                cand = solve_throw_nlp(None, p_target, release_time=THROW_WINDOW_T,
-                                       q_start=q_lift, warm_data=ent)
-            except (RuntimeError, ValueError, AssertionError) as e:
-                ctx.log.info(f"warm[{tag}] 불발: {type(e).__name__}")
-                continue
-            why = self._solution_gates(cand, p_target)
-            if why is None:
-                res, how = cand, f"warm[{tag}]"
-                break
-            ctx.log.info(f"warm[{tag}] 게이트 기각: {why}")
+
+        # ---- ① exact-match 고속 경로: 저장된 최적 궤적을 그대로 사용 (재풀이 생략) --
+        # 이 (시작자세 p_lift, target) 쌍의 해가 DB에 이미 있으면 NLP 재풀이(실측
+        # 3~14s)를 건너뛰고 저장 궤적(P, t_f, t_star)을 그대로 dispatch 한다 —
+        # 결정적 static test(런타임 쌍 = 빌더 PAIRED 쌍)에선 계획 시간이 ~0.
+        # 저장 해는 빌더 게이트를 이미 통과했지만 실기 안전상 _solution_gates 로
+        # 재검증하고, q_lift 를 entry 의 q_start 로 맞춰 lift 가 저장 arc(P[0]=q_start)
+        # 와 연속이 되게 한다. (매칭 허용 2mm — 같은 산술로 만든 좌표라 실질 정확.)
+        if db:
+            for e in db:
+                ps = e.get("p_start")
+                if ps is None:
+                    continue
+                if (float(np.linalg.norm(np.asarray(e["target"]) - p_target)) < 2e-3
+                        and float(np.linalg.norm(np.asarray(ps, float) - p_lift)) < 2e-3):
+                    cand = dict(
+                        P=np.asarray(e["P"], float), t_f=float(e["t_f"]),
+                        t_star=float(e["t_star"]), J=float(e["J"]),
+                        release_time=THROW_WINDOW_T, lam_g=e.get("lam_g"),
+                        u_pos=e.get("u_pos"),
+                        pos_viol_dense=float(e.get("pos_viol_dense", 0.0)))
+                    why = self._solution_gates(cand, p_target)
+                    if why is None:
+                        res, how = cand, "exact-DB"
+                        q_lift = np.asarray(e["q_start"], dtype=float)
+                        break
+                    ctx.log.info(f"exact-DB 게이트 기각: {why} — polish 로 진행")
+
+        # ---- ② 세션 캐시 + 파일 DB 최근접으로 warm start polish (재풀이) ----
+        if res is None:
+            if db:
+                # 후보 선정: target XY 근접이 1차, 시작 자세(p_start) 근접이 2차.
+                # 정확 일치가 아닐 때(쌍이 어긋난 경우) 그나마 가까운 start 를 고른다.
+                def _cost(e):
+                    dt = float(np.linalg.norm(np.asarray(e["target"])[:2] - p_target[:2]))
+                    ps = e.get("p_start")
+                    ds = 0.0 if ps is None else float(
+                        np.linalg.norm(np.asarray(ps, float) - p_lift))
+                    return dt + 0.3 * ds
+                near = sorted(db, key=_cost)[:2]
+                warm_cands += [(f"db#{i}", e) for i, e in enumerate(near)]
+            for tag, ent in warm_cands:
+                try:
+                    cand = solve_throw_nlp(None, p_target, release_time=THROW_WINDOW_T,
+                                           q_start=q_lift, warm_data=ent)
+                except (RuntimeError, ValueError, AssertionError) as e:
+                    ctx.log.info(f"warm[{tag}] 불발: {type(e).__name__}")
+                    continue
+                why = self._solution_gates(cand, p_target)
+                if why is None:
+                    res, how = cand, f"warm[{tag}]"
+                    break
+                ctx.log.info(f"warm[{tag}] 게이트 기각: {why}")
 
         if res is None:
             for k, init in enumerate(INIT_VARIANTS_ROS):

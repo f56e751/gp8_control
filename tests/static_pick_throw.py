@@ -349,6 +349,10 @@ def main() -> None:
                     help="로봇/석션 무명령 — IK+NLP+궤적 조립만 검증")
     ap.add_argument("--no-confirm", action="store_true",
                     help="사이클별 Enter 확인 생략")
+    ap.add_argument("--confirm-throw", action="store_true",
+                    help="grasp(흡착)+유지 후 Enter 를 눌러야 던진다 "
+                         "(장치 on; 기본 off = 흡착 즉시 던짐). q 입력 시 그 사이클 "
+                         "던지기 생략(물체 쥔 채 놓기)")
     args, _ros = ap.parse_known_args()
 
     if not 0.0 < args.vel_scale <= 1.0:
@@ -512,6 +516,19 @@ def main() -> None:
             traj_ctrl.send_trajectory_queue(d_traj, d_vel, d_ts,
                                             final_joint=c["q_press"])
             time.sleep(PICK_TIME)
+
+            # --confirm-throw: 흡착·유지 후 조작자가 Enter 를 눌러야 던진다. 이
+            # 구간 동안 컵은 q_press 자세를 유지(JGPC zero-order-hold)하며 물체를
+            # 계속 누르고 있으므로, 물체 장착/정렬 확인 뒤 던질 수 있다. suction 은
+            # 이미 ON. q 입력 시 이 사이클의 던지기를 생략하고 물체를 놓는다.
+            if args.confirm_throw:
+                ans = input("  물체 grasp 완료 — 던지려면 Enter (q 던지기 생략): "
+                            ).strip().lower()
+                if ans == "q":
+                    print("  던지기 생략 — suction OFF (물체 놓음)")
+                    traj_ctrl.suction_off()
+                    results.append((c["no"], "THROW-SKIPPED"))
+                    continue
 
             th = c["throw"]
             print(f"→ THROW (t_f={c['res']['t_f']:.3f}s, J={c['res']['J']:.3f}, "
