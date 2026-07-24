@@ -556,14 +556,22 @@ def solve_throw_nlp(p_grasp, p_target, v0=None, vf=None,
     rt = release_time
 
     if q_start is None:
-        # 시작 자세: p_grasp를 잡는 IK 해 중 B가 하한에서 떨어진 것
-        for seedB in (0.6, 0.9, 0.3, 1.2):
-            qs, ok = ik_position(np.asarray(p_grasp, float),
-                                 np.array([0.2, 0.5, -0.2, 0.0, seedB, 0.0]))
-            if ok and qs[4] >= Q_LO[4] + 0.01:   # B 하한(10°)에서 살짝 떨어진 해만
-                q_start = qs
+        # 시작 자세: p_grasp를 잡는 IK 해 중 '전 관절이 위치 한계 안'인 것.
+        # 목표 방향으로 S(atan2)를 잡고 어깨 L 낮게·손목 B 넓게 뿌린다 — 고정
+        # seed(S=0.2, L=0.5)는 조인 한계(J2≤30/J3≤45)에서 코너 자세를 L>30
+        # basin 으로 흘려 entry 를 못 만들었다 (2026-07-24). 구 코드는 B 하한만
+        # 봤으나 여기선 전 한계를 확인해 NLP 위치 hull 위반을 원천 차단한다.
+        pg = np.asarray(p_grasp, float)
+        s_yaw = float(np.clip(np.arctan2(pg[1], pg[0]), Q_LO[0], Q_HI[0]))
+        for seedL, seedU in ((0.2, 0.1), (0.4, -0.2)):
+            for seedB in (0.2, 0.5, 0.9, 1.2):
+                qs, ok = ik_position(pg, np.array([s_yaw, seedL, seedU, 0.0, seedB, 0.0]))
+                if ok and np.all(qs >= Q_LO) and np.all(qs <= Q_HI):
+                    q_start = qs
+                    break
+            if q_start is not None:
                 break
-        assert q_start is not None, "B≥10° 시작자세 IK 실패"
+        assert q_start is not None, "위치 한계 내 시작자세 IK 실패"
     else:
         q_start = np.asarray(q_start, float)
         if not (np.all(q_start >= Q_LO - 1e-9) and np.all(q_start <= Q_HI + 1e-9)):

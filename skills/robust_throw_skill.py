@@ -592,9 +592,16 @@ class RobustThrowSkill(ManipulationSkill):
         # lift 자세: NLP 위치 한계(B≥10°, U≤45°, |R|≤80° 포함) 안의 IK 해.
         # ik_position/Q_LO/Q_HI는 플래너 규약이므로 로봇 규약인 start_joint를
         # _PLANNER_SIGN으로 변환해 시드로 쓴다 (고정 시드들은 원래 플래너 규약).
+        # lift IK seed: 목표 방향으로 S 를 잡고(atan2(y,x)) 어깨 L 을 낮게·손목 B 를
+        # 넓게 뿌린다. 구 seed(start_joint + b∈{0.6,0.9,1.2}, S 고정)는 조인 한계
+        # (J2≤30/J3≤45)에서 코너 자세(예 0.5,0.3)를 전부 L>30 basin 으로 흘려보내
+        # '한계 내 해 없음'을 냈지만(2026-07-24 실기 재현), 해 자체는 존재한다 —
+        # 아래 seed 집합은 실측상 12개 lift 자세 12/12 를 한계 안에서 찾는다.
         q_lift = None
+        s_yaw = float(np.clip(np.arctan2(p_lift[1], p_lift[0]), Q_LO[0], Q_HI[0]))
         seeds = [np.asarray(start_joint, dtype=float) * _PLANNER_SIGN]
-        seeds += [np.array([seeds[0][0], 0.5, -0.2, 0.0, b, 0.0]) for b in (0.6, 0.9, 1.2)]
+        seeds += [np.array([s_yaw, L, U, 0.0, b, 0.0])
+                  for L in (0.2, 0.4) for U in (0.1, -0.2) for b in (0.2, 0.5, 0.9, 1.2)]
         for seed in seeds:
             q, ok = ik_position(p_lift, seed)
             if ok and np.all(q >= Q_LO) and np.all(q <= Q_HI):
