@@ -151,9 +151,14 @@ class Config:
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
 
     # Trajectory sampling / joint limit scales. Affects the post-throw chain
-    # and the pre-pick _move_through (anything via trajectory()/opt_time);
-    # NOT the NN-driven throw motion itself (that uses params.T / params.w).
-    TRAJ_HZ: float = 20.0
+    # and the pre-pick _move_through (anything via trajectory()/opt_time), and
+    # the RobustThrow NLP arc sampling + release-index granularity.
+    # 20 -> 50 Hz (2026-07-24 사용자): throw arc(t_f~0.4-0.6s)가 50ms 간격이면
+    # 8~12점뿐이고 release 타이밍 granularity도 50ms라 거칠었다. 50Hz면 arc가
+    # 2.5배 촘촘하고 release가 20ms 단위로 정밀. 스트림이 250Hz로 리샘플하므로
+    # 실제 모션 부드러움은 이미 250Hz — 여긴 리샘플 전 밀도/타이밍 해상도용.
+    # warm DB(연속 B-spline)와는 무관 (샘플링만 바뀜, 재빌드 불필요).
+    TRAJ_HZ: float = 50.0
     JOINT_VEL_LIMIT_SCALE: float = 0.9    # 90% of nominal joint velocity (safety margin)
     JOINT_ACCEL_LIMIT_SCALE: float = 6.0  # M2 = M1 × this (aggressive accel/decel)
 

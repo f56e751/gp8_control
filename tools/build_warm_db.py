@@ -55,12 +55,12 @@ DB_PATH = SKILLS_DIR / "warm_db.pkl"
 PAIRED = True
 TARGETS: list[tuple[float, float, float]] = [
     # tests/run_static_pick_throw.sh 의 현재 TARGETS 12개 (2026-07-24 사용자 지정).
-    (1.200, 0.225, 0.040), (1.200, 0.075, 0.040),
-    (1.200, -0.075, 0.040), (1.200, -0.225, 0.040),
-    (1.441, 0.225, 0.105), (1.441, 0.075, 0.105),
-    (1.441, -0.075, 0.105), (1.441, -0.225, 0.105),
-    (1.683, 0.225, 0.170), (1.683, 0.075, 0.170),
-    (1.683, -0.075, 0.170), (1.683, -0.225, 0.170),
+    (1.200, 0.225, 0.020), (1.200, 0.075, 0.020),
+    (1.200, -0.075, 0.020), (1.200, -0.225, 0.020),
+    (1.441, 0.225, 0.085), (1.441, 0.075, 0.085),
+    (1.441, -0.075, 0.085), (1.441, -0.225, 0.085),
+    (1.683, 0.225, 0.150), (1.683, 0.075, 0.150),
+    (1.683, -0.075, 0.150), (1.683, -0.225, 0.150),
 ]
 # base-frame 던지기 시작 TCP [x, y, z] (m). PAIRED 모드에서는 TARGETS와 1:1 대응.
 # 값 = run_static_pick_throw.sh POINTS[i] 의 (x, y) + 던지기 시작 z. 시작 z는
@@ -265,6 +265,9 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rebuild", action="store_true",
                     help="기존 DB를 무시하고 전 조합 재계산 (기본은 축적/append)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="축적된 DB의 모든 (target,p_start) 쌍을 현재 init/formulation "
+                         "으로 재최적화 (TARGETS/P_STARTS 무시, 축적 집합 보존·궤적 갱신)")
     ap.add_argument("--json-log", default=str(REPO / "tools" / "warm_db_build_log.json"))
     args = ap.parse_args()
 
@@ -284,32 +287,50 @@ def main() -> None:
                 tuple(round(float(v), 3) for v in p))
 
     existing: list = []
-    if not args.rebuild and out_path.exists():
-        try:
-            with open(out_path, "rb") as f:
-                old = pickle.load(f)
-            if all(old.get("params", {}).get(k) == v for k, v in params.items()):
-                existing = old.get("entries", [])
-                print(f"append: 기존 DB {len(existing)} entries 유지 (공식화 일치)")
-            else:
-                print("append 불가: 기존 DB 공식화 불일치 — 전체 재계산 (기존 폐기)")
-        except Exception as e:  # 손상 파일 → 새로 만든다
-            print(f"기존 DB 로드 실패({type(e).__name__}) — 전체 재계산")
-
-    have = {_key(e["target"], e["p_start"]) for e in existing}
-    if PAIRED:
-        # TARGETS[i] ↔ P_STARTS[i] 1:1 (교차곱 아님). ti/si는 로그·best 키 용도로
-        # 동일 인덱스를 쓴다 (한 쌍당 entry 1개).
-        if len(TARGETS) != len(P_STARTS):
-            sys.exit(f"PAIRED 모드: len(TARGETS)={len(TARGETS)} != "
-                     f"len(P_STARTS)={len(P_STARTS)} — 1:1 이어야 함")
-        combos = [(i, i, t, p) for i, (t, p) in enumerate(zip(TARGETS, P_STARTS))]
-        n_total = len(TARGETS)
+    if args.refresh:
+        # --- refresh: 축적된 DB 의 '모든 쌍'을 현재 54 init/formulation 으로 재최적화 ---
+        # (2026-07-24 사용자 "축적 다하면 54 초기값으로 축적된 쌍들의 궤적 값을
+        # 업데이트"). TARGETS/P_STARTS 리스트는 무시하고, DB 에 이미 쌓인 (target,
+        # p_start) 쌍 전부를 새로 푼다 — 기존 entry 는 폐기하고 결과로 교체. 일반
+        # --rebuild 는 하드코딩된 현재 리스트만 다시 풀어 다른 config 의 축적분을
+        # 잃지만, 이 모드는 축적 집합을 통째로 보존하며 궤적만 갱신한다.
+        if not out_path.exists():
+            sys.exit("--refresh: 기존 DB 없음 — 먼저 축적(append)하라")
+        with open(out_path, "rb") as f:
+            old = pickle.load(f)
+        oe = old.get("entries", [])
+        combos = [(i, i, e["target"], e["p_start"]) for i, e in enumerate(oe)]
+        have = set()                       # 전부 재계산
+        n_total = len(combos)
+        print(f"refresh: 축적 DB {len(oe)} 쌍을 {len(INIT_VARIANTS)} init best-of 로 "
+              f"재최적화 (TARGETS/P_STARTS 무시, 공식화 params 현재값으로 기록)")
     else:
-        combos = [(ti, si, t, p)
-                  for ti, t in enumerate(TARGETS)
-                  for si, p in enumerate(P_STARTS)]
-        n_total = len(TARGETS) * len(P_STARTS)
+        if not args.rebuild and out_path.exists():
+            try:
+                with open(out_path, "rb") as f:
+                    old = pickle.load(f)
+                if all(old.get("params", {}).get(k) == v for k, v in params.items()):
+                    existing = old.get("entries", [])
+                    print(f"append: 기존 DB {len(existing)} entries 유지 (공식화 일치)")
+                else:
+                    print("append 불가: 기존 DB 공식화 불일치 — 전체 재계산 (기존 폐기)")
+            except Exception as e:  # 손상 파일 → 새로 만든다
+                print(f"기존 DB 로드 실패({type(e).__name__}) — 전체 재계산")
+
+        have = {_key(e["target"], e["p_start"]) for e in existing}
+        if PAIRED:
+            # TARGETS[i] ↔ P_STARTS[i] 1:1 (교차곱 아님). ti/si는 로그·best 키 용도로
+            # 동일 인덱스를 쓴다 (한 쌍당 entry 1개).
+            if len(TARGETS) != len(P_STARTS):
+                sys.exit(f"PAIRED 모드: len(TARGETS)={len(TARGETS)} != "
+                         f"len(P_STARTS)={len(P_STARTS)} — 1:1 이어야 함")
+            combos = [(i, i, t, p) for i, (t, p) in enumerate(zip(TARGETS, P_STARTS))]
+            n_total = len(TARGETS)
+        else:
+            combos = [(ti, si, t, p)
+                      for ti, t in enumerate(TARGETS)
+                      for si, p in enumerate(P_STARTS)]
+            n_total = len(TARGETS) * len(P_STARTS)
     new_combos = [(ti, si, t, p) for (ti, si, t, p) in combos
                   if _key(t, p) not in have]
     jobs = [(ti, si, vi, t, p)
@@ -331,26 +352,47 @@ def main() -> None:
 
     t_all = time.time()
     ctx = get_context("spawn")
-    with ctx.Pool(args.workers, initializer=_worker_init) as pool:
-        results = pool.map(_solve_one, jobs)
+    from collections import defaultdict
 
-    # (target, p_start)별 게이트 통과 최소-J 해만 entry로
+    def _write(entries_now):
+        # 원자적 쓰기: 쓰는 도중 죽어도(OOM 등) 기존 DB가 깨지지 않게 tmp→rename.
+        tmp_path = out_path.with_suffix(".pkl.tmp")
+        with open(tmp_path, "wb") as f:
+            pickle.dump(dict(params=params, entries=entries_now), f)
+        os.replace(tmp_path, out_path)
+
+    # 증분 저장 (2026-07-24 사용자 "1개 궤적 축적할 때마다 바로바로 db에 저장"):
+    # imap_unordered 로 결과를 스트리밍하고, 한 쌍(=(ti,si))의 전 variant 가
+    # 끝나는 즉시 게이트 통과 최소-J 해를 골라 entry 에 붙이고 DB 를 원자적으로
+    # 다시 쓴다. 중간에 끊겨도(끊김/OOM) 그때까지 확정된 쌍의 궤적은 보존된다.
+    n_per = len(INIT_VARIANTS)
+    pending: dict = defaultdict(list)
     best: dict[tuple, dict] = {}
-    rejected = []
-    for r in results:
-        if r["ok"]:
+    rejected: list = []
+    results: list = []
+    entries = list(existing)          # 기존(append 유지분) 위에 하나씩 이어붙임
+    done = 0
+    with ctx.Pool(args.workers, initializer=_worker_init) as pool:
+        for r in pool.imap_unordered(_solve_one, jobs):
+            results.append(r)
             key = (r["ti"], r["si"])
-            if key not in best or r["J"] < best[key]["J"]:
-                best[key] = r
-        else:
-            rejected.append(r)
-    entries = existing + [best[k]["entry"] for k in sorted(best)]
-
-    # 원자적 쓰기: 쓰는 도중 죽어도(OOM 등) 기존 DB가 깨지지 않게 tmp→rename.
-    tmp_path = out_path.with_suffix(".pkl.tmp")
-    with open(tmp_path, "wb") as f:
-        pickle.dump(dict(params=params, entries=entries), f)
-    os.replace(tmp_path, out_path)
+            if r["ok"]:
+                if key not in best or r["J"] < best[key]["J"]:
+                    best[key] = r
+            else:
+                rejected.append(r)
+            pending[key].append(r)
+            if len(pending[key]) == n_per:        # 이 쌍의 전 variant 완료
+                done += 1
+                if key in best:
+                    entries.append(best[key]["entry"])
+                    _write(entries)               # ★ 한 쌍 확정 즉시 원자적 저장
+                    tag = f"J={best[key]['J']:.2f}"
+                else:
+                    tag = "entry 없음 (전 변형 위반/실패)"
+                del pending[key]
+                print(f"  [{done}/{len(new_combos)}] combo{key} → entry {len(entries)}개 ({tag})")
+    _write(entries)                   # 최종 일관성 보장 (전멸/마지막 실패 케이스 포함)
     print(f"\nwrote {out_path}: {len(entries)} entries "
           f"(신규 {len(best)}, 기존 유지 {len(existing)}, "
           f"{len(rejected)} attempts rejected) in {time.time() - t_all:.0f}s")
@@ -377,9 +419,15 @@ def main() -> None:
             print(f"  최저 TCP z = {min(zs):+.4f} m,  최소 TCP x = {min(xs):+.4f} m")
         print(f"  위반이 나온 (target,start) 조합: {len(per_combo)}/{len(new_combos)}")
         if no_entry:
+            # refresh 모드에서는 ti 가 DB 쌍 인덱스라 TARGETS[ti] 가 안 맞으므로,
+            # 실제 조합 좌표를 combos 에서 찾아 보고한다.
+            combo_xy = {(ti, si): (t, p) for (ti, si, t, p) in combos}
             print(f"  ** 전 변형이 위반해 entry 생성 실패: {len(no_entry)}조합 **")
             for ti, si in sorted(no_entry):
-                print(f"     target{ti}={TARGETS[ti]}  start{si}={P_STARTS[si]}")
+                t, p = combo_xy[(ti, si)]
+                tt = tuple(round(float(v), 3) for v in t)
+                pp = tuple(round(float(v), 3) for v in p)
+                print(f"     target={tt}  start={pp}")
         else:
             print("  (모든 조합이 위반하지 않는 대안 해를 찾아 entry 확보)")
     else:
