@@ -262,7 +262,7 @@ class GP8App:
         changes — which keeps push/throw work from colliding.
         """
         # Default standby pose for the idle chain: the same boot/initial pose
-        # _move_to_initial_pose uses (cfg.INITIAL_R/T), wrist zeroed. Computed
+        # _move_to_initial_pose uses (cfg.INITIAL_R/T), wrist at PICK_WRIST_J6. Computed
         # once here so a skill's post-action chain can return to it when no next
         # object is queued (ManipulationSkill.idle_target -> ctx.idle_joint),
         # instead of parking low at the belt (e.g. a push's push_end).
@@ -271,7 +271,7 @@ class GP8App:
         if idle_joint is None:
             raise RuntimeError("IK failed for idle/initial pose (cfg.INITIAL_R/T).")
         idle_joint = np.asarray(idle_joint, dtype=float)
-        idle_joint[-1] = 0.0
+        idle_joint[-1] = self.cfg.PICK_WRIST_J6   # shared wrist baseline
 
         self.ctx = SkillContext(
             cfg=self.cfg,
@@ -381,7 +381,7 @@ class GP8App:
 
         current_joint = np.array(self.traj_ctrl.current_joints)
         initial_joint = np.array(initial_joint)
-        initial_joint[-1] = 0.0
+        initial_joint[-1] = self.cfg.PICK_WRIST_J6   # shared wrist baseline
         zero = np.zeros_like(self.M1)
         traj, vel, timestep = trajectory(
             current_joint, zero,
@@ -408,21 +408,31 @@ class GP8App:
         object soonest, and will catch it downstream of the old y=0 line if that
         is where it can still reach it) — or ``None`` when the object can't be
         caught anywhere in the workspace before it passes the downstream reach
-        edge. ``None`` is the only drop reason. Returns a ``PickRequest`` for the
-        first catchable head, or ``None`` if none is catchable this epoch. The
-        selected head is popped and recorded as the active target.
+        edge (the only DROP reason). A catchable candidate can additionally be
+        SKIPPED — kept in the queue, not selected — when its skill's
+        ``placement_veto`` refuses the placement (e.g. push: backswing X below
+        ``PUSH_EXEC_MIN_BACKSWING_X``). Returns a ``PickRequest`` for the first
+        catchable, un-vetoed object, or ``None`` if there is none this epoch.
+        The selected object is removed from the queue and recorded as the
+        active target.
         """
         v = self.conveyor.current
 
-        # Walk from the head (most downstream = most urgent). Take the FIRST object
-        # the arm can still catch in its workspace: earliest_reachable_intercept
-        # returns the dynamic intercept (grab at the EARLIEST reachable belt-Y, even
-        # downstream of y=0) or None when the object can't be caught before it passes
-        # the downstream reach edge. None is the ONLY drop reason now.
+        # Walk in queue order (head = most downstream = most urgent). Take the
+        # FIRST object the arm can still catch AND whose skill accepts the
+        # placement. Two skip flavours with different lifecycles:
+        #   - uncatchable (earliest_reachable_intercept -> None): DROPPED — it
+        #     can never be caught, so it leaves the queue for good.
+        #   - vetoed (skill.placement_veto, e.g. push backswing too close to
+        #     the base): SKIPPED but KEPT in the queue. It must keep anchoring
+        #     camera dedup — removing it would respawn it as a ghost track
+        #     every frame — and the veto is re-evaluated live each epoch (a
+        #     class re-vote can re-route it to a skill with no objection). It
+        #     exits via the normal drop line.
         target = None
         target_it = None
-        while self.queue:
-            candidate = self.queue.head()
+        vetoed_ids = set()
+        for candidate in list(self.queue._objects):
             # Place/judge the intercept with the timeline of the skill that will
             # ACTUALLY run this object (push has a much larger time-to-contact than
             # throw). Routing is geometry-independent, so resolving it here matches
@@ -430,25 +440,41 @@ class GP8App:
             skill = self.ctx.skill_obj_for(candidate)
             it = self.ctx.earliest_reachable_intercept(
                 candidate, current_joint, v, now,
-                t_to_contact_fn=skill.t_to_contact,
+                skill=skill,
             )
             if it is None:
-                self.queue.pop_head()
+                self.queue.remove(candidate)
                 self._node.get_logger().info(
                     f"Drop id={candidate.track_id} {candidate.class_name} "
                     f"(conf {candidate.conf:.2f}): uncatchable in workspace "
                     f"(out of reach, or passes downstream before the arm arrives)"
                 )
                 continue
+            veto = skill.placement_veto(candidate, it)
+            if veto is not None:
+                vetoed_ids.add(candidate.track_id)
+                if not candidate.veto_logged:
+                    candidate.veto_logged = True
+                    self._node.get_logger().info(
+                        f"[{skill.name}-veto] id={candidate.track_id} "
+                        f"{candidate.class_name} (conf {candidate.conf:.2f}): "
+                        f"{veto} — skipped, stays tracked until the drop line"
+                    )
+                continue
             target, target_it = candidate, it
             break
 
         if target is None:
-            return None  # no catchable head in the queue this epoch
+            return None  # nothing catchable & un-vetoed in the queue this epoch
 
-        # Commit to the pick.
-        secondary = self.queue.peek_next() if self.queue.has_next() else None
-        self.queue.pop_head()
+        # Commit to the pick. The chain's pre-position candidate (secondary)
+        # skips objects vetoed THIS walk — parking at a backswing we already
+        # know we won't push would waste the chain move.
+        self.queue.remove(target)
+        secondary = next(
+            (o for o in self.queue._objects if o.track_id not in vetoed_ids),
+            None,
+        )
         # Keep the active target visible in belt_viz while we execute the cycle.
         self._active_target = target
         # DIAGNOSTIC: where the object actually is NOW (obj_y) vs the entry-edge
@@ -611,6 +637,11 @@ class GP8App:
             # diagnostic motion CSV (no-op unless GP8_MOTION_LOG_DIR is set).
             self.traj_ctrl.set_motion_op(skill.name)
             skill.execute(request)
+        else:
+            # Queue non-empty but nothing selectable (e.g. every object vetoed):
+            # without this the epoch loop would re-run the intercept solver at
+            # ~kHz until the vetoed objects reach the drop line.
+            time.sleep(self.cfg.TIME_STEP)
 
     def run(self) -> None:
         self.setup()

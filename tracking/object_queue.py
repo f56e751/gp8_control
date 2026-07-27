@@ -53,6 +53,11 @@ class TrackedObject:
     #     continues to use the conveyor encoder speed.
     y_anchors: list = field(default_factory=list)
     v_est: float | None = None
+    # Diagnostic only: a [<skill>-veto] line has been logged for this track, so
+    # selection doesn't repeat it every epoch. The veto itself is re-evaluated
+    # live each epoch (a class re-vote can re-route the object to a skill
+    # without a veto) — only the LOG is once-per-track.
+    veto_logged: bool = False
 
     def vote_class(self, cls: str, conf: float) -> str:
         """Add a confidence-weighted vote for ``cls``; return the winning class.
@@ -156,6 +161,17 @@ class TrackedObjectQueue:
         if merged:
             self._objects = kept
         return merged
+    def remove(self, obj: TrackedObject) -> None:
+        """Remove ``obj`` wherever it sits (no-op if absent).
+
+        Selection needs this now that it walks PAST veto-skipped entries: the
+        committed target / an uncatchable candidate is no longer always the
+        head, so ``pop_head`` alone can't take it out.
+        """
+        try:
+            self._objects.remove(obj)
+        except ValueError:
+            pass
 
     def update(self, now: float, conveyor_speed: float) -> None:
         """Drop anything past the pick line (drop_below_y), then sort by current Y.

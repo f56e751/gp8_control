@@ -521,11 +521,13 @@ class RobustThrowSkill(ManipulationSkill):
         # serially. Symmetric + stateless: the next epoch still SELECTS + DRIVES fresh from
         # this closer pose (no commit/preposition). None -> lifted-standby park.
         throw_T = float(lift[2][-1] + res["t_f"])  # lift + NLP 전체 궤적
-        # 이 브랜치의 next_chain_target은 다음 intercept의 grasp_joint(6,) 또는
-        # None을 반환한다 (throw_skill/push_skill과 동일 계약 — (grasp, cand)
-        # tuple을 주던 push 브랜치 인터페이스가 아님; chain_park_joint도 이
-        # 브랜치엔 없다).
-        next_grasp = ctx.next_chain_target(grasp_joint, throw_T)
+        # next_chain_target은 (grasp_joint(6,), cand) tuple 또는 None을 반환한다
+        # (push 머지로 바뀐 계약 — 예전엔 grasp_joint만 줬다). NLP 스로워는 아직
+        # chain_park_joint(다음 물체의 스킬이 지정하는 park 자세)를 쓰지 않으므로
+        # grasp만 취한다. throw_skill처럼 park까지 존중하려면 cand로
+        # ctx.skill_obj_for(cand).chain_park_joint(...)를 부르면 된다.
+        nxt = ctx.next_chain_target(grasp_joint, throw_T)
+        next_grasp = nxt[0] if nxt is not None else None
         self.build_throw_trajectory(
             grasp_joint, res, lift, next_grasp=next_grasp,
         )

@@ -192,10 +192,15 @@ def new_trajectory(s, q0, qT, w, T):
     return q, dq, ddq, dddq, t
 
 
-def pad(x: np.ndarray) -> np.ndarray:
-    """Pad array with zero column for 6th joint (from 5-DOF to 6-DOF)."""
+def pad(x: np.ndarray, fill: float = 0.0) -> np.ndarray:
+    """Pad array with a constant column for the 6th joint (5-DOF → 6-DOF).
+
+    ``fill`` is the held joint-6 value — pass the pick wrist for POSITION
+    arrays so J6 stays parked through the 5-DOF throw arc (velocity arrays
+    keep the 0.0 default: a parked joint has zero velocity).
+    """
     pad_shape = list(x.shape[:-1]) + [1]
-    return np.concatenate((x, np.zeros(pad_shape)), axis=-1)
+    return np.concatenate((x, np.full(pad_shape, float(fill))), axis=-1)
 
 
 def decimate_for_queue(

@@ -15,3 +15,6 @@ log/
 
 .vscode/
 .idea/
+
+# local, throwaway analysis scripts (not part of the shipped test suite)
+tests/analyze_push_tracking.py

@@ -137,6 +137,18 @@ class Config:
     TRACK_LEAD_T: float = field(        # [s] env GP8_TRACK_LEAD_T
         default_factory=lambda: float(os.environ.get("GP8_TRACK_LEAD_T", "0.3"))
     )
+    GRASP_Z: float = 0.062
+    # Baseline wrist (joint 6, rad) for EVERY pick/aim/park pose. The suction
+    # cup is axially symmetric, and the throw NN drives joints 1-5 only, so J6
+    # is a FREE DOF for pick/throw — but it is NOT free for push, whose paddle
+    # must face the push heading. Historically this baseline was 0 (neutral),
+    # which made every push cycle swing J6 ~-30..-97 deg to the push-facing
+    # wrist and back. Set to the MEAN push wait-pose J6 over the belt for the
+    # metal-bin geometry (IK sweep 2026-07-06: -30..-97 deg, mean -65 deg), so
+    # the paddle parks roughly facing the push direction and both push->push
+    # and throw->push transitions rotate J6 by <=~33 deg instead of ~90.
+    # Recompute if the push bins move (see PUSH_BIN_TARGET_MAP).
+    PICK_WRIST_J6: float = np.radians(-65.0)
     # CAP on how early suction primes, now that priming is POSITION-triggered
     # (position_and_prime fires at max(cup-parked, arrival - SUCTION_LEAD)). The cup
     # is always parked at the grasp before suction fires; this only bounds how far

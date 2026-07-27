@@ -9,6 +9,17 @@ and mock requires no client-side changes:
   - /write_single_io service (suction on/off)
   - /robot_enable service (robot enable trigger)
 
+It ALSO speaks the adv4ncr ros2_control stream contract used by the
+current TrajectoryController (branch fix/pushing and later):
+
+  - /JointGroupPositionController/commands (Float64MultiArray) subscriber —
+    each 250 Hz sample is echoed into the joint state (ideal servo);
+  - joint states are published on /joint_states as well as
+    /joint_states_urdf (the stream controller reads /joint_states).
+
+So the same mock serves both the MotoROS2 point-queue stack and the
+adv4ncr 250 Hz stream stack, with no client-side changes.
+
 Usage:
   ros2 run gp8_control mock_robot
 """
@@ -36,6 +47,7 @@ from motoros2_interfaces.srv import (
     WriteSingleIO,
 )
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 
 
@@ -73,7 +85,24 @@ class MockRobot(Node):
         self._js_pub = self.create_publisher(
             JointState, "/joint_states_urdf", qos_profile_sensor_data,
         )
+        # Publisher: /joint_states — the adv4ncr stream TrajectoryController
+        # reads THIS topic (joint_state_broadcaster name), not the bridge's
+        # /joint_states_urdf. Same message goes to both.
+        self._js_pub_raw = self.create_publisher(
+            JointState, "/joint_states", qos_profile_sensor_data,
+        )
         self._js_timer = self.create_timer(0.02, self._publish_joint_states)  # 50 Hz
+
+        # Subscriber: /JointGroupPositionController/commands — the adv4ncr
+        # 250 Hz stream backend publishes one Float64MultiArray of joint
+        # positions per 4 ms tick. Echo each sample into the joint state
+        # (ideal, lag-free servo): enough to validate geometry/IK/timing in
+        # RViz; real tracking limits need hardware or the MuJoCo physics twin.
+        self.create_subscription(
+            Float64MultiArray, "/JointGroupPositionController/commands",
+            self._jgpc_command_cb, qos_profile_sensor_data,
+            callback_group=cb_group,
+        )
 
         # Action server: /motoman_gp8_controller/follow_joint_trajectory (matches bridge)
         self._fjt_server = ActionServer(
@@ -123,11 +152,16 @@ class MockRobot(Node):
         # Play queued points back in real time (100 Hz).
         self._q_timer = self.create_timer(0.01, self._drive_queue)
 
+        # Last stream command time, for the finite-diff velocity estimate.
+        self._last_cmd_t: float | None = None
+        self._last_cmd_pos: list | None = None
+
         self.get_logger().info(
-            "Mock robot ready: /joint_states_urdf, "
+            "Mock robot ready: /joint_states_urdf + /joint_states, "
             "/motoman_gp8_controller/follow_joint_trajectory, "
             "/write_single_io, /robot_enable, point-queue mode "
-            "(/start_point_queue_mode, /motoman_gp8_controller/queue_traj_point, ...)"
+            "(/start_point_queue_mode, /motoman_gp8_controller/queue_traj_point, ...), "
+            "adv4ncr stream (/JointGroupPositionController/commands)"
         )
 
     # ------------------------------------------------------------------
@@ -143,6 +177,44 @@ class MockRobot(Node):
             msg.velocity = list(self._joint_velocities)
         msg.effort = [0.0] * 6
         self._js_pub.publish(msg)
+        self._js_pub_raw.publish(msg)
+
+    # ------------------------------------------------------------------
+    # adv4ncr 250 Hz stream (JointGroupPositionController commands)
+    # ------------------------------------------------------------------
+
+    def _jgpc_command_cb(self, msg: Float64MultiArray) -> None:
+        """Echo a streamed position sample into the joint state (ideal servo).
+
+        Velocity is estimated by finite difference between consecutive samples
+        so downstream consumers (and the MuJoCo twin's release fling, which
+        reads ``_cmd_joint_vel``) see the commanded speed, not zeros.
+        """
+        pos = list(msg.data)
+        if len(pos) != len(JOINT_NAMES):
+            return
+        now = time.monotonic()
+        vel = [0.0] * len(pos)
+        if self._last_cmd_pos is not None and self._last_cmd_t is not None:
+            dt = now - self._last_cmd_t
+            # Consecutive stream ticks are ~4 ms; a big gap means a NEW motion
+            # started after an idle stretch — velocity 0 for that first sample.
+            if 1e-4 < dt < 0.1:
+                vel = [(p - q) / dt for p, q in zip(pos, self._last_cmd_pos)]
+        self._last_cmd_t = now
+        self._last_cmd_pos = pos
+        with self._lock:
+            self._joint_positions = pos
+            self._joint_velocities = vel
+        # MuJoCo physics twin (subclass) flings the thrown box at the
+        # commanded joint velocity; keep it fed on the stream path too.
+        if hasattr(self, "_cmd_joint_vel"):
+            self._cmd_joint_vel = vel
+        # Publish immediately (event-driven ~250 Hz) so stream consumers see
+        # the echo with only transport latency — the 50 Hz timer alone would
+        # add up to 20 ms of staleness, which reads as a large fake tracking
+        # error at high joint speeds (real HW publishes at the controller rate).
+        self._publish_joint_states()
 
     # ------------------------------------------------------------------
     # FollowJointTrajectory action

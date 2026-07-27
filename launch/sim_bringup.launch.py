@@ -84,12 +84,16 @@ def generate_launch_description():
     # ---- launch args --------------------------------------------------
     belt_speed = LaunchConfiguration("belt_speed")
     spawn_interval = LaunchConfiguration("spawn_interval")
+    lane_x = LaunchConfiguration("lane_x")
     use_rviz = LaunchConfiguration("rviz")
     args = [
         DeclareLaunchArgument("belt_speed", default_value="0.12",
                               description="Belt speed (m/s)"),
         DeclareLaunchArgument("spawn_interval", default_value="5.0",
                               description="Seconds between spawned objects"),
+        DeclareLaunchArgument("lane_x", default_value="0.45",
+                              description="Belt lane X (m); low values "
+                                          "exercise the near-base push veto"),
         DeclareLaunchArgument("rviz", default_value="true",
                               description="Launch RViz"),
     ]
@@ -124,7 +128,8 @@ def generate_launch_description():
     )
     fake_belt = Node(
         package="gp8_control", executable="fake_belt", name="fake_belt",
-        parameters=[{"belt_speed": belt_speed, "spawn_interval": spawn_interval}],
+        parameters=[{"belt_speed": belt_speed, "spawn_interval": spawn_interval,
+                     "lane_x": lane_x}],
         output="screen",
     )
 

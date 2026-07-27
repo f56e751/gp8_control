@@ -102,8 +102,8 @@ class SkillContext:
     # Lets the chain pre-position the NEXT object with the skill that will run it.
     skill_for: Callable[["TrackedObject"], str]
     # The SKILL OBJECT (not just its name) that will handle a given object. Lets the
-    # intercept solver query that skill's t_to_contact() timeline — push and throw
-    # have different setup/positioning/contact costs, so the grasp must be placed
+    # intercept solver query that skill's intercept_time_budget() timeline — push and
+    # throw have different positioning/contact costs, so the grasp must be placed
     # using the skill that will actually run. Wired in GP8App._build_skills.
     skill_obj_for: Callable[["TrackedObject"], "ManipulationSkill"]
     # Default standby pose (6-DOF joint vector, wrist/j6 = 0) the post-action
@@ -201,7 +201,7 @@ class SkillContext:
         v: float,
         now: float,
         pre_delay: float = 0.0,
-        t_to_contact_fn: "Optional[Callable[[float], float]]" = None,
+        skill: "Optional[ManipulationSkill]" = None,
     ) -> "Optional[Intercept]":
         """Earliest belt-Y at which the arm can grab ``target``, or ``None`` if it
         can't be caught anywhere in the workspace before passing downstream.
@@ -266,20 +266,25 @@ class SkillContext:
             aj = self.robot.inverse_kinematics(T_aim)
             if gj is None or aj is None:
                 return None
-            gj = np.asarray(gj, dtype=float); gj[-1] = 0.0
-            aj = np.asarray(aj, dtype=float); aj[-1] = 0.0
+            # Wrist baseline: J6 is a free DOF for pick/throw (symmetric cup,
+            # 5-DOF throw NN), so park it where PUSH will want it — the
+            # push-facing mean (cfg.PICK_WRIST_J6, was 0) — to kill the
+            # ~90 deg J6 round-trips between cycles.
+            gj = np.asarray(gj, dtype=float); gj[-1] = cfg.PICK_WRIST_J6
+            aj = np.asarray(aj, dtype=float); aj[-1] = cfg.PICK_WRIST_J6
             move_time = (
                 opt_time(current_joint, zero, aj, zero, self.M1, self.M2)
                 + opt_time(aj, zero, gj, zero, self.M1, self.M2)
             )
             # Where the object will be once the arm reaches CONTACT (after pre_delay).
-            # The contact budget is the skill's real timeline (t_to_contact_fn:
-            # setup + positioning + contact offset) when supplied, else the legacy
-            # opt_time*factor proxy. This is the placement+feasibility fix: the old
-            # proxy omitted the dispatch + push pre-travel, so the grasp was aimed
-            # upstream of where the object actually was at strike.
+            # The contact budget comes from the skill that will RUN this object,
+            # queried with the candidate's concrete geometry (intercept_time_budget:
+            # push prices its real backswing route + run-up; throw's base default
+            # keeps the legacy opt_time*factor proxy). No skill → legacy proxy.
             budget = (
-                t_to_contact_fn(move_time) if t_to_contact_fn is not None
+                skill.intercept_time_budget(
+                    target, current_joint, T_aim, T_grasp, aj, gj, move_time,
+                ) if skill is not None
                 else move_time * factor
             )
             obj_y_arrival = obj_y - v_obj * (pre_delay + budget)
@@ -562,7 +567,7 @@ class SkillContext:
             self.log.warn("lifted-standby IK failed; parking at home/idle pose")
             return self.idle_joint
         q = np.asarray(q, dtype=float)
-        q[-1] = 0.0
+        q[-1] = self.cfg.PICK_WRIST_J6   # shared wrist baseline (see config)
         return q
 
     def next_chain_target(self, from_joint: np.ndarray, action_time: float):
@@ -571,24 +576,38 @@ class SkillContext:
         throughput the plain-standby park lost). Reuses ``earliest_reachable_intercept``
         with ``pre_delay=action_time`` (the arm frees up only after this action) — its
         fixed-point loop resolves the move-time <-> object-position circularity. Returns
-        the first feasible object's grasp joints (wrist=0), or ``None`` (no next / none
-        catchable) so the caller parks at lifted_standby. Works for ANY next skill
+        ``(grasp_joint, candidate)`` for the first feasible object (wrist at
+        cfg.PICK_WRIST_J6), or ``None`` (no next / none catchable) so the caller parks at
+        lifted_standby. The candidate lets the caller pick a chain WRIST for the next
+        object's skill (push keeps its push-facing wrist). Works for ANY next skill
         (symmetric). NO commitment: the next epoch still SELECTS + DRIVES fresh from this
-        closer pose, so the handoff stays stateless (no committed/prepositioned/skip_move)."""
+        closer pose, so the handoff stays stateless (no committed/prepositioned/skip_move).
+        Candidates the skill's ``placement_veto`` refuses are skipped, mirroring the
+        selection walk — the chain never parks at a backswing that won't be swung."""
         now = time.time()
         v = self.conveyor.current if self.conveyor is not None else 0.0
         # No queue.update() here — earliest_reachable_intercept computes each object's
         # position from object_y_now itself, and mutating the queue mid-chain (pruning)
         # is a side effect the next epoch's own update should own.
         for cand in list(self.queue._objects):
+            skill = self.skill_obj_for(cand)
             it = self.earliest_reachable_intercept(
                 cand, from_joint, v, now, pre_delay=action_time,
-                t_to_contact_fn=self.skill_obj_for(cand).t_to_contact,
+                skill=skill,
             )
-            if it is not None:
-                self.log.info(
-                    f"Chain toward next: id={cand.track_id} {cand.class_name} @ "
-                    f"y={it.intercept_y:+.3f} (arrival {it.eta:.2f}s, pre_delay {action_time:.2f}s)"
-                )
-                return it.grasp_joint
+            if it is None:
+                continue
+            # Same gate the selection walk applies (placement_veto): don't
+            # pre-position the chain at a backswing selection is already known
+            # to refuse — without this the arm parks at a soon-to-be-vetoed
+            # near-base metal and waits there without ever swinging. Silent
+            # skip: selection owns the once-per-track [<skill>-veto] log line,
+            # and the veto stays re-evaluated (class re-votes can un-veto).
+            if skill.placement_veto(cand, it) is not None:
+                continue
+            self.log.info(
+                f"Chain toward next: id={cand.track_id} {cand.class_name} @ "
+                f"y={it.intercept_y:+.3f} (arrival {it.eta:.2f}s, pre_delay {action_time:.2f}s)"
+            )
+            return it.grasp_joint, cand
         return None
