@@ -173,7 +173,8 @@ def _precompute_cycles(ctx, skill, robot, cfg, points, targets, idle_joint,
         res, lift = planned
         print(f"  [{i + 1}] ({x:+.3f}, {y:+.3f}, {z:+.3f}) → "
               f"({p_target[0]:+.2f}, {p_target[1]:+.2f}, {p_target[2]:+.2f})  "
-              f"plan {time.time() - t0:.1f}s  t_f={res['t_f']:.3f}s  J={res['J']:.3f}")
+              f"plan {time.time() - t0:.1f}s  throw 궤적 {res['t_f']:.3f}s (grasp 제외)  "
+              f"J={res['J']:.3f}")
         viable.append(dict(no=i + 1, point=(x, y, z), target=p_target,
                            q_grasp=q_grasp, q_hover=q_hover, q_press=q_press,
                            res=res, lift=lift))
@@ -410,8 +411,8 @@ def main() -> None:
                 nxt = nq
             skill.build_throw_trajectory(q_press, res, lift, next_grasp=nxt)
             ok += 1
-            print(f"    OK: plan {time.time() - t0:.1f}s, t_f={res['t_f']:.3f}s, "
-                  f"J={res['J']:.3f}")
+            print(f"    OK: plan {time.time() - t0:.1f}s, throw 궤적 {res['t_f']:.3f}s "
+                  f"(grasp 제외), J={res['J']:.3f}")
         n_throw = sum(1 for d in traj_ctrl.dispatches if d["kind"] == "throw")
         print(f"\n계획 성공 {ok}/{len(points)}, throw dispatch {n_throw}건 (로봇 무명령)")
         return
@@ -531,7 +532,8 @@ def main() -> None:
                     continue
 
             th = c["throw"]
-            print(f"→ THROW (t_f={c['res']['t_f']:.3f}s, J={c['res']['J']:.3f}, "
+            print(f"→ THROW: throw 궤적 {c['res']['t_f']:.3f}s (grasp 제외), "
+                  f"J={c['res']['J']:.3f}, "
                   f"release idx {th['release_index']}/{th['traj'].shape[1] - 1})")
             traj_ctrl.send_trajectory_queue_with_timed_release(
                 th["traj"], th["vel"], th["ts"],

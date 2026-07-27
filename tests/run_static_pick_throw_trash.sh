@@ -24,19 +24,19 @@ set -eo pipefail   # -u는 ROS setup.bash가 미정의 변수를 참조해서 �
 #   "x,y"로 z를 생략하면 Config.GRASP_Z.
 # ============================================================================
 POINTS=(
-    "0.40,0.30,0.04"
+    # "0.40,0.30,0.04"
     "0.40,0.20,0.04"
-    "0.40,0.10,0.04"
-    "0.40,0.0,0.04"
-    "0.40,-0.10,0.04"
-    "0.40,-0.20,0.04"
+    # "0.40,0.10,0.04"
+    "0.40,0.02,0.04"
+    # "0.40,-0.10,0.04"
+    "0.40,-0.21,0.04"
     
     # "0.50,0.30,0.04"
-    # "0.50,0.20,0.04"
+    "0.50,0.20,0.04"
     # "0.50,0.10,0.04"
-    # "0.50,0.0,0.04"
+    "0.50,0.0,0.04"
     # "0.50,-0.10,0.04"
-    # "0.50,-0.20,0.04"
+    "0.50,-0.20,0.04"
 )
 
 # ============================================================================
@@ -44,27 +44,19 @@ POINTS=(
 # 여러 개면 지점 수와 같아야 하고 순서대로 1:1 매칭된다.
 # ============================================================================
 TARGETS=(
-    "1.20,0.225,0.02"
-    "1.20,0.075,0.02"
-    # "1.20,-0.075,0.02"
-    # "1.20,-0.225,0.02"
-
-    # "1.441,0.225,0.085"
-    # "1.441,0.075,0.085"
-    "1.441,-0.075,0.085"
-    "1.441,-0.225,0.085"
-
-    "1.683,0.225,0.15"
-    "1.683,0.075,0.15"
-    # "1.683,-0.075,0.15"
-    # "1.683,-0.225,0.15"
+    "1.09, 0.16, -0.11"
+    "1.09, 0.16, -0.11"
+    "1.09, -0.16, -0.11"
+    "1.09, -0.16, -0.11"
+    "1.40, 0.0, -0.11"
+    "1.40, 0.0, -0.11"
 )
 
 # 항상 붙는 추가 옵션 (예: "--vel-scale" "0.3", 셔플 재현은 "--seed" "42", "--shuffle-points" )
 # --shuffle-points: 지점 방문 순서를 무작위로 섞음. TARGETS 순서는 고정이라
 # "i번째 던지기 → TARGETS[i]"는 그대로, 어느 지점을 i번째로 집는지만 랜덤.
-# "--no-confirm" 
-EXTRA_ARGS=("--confirm-throw" "--vel-scale" "0.2" "--shuffle-points")
+# "--no-confirm" "--confirm-throw"
+EXTRA_ARGS=("--confirm-throw" "--vel-scale" "0.2")
 
 # driver 스택: 1 = 스크립트 종료 후에도 유지(재실행 빠름), 0 = 종료 시 함께 정리
 KEEP_DRIVER=1
@@ -75,6 +67,18 @@ PKG_DIR="$WS/src/gp8_control"
 VENV_PY="$PKG_DIR/.venv/bin/python"
 DRIVER_LOG="/tmp/gp8_driver_bringup.log"
 JTC_ACTION="/joint_trajectory_controller/follow_joint_trajectory"
+
+# ── 6쌍(저bin, 4cm/grip40mm) warm DB 연결 ──────────────────────────────────
+# 이 테스트를 skills/warm_db_6pairs_x109_140.pkl (target x=1.09/1.40, GRIP_OFF 4cm 로 빌드) 로 돌린다.
+#   • GP8_GRIP_OFF=0.04 → 플래너 GRIP_OFF/launch_state 발사점이 4cm 가 되어
+#     FLIGHT_MODEL 이 grip40mm 이 됨 → 6쌍 DB 의 formulation 해시와 매칭
+#     (안 맞으면 로더가 entry 를 전부 무시하고 cold 로 재풀이 → 3~14s/쌍).
+#   • GP8_THROW_WARM_DB → warm DB 파일을 6쌍 DB 로 지정.
+# 둘 다 이 스크립트 실행에만 export (기본값 2cm + warm_db.pkl 은 앱/다른 실행 그대로).
+# 연결 해제하려면 아래 두 줄을 주석 처리(그러면 기본 2cm + warm_db.pkl).
+WARM_DB_6PAIRS="$PKG_DIR/skills/warm_db_6pairs_x109_140.pkl"
+export GP8_GRIP_OFF="${GP8_GRIP_OFF:-0.04}"
+export GP8_THROW_WARM_DB="${GP8_THROW_WARM_DB:-$WARM_DB_6PAIRS}"
 
 join_semi() { local IFS=";"; echo "$*"; }   # 배열 → "a;b;c"
 
@@ -151,7 +155,10 @@ echo "target: $TARGET_ARG"
 [ "$#" -gt 0 ] && echo "cli   : $*"
 
 echo "=== [4/4] run static_pick_throw ==="
+echo "warm DB : $GP8_THROW_WARM_DB (GP8_GRIP_OFF=$GP8_GRIP_OFF → grip$(awk "BEGIN{printf \"%.0f\", $GP8_GRIP_OFF*1000}")mm)"
+[ -f "$GP8_THROW_WARM_DB" ] || echo "  경고: warm DB 파일 없음 — cold 로 진행됨" >&2
 # 배열값 먼저 + CLI 뒤 — argparse는 같은 옵션 중복 시 마지막 것을 쓰므로
 # CLI --points/--target이 배열값을 덮어쓰고, 플래그는 그대로 추가된다.
+# GP8_GRIP_OFF / GP8_THROW_WARM_DB 는 위에서 export 됨 (6쌍 DB 연결).
 env PYTHONPATH="$WS/src:${PYTHONPATH:-}" \
     "$VENV_PY" -m gp8_control.tests.static_pick_throw "${ARGS[@]}"

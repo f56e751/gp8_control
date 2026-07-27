@@ -12,6 +12,8 @@ GP8 kinematics + ballistics 코어 라이브러리.
  2026-07-15 throw_nlp 통합 때 제거. 세션 백업: scratchpad THR_deleted_backup/)
 """
 
+import os
+
 import numpy as np
 
 G = 9.81
@@ -97,7 +99,10 @@ def ik_position(p_des, q_seed, iters=300, tol=1e-10):
     return q, np.linalg.norm(p_des - fk_pos(q)) < 1e-8
 
 
-def launch_state(q, qd, off=0.02):
+_LAUNCH_OFF = float(os.environ.get("GP8_GRIP_OFF", "0.02"))   # throw_nlp.GRIP_OFF 와 동일 env 로 동기
+
+
+def launch_state(q, qd, off=_LAUNCH_OFF):
     """발사점 상태 (p_eff, v_eff): TCP에서 그리퍼 로드 축(흡착면 법선)으로
     off[m] 연장한 점 — 흡착된 물체 CoM 근사 (2026-07-22 사용자 스펙 2cm).
     v_eff는 그 점의 강체 속도 (ω×r 포함) — revolute Jacobian을 p_eff 기준으로."""

@@ -128,8 +128,8 @@ COL_H = 0.55
 # c=0이면 RK4가 등가속도를 '정확히' 적분하므로 (2차 다항) 기존 포물선과 일치.
 # 목적은 항력 최소화가 아니라 '보상' — 항력 포함 착지점이 target과 일치하는 궤적.
 N_FLIGHT = 8
-GRIP_OFF = 0.02   # 발사점 = TCP + 로드 축 방향 2cm (흡착 물체 CoM 근사 —
-#   2026-07-24 사용자: 1cm→2cm. 판정이 CoM 기준이라 TCP 조준 시 ω×r 오버슛 bias가
+GRIP_OFF = float(os.environ.get("GP8_GRIP_OFF", "0.02"))   # 발사점 = TCP + 로드 축 (기본 2cm; GP8_GRIP_OFF 로 오버라이드 — 예 4cm(grip40mm) DB 테스트 시 0.04. 흡착 물체 CoM 근사 —
+#   활성값 2cm (grip40 144 추가 DB 는 warm_db_grip40_144.pkl 로 별도 빌드 중). 판정이 CoM 기준이라 TCP 조준 시 ω×r 오버슛 bias가
 #   생기는 문제의 계획단 보정: p_eff를 심볼릭으로 만들고 v=jtimes(p_eff)라
 #   그 점의 강체 속도(ω×r 포함)가 자동으로 비행 초기조건이 됨. throwing.launch_state
 #   의 기본 off 도 같이 맞춰야 게이트가 NLP 와 같은 발사점을 본다.)

@@ -75,8 +75,8 @@ _PLANNER_SIGN = np.array([1.0, 1.0, -1.0, -1.0, -1.0, -1.0])
 # by the manifold planner itself (v0 points from the object's throw-start
 # position to the bin), so no per-object theta is needed for the trajectory —
 # theta below is only used by the legacy plan_throw_landing fallback.
-THROW_BIN_X: float = 1.1
-THROW_BIN_Y: float = -0.25
+# THROW_BIN_X: float = 1.1
+# THROW_BIN_Y: float = -0.25
 
 # Per-class throw bin TARGET (absolute base-frame XYZ, m). When a target's
 # class is in this map, the landing point is OVERRIDDEN with these coordinates
@@ -85,8 +85,8 @@ THROW_BIN_Y: float = -0.25
 # (perception_client.py — "plastic"이라는 클래스는 없음). 좌표는 운영자 제공
 # 실측(2026-07-20), z=0 = 바닥 높이 bin.
 THROW_BIN_TARGET_MAP: dict[str, tuple] = {
-    "metal": (1.5, 0.3, 0.0),
-    "transparent": (1.2, -0.2, 0.0),
+    "metal": (0.9, 0.16, -0.11),
+    "transparent": (0.9, -0.16, -0.11),
 }
 
 # 던지기 시작 TCP = grasp 위치 + 이만큼 lift (벨트/주변 clearance 확보).
@@ -131,12 +131,16 @@ LANDING_GATE: float = 0.03
 # 2026-07-23. 던지기 궤적의 TCP가 이 밖으로 나가면 **실행하지 않고 에러로 보고**한다.
 #   x ≤ MIN_TCP_X : 기둥/베이스 쪽으로 파고듦
 #   z ≤ MIN_TCP_Z : 바닥/벨트 충돌
+#   z ≥ MAX_TCP_Z : 팔을 너무 높이 듦 (2026-07-27 사용자 — DB 빌더 게이트와 동일 0.85)
 # 이 게이트가 유일한 방어선인 이유: throw_nlp의 기둥 회피는 release 창 끝까지만
 # 활성이고(감속 꼬리 전 구간에 걸면 무충돌 basin까지 잘려 multistart가 전멸),
 # TCP 바닥 클리어런스는 아예 hard 제약이 아니다("hard로 걸면 0/148 전멸" —
 # throw_nlp.py 제약 3b 주석). 즉 감속 꼬리가 지하로 다이브하는 해가 정상 수렴한다.
+# MAX_TCP_Z 는 tools/build_warm_db._gates 와 동일 기준으로, 스윙 아크가 이보다
+# 높이 올라가는 해를 후보·dispatch 양쪽에서 거른다 (빌더와 런타임 정합).
 MIN_TCP_X: float = 0.20
 MIN_TCP_Z: float = 0.04
+MAX_TCP_Z: float = 0.85
 
 # cold multistart 초기해 변형 (lift 높이 시작 z≈0.7 기준). IPOPT는 local
 # solver라 한 초기해의 basin이 infeasible하면 실패만 반환 → 순차 재시도.
@@ -151,7 +155,8 @@ INIT_VARIANTS_ROS = (
 
 # offline warm DB (선택): THR 루트의 warm_db.pkl — 있으면 최근접 entry로
 # full warm start polish (~1-2s). 공식화 파라미터가 다르면 자동 무시.
-THROW_WARM_DB: str = str(Path(_THR_DIR) / "warm_db.pkl")
+THROW_WARM_DB: str = os.environ.get(
+    "GP8_THROW_WARM_DB", str(Path(_THR_DIR) / "warm_db.pkl"))
 
 _WARM_DB_CACHE: "Optional[list]" = None   # 파일 DB 로드 캐시 (None=미로드)
 
@@ -755,10 +760,12 @@ class RobustThrowSkill(ManipulationSkill):
         #    fk_pos는 플래너 규약 FK (로봇 FK와 0.000mm 일치 검증됨).
         P_arc = np.array([fk_pos(q_of(t))
                           for t in np.linspace(0.0, res["t_f"], 300)])
-        x_min, z_min = float(P_arc[:, 0].min()), float(P_arc[:, 2].min())
-        if x_min <= MIN_TCP_X or z_min <= MIN_TCP_Z:
+        x_min, z_min, z_max = (float(P_arc[:, 0].min()), float(P_arc[:, 2].min()),
+                               float(P_arc[:, 2].max()))
+        if x_min <= MIN_TCP_X or z_min <= MIN_TCP_Z or z_max > MAX_TCP_Z:
             return (f"Cartesian 엔벨로프 위반 (x_min={x_min:+.3f}m, "
-                    f"z_min={z_min:+.3f}m; 한계 x>{MIN_TCP_X:.2f}, z>{MIN_TCP_Z:.2f})")
+                    f"z_min={z_min:+.3f}m, z_max={z_max:+.3f}m; "
+                    f"한계 x>{MIN_TCP_X:.2f}, {MIN_TCP_Z:.2f}<z<{MAX_TCP_Z:.2f})")
         return None
 
     # ------------------------------------------------------------------
@@ -869,7 +876,8 @@ class RobustThrowSkill(ManipulationSkill):
             return
 
         # SAFETY GATE 2 (Cartesian, 로봇 규약 FK): TCP가 기둥/베이스(x ≤ MIN_TCP_X)나
-        # 바닥/벨트(z ≤ MIN_TCP_Z)로 들어가면 디스패치하지 않는다.
+        # 바닥/벨트(z ≤ MIN_TCP_Z)로 들어가거나 너무 높이(z > MAX_TCP_Z) 뜨면
+        # 디스패치하지 않는다.
         # z는 픽 자세(프레스 TCP z=PRESS_Z, 0.04보다 낮음)에서 출발하므로, lift가
         # 처음 MIN_TCP_Z를 넘어선 '이후' 구간에만 적용한다 — 출발점 자체는 위반이
         # 아니고, 한 번 벗어난 뒤 다시 내려오는 것(=꼬리 다이브)만 잡는다.
@@ -892,9 +900,15 @@ class RobustThrowSkill(ManipulationSkill):
         if near.size:
             k = int(near[0])
             bad.append((k, f"TCP x={tcp[0, k]:+.4f}m ≤ {MIN_TCP_X:.3f}m (기둥/베이스)"))
+        # z 상한(팔 과다 상승)은 전 구간 적용 — 출발/lift 어디서도 0.85 위로 갈 이유 없다.
+        high = np.nonzero(tcp[2] > MAX_TCP_Z)[0]
+        if high.size:
+            k = int(high[0])
+            bad.append((k, f"TCP z={tcp[2, k]:+.4f}m > {MAX_TCP_Z:.3f}m (팔 과다 상승)"))
         if bad:
             k, why = min(bad)                      # 가장 이른 위반 지점
-            n_viol = int(np.count_nonzero((tcp[0] <= MIN_TCP_X) | (tcp[2] <= MIN_TCP_Z)))
+            n_viol = int(np.count_nonzero(
+                (tcp[0] <= MIN_TCP_X) | (tcp[2] <= MIN_TCP_Z) | (tcp[2] > MAX_TCP_Z)))
             T_bad = np.asarray(ctx.robot.forward_kinematics(traj_throw[:, k]),
                                dtype=float)
             seg = ("lift" if k < l_traj.shape[1]
