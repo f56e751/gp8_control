@@ -122,8 +122,22 @@ class SkillContext:
     # Shared motion / timing primitives
     # ------------------------------------------------------------------
     def object_y_now(self, target: "TrackedObject", now: float, v: float) -> float:
-        """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases)."""
-        return target.T_grasp_base[1, 3] - v * (now - target.detect_time)
+        """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases).
+
+        Use the conveyor encoder speed consistently for dead reckoning, intercept
+        planning, and arrival waits.  A per-object fitted speed was introduced to
+        compensate for encoder scale error / objects drifting on the belt, but the
+        HW logs measured transparent objects at the acceptance-floor (~25% slower)
+        and accumulated 40--50 cm of false position error after camera visibility
+        ended.  Keep the old selection below as a commented record of that intent.
+        """
+        # Previous intent: why use this object's camera-fitted speed instead of the
+        # encoder?  It was meant to follow rolling/slipping objects independently.
+        # v_obj = target.v_est if getattr(target, "v_est", None) is not None else v
+        # Current policy: one belt speed for the complete timing chain, matching the
+        # last committed behaviour and avoiding mixed v_est/belt ETA calculations.
+        v_obj = v
+        return target.T_grasp_base[1, 3] - v_obj * (now - target.detect_time)
 
     def log_action_timing(self, target: "TrackedObject", intercept_y: float, tag: str) -> None:
         """DIAGNOSTIC: object position vs the intercept at the instant the action fires.
@@ -214,6 +228,14 @@ class SkillContext:
         """
         cfg = self.cfg
         x = float(target.T_grasp_base[0, 3])
+        # Previous intent: use a camera-fitted per-object speed for position,
+        # projected contact, and ETA so a rolling/slipping object can differ from
+        # the conveyor.  HW logs showed that estimate causing large stale-track
+        # errors, so retain the original line only as documentation.
+        # v_obj = target.v_est if getattr(target, "v_est", None) is not None else v
+        # Current policy: use the conveyor speed consistently, as object_y_now()
+        # and position_and_prime() do.
+        v_obj = v
         obj_y = self.object_y_now(target, now, v)
         denom = cfg.MAX_REACH ** 2 - x ** 2
         if denom <= 0.0:
@@ -260,7 +282,7 @@ class SkillContext:
                 t_to_contact_fn(move_time) if t_to_contact_fn is not None
                 else move_time * factor
             )
-            obj_y_arrival = obj_y - v * (pre_delay + budget)
+            obj_y_arrival = obj_y - v_obj * (pre_delay + budget)
             if obj_y_arrival < -y_b:
                 return None                      # exits downstream before the arm arrives
             target_y = min(obj_y_arrival, y_b)   # wait at the entry edge if still upstream
@@ -268,7 +290,7 @@ class SkillContext:
                 break
             y_guess = (1.0 - _INTERCEPT_RELAX) * y_eval + _INTERCEPT_RELAX * target_y
 
-        eta = (obj_y - y_eval) / (v + 1e-6)
+        eta = (obj_y - y_eval) / (v_obj + 1e-6)
         return Intercept(
             intercept_y=y_eval,
             T_aim=T_aim.copy(),
@@ -433,6 +455,7 @@ class SkillContext:
         target: "TrackedObject",
         intercept_y: float,
         start_lead: "Optional[float]" = None,
+        prime_suction: bool = True,
     ) -> bool:
         """Drive to the grasp pose, then POSITION-PRIME suction: fire it only once
         the cup is PARKED at the grasp, capped at SUCTION_LEAD before arrival.
@@ -451,6 +474,12 @@ class SkillContext:
         The adv4ncr 250 Hz stream (<10 ms command->motion) makes "fire when parked"
         land within a stream tick of the grasp. Returns once the object has reached
         the intercept (caller then lifts/throws).
+
+        ``prime_suction=False`` skips the suction entirely (still parks + waits +
+        returns at ``arrival - start_lead``). TRACK_DESCEND passes this because its
+        wait pose is a HOVER above the object: priming at the hover would run the
+        vacuum in air for ~SUCTION_LEAD before the descend starts (a stationary
+        suction-on gap). That caller fires suction as the descend begins instead.
         """
         now = time.time()
         v = self.conveyor.current
@@ -493,13 +522,18 @@ class SkillContext:
         #    never before the cup is down (now = just parked), never more than
         #    SUCTION_LEAD early. Backed-up object -> ~now; slack pick -> waits until
         #    SUCTION_LEAD before arrival.
+        #    prime_suction=False (TRACK_DESCEND): the wait pose is a HOVER above the
+        #    object, not the grasp, so priming here would run the vacuum in air for
+        #    ~SUCTION_LEAD before the descend even starts (the stationary suction-on
+        #    gap). That caller instead fires suction AS the descend begins.
         self.set_status("WAITING", getattr(target, "class_name", ""))
-        t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
-        self.sleep_until(t_suction)
-        self.traj_ctrl.suction_on()
-        # DIAGNOSTIC: object's calculated position vs the EE's actual position at
-        # the instant suction fired (see log_suction_on).
-        self.log_suction_on(target)
+        if prime_suction:
+            t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
+            self.sleep_until(t_suction)
+            self.traj_ctrl.suction_on()
+            # DIAGNOSTIC: object's calculated position vs the EE's actual position at
+            # the instant suction fired (see log_suction_on).
+            self.log_suction_on(target)
 
         # 3) End the wait `start_lead` s before predicted arrival so the post-wait
         #    trajectory dispatch overlaps the object's final approach and the lift

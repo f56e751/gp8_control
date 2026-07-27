@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -34,22 +35,38 @@ THROW_BIN_TARGET_MAP: dict[str, tuple] = {}
 
 
 class PickWaitMode(Enum):
-    """How the arm waits at the ambush intercept before suction fires.
+    """How the arm meets the object at the ambush intercept.
 
     Extension point: map object classes to a wait mode in ``PICK_WAIT_MODE``
-    so e.g. fragile classes can hover-and-descend while flat ones park at
-    grasp height. Only WAIT_AT_GRASP is implemented today; HOVER_DESCEND
-    falls back to it with a warning until added.
+    so e.g. fragile classes can track-and-descend while flat ones park at
+    grasp height.
     """
 
     WAIT_AT_GRASP = "wait_at_grasp"   # cup parked at grasp height; suction on arrival
-    HOVER_DESCEND = "hover_descend"   # park above, descend + suction on arrival (TODO)
+    TRACK_DESCEND = "track_descend"   # park high, then follow the object at belt
+                                      # speed while descending onto it
 
 
 # Per-class wait mode (class_name -> PickWaitMode). Classes not listed use
 # DEFAULT_PICK_WAIT_MODE.
 PICK_WAIT_MODE: dict[str, PickWaitMode] = {}
-DEFAULT_PICK_WAIT_MODE = PickWaitMode.WAIT_AT_GRASP
+DEFAULT_PICK_WAIT_MODE = PickWaitMode.TRACK_DESCEND
+
+# Belt-tracking descend shaping (see ThrowSkill._build_track_descend). Both are
+# small compared to the descend itself and are NOT operator flags — the three
+# tunables the operator passes per run are cfg.TRACK_Z_START/END/SPEED.
+# Ramp-up to belt speed [s]. The arm is at REST at the hover when the object
+# arrives, so it cannot start at belt speed; it accelerates over this window.
+# ``arrival_lead`` starts the segment TRACK_ACCEL_T/2 early, which makes the
+# cup's along-belt position match the object's EXACTLY from t = TRACK_ACCEL_T
+# onward (the ramp's half-window lag is pre-paid) — so the descend lands on a
+# co-moving object with zero relative velocity.
+TRACK_ACCEL_T: float = 0.10
+# Ramp-down to rest [s] after Z reaches TRACK_Z_END. The NN throw arc starts
+# from rest (new_trajectory's dq(0)=0 boundary condition), so the tracking
+# segment must stop before it. The object is already sealed to the cup by then,
+# so the belt just slips underneath — the lag here is harmless.
+TRACK_DECEL_T: float = 0.10
 
 
 class ThrowSkill(ManipulationSkill):
@@ -66,6 +83,7 @@ class ThrowSkill(ManipulationSkill):
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._last_throw_meta: dict = {}
+        self._throw_bins = self._parse_throw_bins(ctx.cfg.THROW_BINS)
         self._visualizer = ThrowVisualizer(
             ctx.node,
             ctx.robot,
@@ -73,6 +91,41 @@ class ThrowSkill(ManipulationSkill):
             goal_xy=(ctx.cfg.THROW_GOAL_X, ctx.cfg.THROW_GOAL_Y),
             goal_radius=ctx.cfg.THROW_GOAL_RADIUS,
         )
+
+    @staticmethod
+    def _parse_throw_bins(raw: str) -> list[tuple[str, np.ndarray, float]]:
+        if not raw.strip():
+            return []
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("throw_bins must be a JSON list")
+        bins = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise ValueError(f"throw_bins[{i}] must be an object")
+            name = str(item.get("name", f"bin{i + 1}"))
+            xyz = np.asarray([item["x"], item["y"], item["z"]], dtype=float)
+            radius = float(item.get("radius", 0.10))
+            if not np.all(np.isfinite(xyz)) or not np.isfinite(radius) or radius <= 0.0:
+                raise ValueError(f"throw_bins[{i}] has invalid coordinates/radius")
+            bins.append((name, xyz, radius))
+        return bins
+
+    def _select_throw_bin(self, T_grasp: np.ndarray):
+        """Choose once from the planned final grasp; the throw flow stays unchanged."""
+        if not self._throw_bins:
+            return None
+        grasp_xy = np.asarray(T_grasp[:2, 3], dtype=float)
+        distances = [float(np.linalg.norm(xyz[:2] - grasp_xy))
+                     for _, xyz, _ in self._throw_bins]
+        index = int(np.argmin(distances))
+        selected = self._throw_bins[index]
+        self.ctx.log.info(
+            f"[bin-select] grasp=({grasp_xy[0]:+.3f},{grasp_xy[1]:+.3f}) "
+            f"candidates={[f'{b[0]}:{d:.3f}m' for b, d in zip(self._throw_bins, distances)]} "
+            f"selected={selected[0]}"
+        )
+        return selected
 
     def t_to_contact(self, move_time: float) -> float:
         """Throw pick budget = positioning estimate + a GUARANTEED parked
@@ -87,6 +140,164 @@ class ThrowSkill(ManipulationSkill):
         """
         base = move_time * self.ctx.cfg.PICK_FEASIBILITY_FACTOR
         return base + self.ctx.cfg.MIN_SUCTION_HOLD
+
+    def arrival_lead(self) -> float:
+        """End the wait half a ramp-up window early in TRACK_DESCEND mode.
+
+        The tracking segment starts from rest and reaches belt speed only after
+        ``TRACK_ACCEL_T``; over that ramp the cup covers ``v*TRACK_ACCEL_T/2``
+        while the object covers ``v*TRACK_ACCEL_T``. Dispatching the segment
+        ``TRACK_ACCEL_T/2`` before predicted arrival pre-pays exactly that
+        difference, so cup and object are aligned from the end of the ramp on
+        (and stay aligned through the descend — verified: relative offset 0 mm
+        from t=TRACK_ACCEL_T until Z lands).
+
+        This is keyed off the CONFIG only, not the per-object wait mode, because
+        the lead is consumed by ``position_and_prime`` before the mode's segment
+        is known to be buildable. A parked (WAIT_AT_GRASP / fallback) pick
+        therefore ends its wait 50 ms early — well inside the SUCTION_LEAD cap
+        that actually gates the parked prime, so it changes nothing there.
+        """
+        lead = super().arrival_lead()
+        if self._track_z_params() is not None:
+            lead += 0.5 * TRACK_ACCEL_T
+            # Empirical timing knob: start the follow+descend TRACK_LEAD_T earlier
+            # to cancel a fixed downstream landing offset (the object leading the
+            # cup at touchdown). See Config.TRACK_LEAD_T.
+            lead += float(self.ctx.cfg.TRACK_LEAD_T)
+        return lead
+
+    # ------------------------------------------------------------------
+    # Belt-tracking descend (TRACK_DESCEND wait mode)
+    # ------------------------------------------------------------------
+    def _track_z_params(self) -> "Optional[tuple[float, float, float]]":
+        """Resolved ``(z_start, z_end, z_speed)`` for the tracking descend, or
+        ``None`` when it is disabled / degenerate (caller falls back to the
+        parked WAIT_AT_GRASP pick).
+
+        NaN start/end mean "derive from GRASP_Z" (see ``Config.TRACK_Z_START``):
+        start = GRASP_Z + TRACK_Z_HOVER, end = GRASP_Z. Disabled when the speed
+        is non-positive or the two heights don't leave a downward travel.
+        """
+        cfg = self.ctx.cfg
+        v_desc = float(cfg.TRACK_Z_SPEED)
+        if not np.isfinite(v_desc) or v_desc <= 0.0:
+            return None
+        z_start = float(cfg.TRACK_Z_START)
+        if not np.isfinite(z_start):
+            z_start = float(cfg.GRASP_Z) + float(cfg.TRACK_Z_HOVER)
+        z_end = float(cfg.TRACK_Z_END)
+        if not np.isfinite(z_end):
+            z_end = float(cfg.GRASP_Z)
+        if z_start - z_end <= 1e-4:
+            return None
+        return z_start, z_end, v_desc
+
+    def _tcp_z_joint(self, T_grasp: np.ndarray, z_abs: float, seed_joint: np.ndarray):
+        """IK for the grasp TCP's XY/orientation held at absolute height ``z_abs``,
+        seeded with ``seed_joint`` so the solution stays on the same wrist branch.
+        ``None`` on failure (caller falls back)."""
+        T_h = np.asarray(T_grasp, dtype=float).copy()
+        T_h[2, 3] = float(z_abs)
+        q = self.ctx.robot.inverse_kinematics(
+            T_h, q_init=np.asarray(seed_joint, dtype=float)[:6]
+        )
+        return None if q is None else np.asarray(q, dtype=float)
+
+    def _build_track_descend(
+        self,
+        T_grasp: np.ndarray,
+        wait_joint: np.ndarray,
+        v_belt: float,
+        z_start: float,
+        z_end: float,
+        v_desc: float,
+    ):
+        """Cartesian segment that FOLLOWS the object downstream while descending.
+
+        Starting at the intercept (``T_grasp`` XY, height ``z_start``) the TCP
+        moves along -Y — the belt direction — with the profile
+        ``ramp up over TRACK_ACCEL_T -> cruise at v_belt -> ramp down over
+        TRACK_DECEL_T``, while Z falls linearly from ``z_start`` to ``z_end`` at
+        ``v_desc``. Cruise means ZERO relative velocity to the object, so the cup
+        settles onto an object that is stationary in its frame instead of sliding
+        underneath it. Both ends are at rest: the arm is parked when the segment
+        is dispatched, and the NN throw arc that follows needs a rest start.
+
+        Each waypoint's IK is seeded with the previous solution to hold one wrist
+        branch (same contract as the push stroke). If IK fails part-way — the
+        follow ran out of reach downstream — the segment is TRUNCATED there and
+        the throw simply starts from the shorter follow.
+
+        Returns ``(traj (6,n), vel (6,n), ts (n,))`` or ``None`` when the belt is
+        stopped or too few waypoints solved.
+        """
+        ctx = self.ctx
+        if v_belt < 1e-3:
+            return None                        # belt stopped -> nothing to track
+        dt = 1.0 / ctx.cfg.TRAJ_HZ
+        t_desc = (z_start - z_end) / v_desc
+        t_acc = TRACK_ACCEL_T
+        t_dec = TRACK_DECEL_T
+        t_cruise_end = max(t_desc, t_acc)      # hold belt speed until Z has landed
+        t_total = t_cruise_end + t_dec
+        n_steps = max(2, int(round(t_total / dt)))
+
+        def _along(t: float) -> float:
+            """Downstream distance travelled at segment time ``t``."""
+            if t <= t_acc:
+                return v_belt * t * t / (2.0 * t_acc)
+            s = v_belt * (t_acc * 0.5 + (min(t, t_cruise_end) - t_acc))
+            if t > t_cruise_end:
+                tau = min(t - t_cruise_end, t_dec)
+                s += v_belt * (tau - 0.5 * tau * tau / t_dec)
+            return s
+
+        waypoints = []
+        q_seed = np.asarray(wait_joint, dtype=float)
+        for i in range(n_steps + 1):
+            t = min(i * dt, t_total)
+            T_wp = np.asarray(T_grasp, dtype=float).copy()
+            T_wp[1, 3] -= _along(t)            # the belt advances toward -Y
+            T_wp[2, 3] = z_start - v_desc * min(t, t_desc)
+            ik = ctx.robot.inverse_kinematics(T_wp, q_init=q_seed)
+            if ik is None:
+                ctx.log.warn(
+                    f"track-descend IK failed @ {i}/{n_steps} "
+                    f"(y-{_along(t) * 1000:.0f}mm, z={T_wp[2, 3]:.3f}) — "
+                    f"truncating the follow to {len(waypoints)} waypoints"
+                )
+                break
+            q_seed = np.asarray(ik, dtype=float)
+            waypoints.append(q_seed)
+
+        if len(waypoints) < 3:
+            ctx.log.warn("track-descend segment unbuildable — parking at the grasp")
+            return None
+
+        n = len(waypoints)
+        traj = np.column_stack(waypoints)                  # (6, n)
+        ts = np.linspace(0.0, dt * (n - 1), n)
+        vel = np.zeros_like(traj)
+        vel[:, 1:-1] = (traj[:, 2:] - traj[:, :-2]) / (2.0 * dt)
+        # Both ends at rest (parked start, rest start for the throw arc). On a
+        # truncated follow the tail velocity is forced to 0 as well — the arm is
+        # at its reach limit there and must stop regardless.
+        vel[:, 0] = 0.0
+        vel[:, -1] = 0.0
+
+        # Joint-velocity check. Unlike the throw arc we must NOT stretch time to
+        # fix an overrun — stretching breaks the belt sync that is the whole
+        # point — so an over-limit follow is abandoned for the parked pick.
+        seg = np.abs(np.diff(traj, axis=1)) / dt
+        ratio = float(np.max(seg / np.asarray(ctx.M1[:6], dtype=float)[:, None]))
+        if ratio > 1.0:
+            ctx.log.warn(
+                f"track-descend exceeds joint velocity limits (max {ratio:.2f}x) — "
+                f"parking at the grasp instead"
+            )
+            return None
+        return traj, vel, ts
 
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
@@ -103,21 +314,67 @@ class ThrowSkill(ManipulationSkill):
         secondary = request.secondary
 
         mode = PICK_WAIT_MODE.get(target.class_name, DEFAULT_PICK_WAIT_MODE)
-        if mode == PickWaitMode.HOVER_DESCEND:
-            ctx.log.warn(
-                "HOVER_DESCEND wait mode not implemented yet; using WAIT_AT_GRASP"
-            )
-            mode = PickWaitMode.WAIT_AT_GRASP
 
         # Start clean (uniform per-object flow: no cross-cycle suction hand-off).
         ctx.traj_ctrl.suction_off()
 
-        # WAIT_AT_GRASP: drive to the grasp pose and prime suction SUCTION_LEAD before
-        # the object's arrival. Returns once the object has reached the intercept.
+        # TRACK_DESCEND (default): park at TRACK_Z_START above the intercept, and on
+        # the object's arrival run one belt-tracking segment that follows it at belt
+        # speed while the cup descends to TRACK_Z_END. The throw then starts from the
+        # END of that follow — further downstream and lower than the nominal grasp —
+        # so T_grasp/grasp_joint are re-bound below.
+        # WAIT_AT_GRASP (per-class, or the fallback when tracking is disabled/
+        # unbuildable): park AT the grasp height and take the object passively.
+        wait_joint = np.asarray(grasp_joint, dtype=float)
+        track = None                              # (traj, vel, ts) | None
+        z_params = self._track_z_params() if mode == PickWaitMode.TRACK_DESCEND else None
+        if z_params is not None:
+            z_start, z_end, v_desc = z_params
+            q_wait = self._tcp_z_joint(T_grasp, z_start, grasp_joint)
+            if q_wait is None:
+                ctx.log.warn(
+                    f"track-descend hover IK failed at z={z_start:.3f} — "
+                    f"falling back to the parked grasp wait"
+                )
+            else:
+                track = self._build_track_descend(
+                    T_grasp, q_wait, float(ctx.conveyor.current),
+                    z_start, z_end, v_desc,
+                )
+                if track is not None:
+                    wait_joint = q_wait
+                    ctx.log.info(
+                        f"track-descend: hover z={z_start:.3f} -> z={z_end:.3f} "
+                        f"@ {v_desc:.3f} m/s ({(z_start - z_end) / v_desc:.2f}s), "
+                        f"following belt {float(ctx.conveyor.current):.3f} m/s for "
+                        f"{float(track[2][-1]):.2f}s"
+                    )
+
+        # The tracking trajectory's final joint is already known before pickup,
+        # so choose the nearest bin once from its predicted final grasp pose.
+        bin_grasp = T_grasp
+        if track is not None:
+            bin_grasp = ctx.robot.forward_kinematics(track[0][:, -1][:6])
+        selected_bin = self._select_throw_bin(bin_grasp)
+
+        # Drive to the wait pose and (for the parked pick) prime suction SUCTION_LEAD
+        # before the object's arrival. Returns arrival_lead() before the object
+        # reaches the intercept.
+        #
+        # TRACK_DESCEND (track is not None): do NOT prime at the hover. The wait pose
+        # is TRACK_Z_START above the object, so an early prime there runs the vacuum
+        # in air for SUCTION_LEAD-arrival_lead (~0.43 s) while the arm sits STILL,
+        # before the descend even starts — the stationary suction-on gap. Instead
+        # park silently and fire suction AS the descend begins (below), so the vacuum
+        # forms DURING the descent motion and there is no still period. The descend's
+        # Z-landing takes (z_start-z_end)/v_desc (~0.5 s at defaults), which is the
+        # vacuum-formation window SUCTION_LEAD used to buy while parked. WAIT_AT_GRASP
+        # / fallback (track is None) keeps the original parked prime.
         ctx.set_status("POSITIONING", target.class_name)
         ctx.position_and_prime(
-            current_joint, aim_joint, grasp_joint, target, T_grasp[1, 3],
+            current_joint, aim_joint, wait_joint, target, T_grasp[1, 3],
             start_lead=self.arrival_lead(),
+            prime_suction=(track is None),
         )
 
         # DIAGNOSTIC: object vs intercept at the instant the lift/throw fires.
@@ -126,42 +383,89 @@ class ThrowSkill(ManipulationSkill):
         # SkillContext.log_action_timing.
         ctx.log_action_timing(target, T_grasp[1, 3], "throw-lift")
 
+        if track is not None:
+            # The object is arriving now: run the follow+descend. send_trajectory_queue
+            # blocks for the whole segment (the 250 Hz stream paces it in real time),
+            # so the cup is down on the object, at rest, when it returns.
+            t_traj, t_vel, t_ts = track
+            q_end = t_traj[:, -1]
+            # Fire suction AS the descend starts — NOT parked high above it. suction_on()
+            # only enqueues on the IO worker and returns immediately, so the descend
+            # dispatch follows with no stationary gap: the vacuum forms while the cup
+            # is already moving down onto the object and is fully pulled by the time it
+            # settles at z_end (see the prime_suction=False rationale above).
+            ctx.traj_ctrl.suction_on()
+            ctx.log_suction_on(target)
+            ctx.traj_ctrl.send_trajectory_queue(
+                t_traj, t_vel, t_ts, final_joint=q_end,
+            )
+            # Re-bind the throw's start pose to where the follow actually ended.
+            # compute_throw_params and the NN arc both key off these, so leaving
+            # them at the nominal intercept would plan a throw from a pose the arm
+            # is no longer in (a jump at the swing start, and a mis-aimed arc).
+            grasp_joint = np.asarray(q_end, dtype=float)
+            T_grasp = ctx.robot.forward_kinematics(grasp_joint[:6])
+            ctx.log.info(
+                f"track-descend done: throw starts at "
+                f"({T_grasp[0, 3]:+.3f}, {T_grasp[1, 3]:+.3f}, {T_grasp[2, 3]:+.3f}) m"
+            )
+
         # Lift + throw.
         ctx.set_status("THROWING", target.class_name)
+
+        if selected_bin is None:
+            goal_x = float(ctx.cfg.THROW_GOAL_X)
+            goal_y = float(ctx.cfg.THROW_GOAL_Y)
+            goal_radius = float(ctx.cfg.THROW_GOAL_RADIUS)
+        else:
+            _, selected_xyz, goal_radius = selected_bin
+            goal_x, goal_y = map(float, selected_xyz[:2])
+        model_distance = float(np.hypot(goal_x, goal_y))
+        self._visualizer.set_goal((goal_x, goal_y), goal_radius)
 
         # Match the coordinate convention used to train the FCN: theta is the
         # base-origin azimuth of the throw target, and the grasp/aim XY inputs
         # are rotated by -theta inside PickThrowPlanner.  Do NOT use the
         # point-to-point bearing (goal - grasp) here; that rotates coordinates
         # about the wrong reference and produced a ~44 deg release-direction
-        # error on hardware.  TARGET_DISTANCE intentionally remains the
-        # separately configured fixed model input (currently 1.2 m).
+        # error on hardware. The NN distance is the selected bin's base-frame
+        # XY radius, matching the existing single-goal convention.
         theta = float(np.arctan2(
-            ctx.cfg.THROW_GOAL_Y,
-            ctx.cfg.THROW_GOAL_X,
+            goal_y,
+            goal_x,
         ))
         ctx.log.info(
             f"Throw frame: theta={np.degrees(theta):+.2f}deg (goal azimuth), "
             f"grasp=({T_grasp[0, 3]:+.3f},{T_grasp[1, 3]:+.3f}), "
-            f"goal=({ctx.cfg.THROW_GOAL_X:+.3f},{ctx.cfg.THROW_GOAL_Y:+.3f}), "
-            f"model_distance={ctx.cfg.TARGET_DISTANCE:.3f}m"
+            f"goal=({goal_x:+.3f},{goal_y:+.3f}), "
+            f"model_distance={model_distance:.3f}m"
         )
 
-        # Throw target. If the class has a fixed bin coord in THROW_BIN_TARGET_MAP,
-        # override T_aim2 with that absolute base-frame XYZ so the NN aims at the
-        # bin. Otherwise fall back to the legacy plan_throw_landing (secondary's
-        # predicted position, or T_aim hover when no secondary).
-        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
-        if bin_xyz is not None:
+        # A selected runtime bin behaves exactly like the existing fixed bin;
+        # without throw_bins, preserve the legacy per-class/fallback flow.
+        if selected_bin is not None:
+            bin_name, bin_xyz, _ = selected_bin
             T_aim2 = np.eye(4)
             T_aim2[:3, :3] = T_aim[:3, :3]
-            T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+            T_aim2[:3, 3] = bin_xyz
             ctx.log.info(
-                f"Throw target for {target.class_name}: fixed bin "
+                f"Throw target: selected bin {bin_name} "
                 f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
             )
         else:
-            T_aim2 = self.plan_throw_landing(T_grasp, theta, T_aim, time.time(), secondary)
+            bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+            if bin_xyz is not None:
+                T_aim2 = np.eye(4)
+                T_aim2[:3, :3] = T_aim[:3, :3]
+                T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+                ctx.log.info(
+                    f"Throw target for {target.class_name}: fixed bin "
+                    f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
+                )
+            else:
+                T_aim2 = self.plan_throw_landing(
+                    T_grasp, theta, T_aim, time.time(), secondary,
+                )
 
         aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
         if aim_joint2 is None:
@@ -169,7 +473,9 @@ class ThrowSkill(ManipulationSkill):
             aim_joint2, T_aim2 = aim_joint, T_aim
         aim_joint2 = np.asarray(aim_joint2, dtype=float); aim_joint2[-1] = 0.0
 
-        params = ctx.planner.compute_throw_params(T_grasp, T_aim2, theta)
+        params = ctx.planner.compute_throw_params(
+            T_grasp, T_aim2, theta, target_distance=model_distance,
+        )
         # Chain the follow-through toward the NEXT object's grasp (best-effort) so the arm
         # OVERLAPS the next approach with this throw instead of parking far and re-driving
         # serially. Symmetric + stateless: the next epoch still SELECTS + DRIVES fresh from

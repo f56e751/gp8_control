@@ -44,6 +44,15 @@ class TrackedObject:
     # push forever. Every detection adds its confidence here (see vote_class) and
     # the EFFECTIVE class_name is the running argmax.
     class_votes: dict = field(default_factory=dict)
+    # Per-object belt-speed estimation (DetectionIntake fills these; the fit
+    # policy lives there, mirroring how dedup lives in intake — this is data).
+    #   y_anchors: recent [(detect_time, belt_frame_y)] observed while in the
+    #     camera box, trimmed to OBJECT_VEL_WINDOW_S.
+    #   v_est: fitted belt-direction speed [m/s, +] for THIS object, or None
+    #     until enough valid anchors. Diagnostic only; control dead-reckoning
+    #     continues to use the conveyor encoder speed.
+    y_anchors: list = field(default_factory=list)
+    v_est: float | None = None
 
     def vote_class(self, cls: str, conf: float) -> str:
         """Add a confidence-weighted vote for ``cls``; return the winning class.

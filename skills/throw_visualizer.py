@@ -110,6 +110,14 @@ class ThrowVisualizer:
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self._publisher = node.create_publisher(MarkerArray, self.TOPIC, qos)
 
+    def set_goal(self, goal_xy, goal_radius: float) -> None:
+        """Set this throw cycle's selected bin for preview and evaluation."""
+        radius = float(goal_radius)
+        if radius <= 0.0:
+            raise ValueError("throw goal radius must be positive")
+        self._goal_xy = np.asarray(goal_xy, dtype=float).reshape(2)
+        self._goal_radius = radius
+
     @staticmethod
     def _point(xyz) -> Point:
         point = Point()

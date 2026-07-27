@@ -109,6 +109,22 @@ selected `ManipulationSkill` runs the manipulation. (An older predictive "moving
 strategy and its support code — `lock_or_drop_head`, `_execute_cycle`,
 `PICK_STRATEGY` — have been removed.)
 
+How the arm *meets* the object at that intercept is the skill's `PickWaitMode`.
+`ThrowSkill` defaults to **`TRACK_DESCEND`**: it parks at `TRACK_Z_START` above
+the intercept, and on arrival dispatches one cartesian segment
+(`_build_track_descend`) that follows the object downstream at belt speed
+(ramp → cruise → ramp, zero relative velocity through the cruise) while the TCP Z
+ramps to `TRACK_Z_END` at `TRACK_Z_SPEED`. The throw's start pose is then
+**re-bound to where that follow ended** (downstream and lower than the nominal
+grasp) before `compute_throw_params`. The three heights/rate are per-run flags —
+`track_z_start:=` / `track_z_end:=` / `track_z_speed:=` (launch),
+`--track-z-start/--track-z-end/--track-z-speed` (CLI),
+`GP8_TRACK_Z_START/END/SPEED` (env); `nan` derives the heights from `GRASP_Z`,
+and `track_z_speed:=0` restores the old parked `WAIT_AT_GRASP` pick.
+`RobustThrowSkill` has its own, different pick (`HOVER_DESCEND`: vertical press
+to `PRESS_Z` on arrival, *then* belt-follow for `PICK_TIME`) — the two are
+deliberately separate.
+
 ### Two-process bridge — `bridge.py` is mandatory
 
 MotoROS2 names joints `joint_1..6`; everything else (URDF/SRDF/MoveIt/GUI/

@@ -141,6 +141,34 @@ def generate_launch_description():
         default_value=EnvironmentVariable("GP8_GRASP_Z", default_value="0.062"),
         description="Throw/pick suction wait TCP Z in base frame [m] (GRASP_Z).",
     )
+    # Throw pick belt-tracking descend (skills/throw_skill.py): the cup follows the
+    # object downstream at belt speed while lowering from track_z_start to
+    # track_z_end at track_z_speed. "nan" (default) derives the heights from grasp_z
+    # (start = grasp_z + 0.05, end = grasp_z); track_z_speed:=0 disables tracking and
+    # restores the old parked wait-at-grasp pick.
+    # track_z_* / track_lead_t defaults below are the values that tracked best on
+    # HW at belt 0.223 m/s. Pass "nan" to restore the derive-from-grasp_z heights.
+    track_z_start_arg = DeclareLaunchArgument(
+        "track_z_start",
+        default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="0.12"),
+        description="Throw pick: TCP Z the descend starts from [m] (nan -> grasp_z + 0.05).",
+    )
+    track_z_end_arg = DeclareLaunchArgument(
+        "track_z_end",
+        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.03"),
+        description="Throw pick: TCP Z the descend ends at [m] (nan -> grasp_z).",
+    )
+    track_z_speed_arg = DeclareLaunchArgument(
+        "track_z_speed",
+        default_value=EnvironmentVariable("GP8_TRACK_Z_SPEED", default_value="0.2"),
+        description="Throw pick: descend rate while tracking the belt [m/s] (<=0 disables).",
+    )
+    track_lead_t_arg = DeclareLaunchArgument(
+        "track_lead_t",
+        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.3"),
+        description="Throw pick: start the tracking descend this many s EARLIER to "
+                    "cancel a downstream landing offset (~= miss[m]/belt[m/s]).",
+    )
     # Pin every object to ONE manipulation skill for this run:
     # `skill:=throw|robust_throw|push`. Empty (default) = normal per-class
     # routing. robust_throw is the NLP (CasADi/IPOPT) thrower and needs casadi
@@ -149,6 +177,14 @@ def generate_launch_description():
         "skill",
         default_value=EnvironmentVariable("GP8_FORCE_SKILL", default_value=""),
         description="Force ALL objects to one skill: throw|robust_throw|push (empty = class routing).",
+    )
+    # 벨트 속도 소스: "encoder"(기본, 기존 ConveyorSpeedTracker 구독) 또는
+    # "camera"(엔코더 없이 지나가는 물체 추적으로 속도 추론 + /conveyor/speed
+    # 발행 대행 — 엔코더 노드와 동시 사용 금지).
+    conveyor_source_arg = DeclareLaunchArgument(
+        "conveyor_source",
+        default_value=EnvironmentVariable("GP8_CONVEYOR_SOURCE", default_value="encoder"),
+        description="Belt speed source: encoder (default) | camera (infer from tracked objects).",
     )
     rviz_arg = DeclareLaunchArgument(
         "rviz", default_value="false",
@@ -173,6 +209,15 @@ def generate_launch_description():
         "throw_goal_radius",
         default_value=EnvironmentVariable("GP8_THROW_GOAL_RADIUS", default_value="0.10"),
         description="Horizontal acceptance radius for predicted throw landing [m].",
+    )
+    throw_bins_arg = DeclareLaunchArgument(
+        "throw_bins",
+        default_value=EnvironmentVariable("GP8_THROW_BINS", default_value=""),
+        description=(
+            "Optional JSON throw-bin list: "
+            "[{\"name\":\"left\",\"x\":1.2,\"y\":0.3,\"z\":0.08,\"radius\":0.1}]. "
+            "Empty keeps throw_goal_x/y/radius behavior."
+        ),
     )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
@@ -351,13 +396,22 @@ def generate_launch_description():
             "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
             # Throw/pick suction wait height: `grasp_z:=` -> GP8_GRASP_Z.
             "GP8_GRASP_Z": LaunchConfiguration("grasp_z"),
+            # Throw pick belt-tracking descend: `track_z_start/end/speed:=`.
+            "GP8_TRACK_Z_START": LaunchConfiguration("track_z_start"),
+            "GP8_TRACK_Z_END": LaunchConfiguration("track_z_end"),
+            "GP8_TRACK_Z_SPEED": LaunchConfiguration("track_z_speed"),
+            # Throw pick descend timing lead: `track_lead_t:=` -> GP8_TRACK_LEAD_T.
+            "GP8_TRACK_LEAD_T": LaunchConfiguration("track_lead_t"),
             # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
             "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
+            # 벨트 속도 소스: `conveyor_source:=` -> GP8_CONVEYOR_SOURCE.
+            "GP8_CONVEYOR_SOURCE": LaunchConfiguration("conveyor_source"),
             # Visualization-only impact plane; never changes robot motion.
             "GP8_THROW_VIZ_IMPACT_Z": LaunchConfiguration("throw_viz_impact_z"),
             "GP8_THROW_GOAL_X": LaunchConfiguration("throw_goal_x"),
             "GP8_THROW_GOAL_Y": LaunchConfiguration("throw_goal_y"),
             "GP8_THROW_GOAL_RADIUS": LaunchConfiguration("throw_goal_radius"),
+            "GP8_THROW_BINS": LaunchConfiguration("throw_bins"),
         },
     )
 
@@ -383,7 +437,12 @@ def generate_launch_description():
         release_lead_arg,
         min_suction_hold_arg,
         grasp_z_arg,
+        track_z_start_arg,
+        track_z_end_arg,
+        track_z_speed_arg,
+        track_lead_t_arg,
         skill_arg,
+        conveyor_source_arg,
         app_arg,
         moveit_arg,
         rviz_arg,
@@ -391,6 +450,7 @@ def generate_launch_description():
         throw_goal_x_arg,
         throw_goal_y_arg,
         throw_goal_radius_arg,
+        throw_bins_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,
