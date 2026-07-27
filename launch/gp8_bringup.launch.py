@@ -40,6 +40,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     SetEnvironmentVariable,
 )
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     EnvironmentVariable,
@@ -132,6 +133,92 @@ def generate_launch_description():
         default_value=EnvironmentVariable("GP8_MIN_SUCTION_HOLD", default_value="0.3"),
         description="Guaranteed parked suction hold before throw lift [s] (MIN_SUCTION_HOLD).",
     )
+    # Absolute base-frame TCP Z where throw/pick parks and primes suction.
+    # `grasp_z:=0.0615` allows millimetre-level contact calibration without a
+    # rebuild; omitted -> shell GP8_GRASP_Z, else Config default 0.062 m.
+    grasp_z_arg = DeclareLaunchArgument(
+        "grasp_z",
+        default_value=EnvironmentVariable("GP8_GRASP_Z", default_value="0.062"),
+        description="Throw/pick suction wait TCP Z in base frame [m] (GRASP_Z).",
+    )
+    # Throw pick belt-tracking descend (skills/throw_skill.py): the cup follows the
+    # object downstream at belt speed while lowering from track_z_start to
+    # track_z_end at track_z_speed. "nan" (default) derives the heights from grasp_z
+    # (start = grasp_z + 0.05, end = grasp_z); track_z_speed:=0 disables tracking and
+    # restores the old parked wait-at-grasp pick.
+    # track_z_* / track_lead_t defaults below are the values that tracked best on
+    # HW at belt 0.223 m/s. Pass "nan" to restore the derive-from-grasp_z heights.
+    track_z_start_arg = DeclareLaunchArgument(
+        "track_z_start",
+        default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="0.12"),
+        description="Throw pick: TCP Z the descend starts from [m] (nan -> grasp_z + 0.05).",
+    )
+    track_z_end_arg = DeclareLaunchArgument(
+        "track_z_end",
+        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.03"),
+        description="Throw pick: TCP Z the descend ends at [m] (nan -> grasp_z).",
+    )
+    track_z_speed_arg = DeclareLaunchArgument(
+        "track_z_speed",
+        default_value=EnvironmentVariable("GP8_TRACK_Z_SPEED", default_value="0.2"),
+        description="Throw pick: descend rate while tracking the belt [m/s] (<=0 disables).",
+    )
+    track_lead_t_arg = DeclareLaunchArgument(
+        "track_lead_t",
+        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.3"),
+        description="Throw pick: start the tracking descend this many s EARLIER to "
+                    "cancel a downstream landing offset (~= miss[m]/belt[m/s]).",
+    )
+    # Pin every object to ONE manipulation skill for this run:
+    # `skill:=throw|robust_throw|push`. Empty (default) = normal per-class
+    # routing. robust_throw is the NLP (CasADi/IPOPT) thrower and needs casadi
+    # in .venv; omitted -> shell GP8_FORCE_SKILL, else normal routing.
+    skill_arg = DeclareLaunchArgument(
+        "skill",
+        default_value=EnvironmentVariable("GP8_FORCE_SKILL", default_value=""),
+        description="Force ALL objects to one skill: throw|robust_throw|push (empty = class routing).",
+    )
+    # 벨트 속도 소스: "encoder"(기본, 기존 ConveyorSpeedTracker 구독) 또는
+    # "camera"(엔코더 없이 지나가는 물체 추적으로 속도 추론 + /conveyor/speed
+    # 발행 대행 — 엔코더 노드와 동시 사용 금지).
+    conveyor_source_arg = DeclareLaunchArgument(
+        "conveyor_source",
+        default_value=EnvironmentVariable("GP8_CONVEYOR_SOURCE", default_value="encoder"),
+        description="Belt speed source: encoder (default) | camera (infer from tracked objects).",
+    )
+    rviz_arg = DeclareLaunchArgument(
+        "rviz", default_value="false",
+        description="Start RViz with live throw trajectory/release/ballistic markers.",
+    )
+    throw_viz_impact_z_arg = DeclareLaunchArgument(
+        "throw_viz_impact_z",
+        default_value=EnvironmentVariable("GP8_THROW_VIZ_IMPACT_Z", default_value="0.0"),
+        description="Base-frame Z plane where the RViz ballistic preview lands [m].",
+    )
+    throw_goal_x_arg = DeclareLaunchArgument(
+        "throw_goal_x",
+        default_value=EnvironmentVariable("GP8_THROW_GOAL_X", default_value="1.1"),
+        description="Throw evaluation goal/bin center X in base_link [m].",
+    )
+    throw_goal_y_arg = DeclareLaunchArgument(
+        "throw_goal_y",
+        default_value=EnvironmentVariable("GP8_THROW_GOAL_Y", default_value="-0.25"),
+        description="Throw evaluation goal/bin center Y in base_link [m].",
+    )
+    throw_goal_radius_arg = DeclareLaunchArgument(
+        "throw_goal_radius",
+        default_value=EnvironmentVariable("GP8_THROW_GOAL_RADIUS", default_value="0.10"),
+        description="Horizontal acceptance radius for predicted throw landing [m].",
+    )
+    throw_bins_arg = DeclareLaunchArgument(
+        "throw_bins",
+        default_value=EnvironmentVariable("GP8_THROW_BINS", default_value=""),
+        description=(
+            "Optional JSON throw-bin list: "
+            "[{\"name\":\"left\",\"x\":1.2,\"y\":0.3,\"z\":0.08,\"radius\":0.1}]. "
+            "Empty keeps throw_goal_x/y/radius behavior."
+        ),
+    )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
     # the included adv4ncr stack's robot_state_publisher and by move_group
@@ -194,6 +281,7 @@ def generate_launch_description():
                 "launch", "move_group.launch.py",
             ])
         ]),
+        condition=IfCondition(LaunchConfiguration("moveit")),
     )
 
     # =====================================================================
@@ -277,9 +365,28 @@ def generate_launch_description():
         if k not in os.environ:
             app_env[k] = v
 
+    # `app:=false` — 드라이버 스택(adv4ncr + JTC inactive + MoveIt)만 띄우고
+    # gp8_manager 앱은 생략. 정적 테스트(tests/static_pick_throw.py)나 디버그
+    # 도구처럼 JointGroupPositionController에 직접 명령을 쓰는 프로세스는 앱과
+    # 동시에 돌 수 없으므로 이 모드로 bringup 한다.
+    app_arg = DeclareLaunchArgument(
+        "app",
+        default_value="true",
+        description="Run the gp8_manager app (false = driver stack only, for tests).",
+    )
+    # MoveIt(move_group)도 선택화: 정적 테스트/디버그 도구는 JTC 액션 + 250Hz
+    # 스트림 + 자체 IK만 쓰므로 move_group이 필요 없다 (그리고 move_group이
+    # 죽어도 테스트에는 지장이 없다).
+    moveit_arg = DeclareLaunchArgument(
+        "moveit",
+        default_value="true",
+        description="Run MoveIt move_group (false = skip; tests don't need it).",
+    )
+
     gp8_app = ExecuteProcess(
         cmd=[_venv_python, "-m", "gp8_control.app"],
         output="screen",
+        condition=IfCondition(LaunchConfiguration("app")),
         additional_env={
             **app_env,
             # Throw suction-release lead: `release_lead:=` launch arg (falling back
@@ -287,7 +394,36 @@ def generate_launch_description():
             "GP8_RELEASE_LEAD": LaunchConfiguration("release_lead"),
             # Guaranteed parked suction hold: `min_suction_hold:=` -> GP8_MIN_SUCTION_HOLD.
             "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
+            # Throw/pick suction wait height: `grasp_z:=` -> GP8_GRASP_Z.
+            "GP8_GRASP_Z": LaunchConfiguration("grasp_z"),
+            # Throw pick belt-tracking descend: `track_z_start/end/speed:=`.
+            "GP8_TRACK_Z_START": LaunchConfiguration("track_z_start"),
+            "GP8_TRACK_Z_END": LaunchConfiguration("track_z_end"),
+            "GP8_TRACK_Z_SPEED": LaunchConfiguration("track_z_speed"),
+            # Throw pick descend timing lead: `track_lead_t:=` -> GP8_TRACK_LEAD_T.
+            "GP8_TRACK_LEAD_T": LaunchConfiguration("track_lead_t"),
+            # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
+            "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
+            # 벨트 속도 소스: `conveyor_source:=` -> GP8_CONVEYOR_SOURCE.
+            "GP8_CONVEYOR_SOURCE": LaunchConfiguration("conveyor_source"),
+            # Visualization-only impact plane; never changes robot motion.
+            "GP8_THROW_VIZ_IMPACT_Z": LaunchConfiguration("throw_viz_impact_z"),
+            "GP8_THROW_GOAL_X": LaunchConfiguration("throw_goal_x"),
+            "GP8_THROW_GOAL_Y": LaunchConfiguration("throw_goal_y"),
+            "GP8_THROW_GOAL_RADIUS": LaunchConfiguration("throw_goal_radius"),
+            "GP8_THROW_BINS": LaunchConfiguration("throw_bins"),
         },
+    )
+
+    rviz = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="gp8_throw_rviz",
+        arguments=["-d", PathJoinSubstitution([
+            FindPackageShare("gp8_control"), "rviz", "throw_runtime.rviz",
+        ])],
+        condition=IfCondition(LaunchConfiguration("rviz")),
+        output="screen",
     )
 
     # =====================================================================
@@ -300,8 +436,24 @@ def generate_launch_description():
         acc_factor_arg,
         release_lead_arg,
         min_suction_hold_arg,
+        grasp_z_arg,
+        track_z_start_arg,
+        track_z_end_arg,
+        track_z_speed_arg,
+        track_lead_t_arg,
+        skill_arg,
+        conveyor_source_arg,
+        app_arg,
+        moveit_arg,
+        rviz_arg,
+        throw_viz_impact_z_arg,
+        throw_goal_x_arg,
+        throw_goal_y_arg,
+        throw_goal_radius_arg,
+        throw_bins_arg,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,
         gp8_app,
+        rviz,
     ])

@@ -1,0 +1,70 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.1
+      Plane Cell Count: 24
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Marker Scale: 0.25
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        # robot_state_publisher publishes robot_description once with transient-local
+        # durability. RViz often starts later, so it must request the retained sample.
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Visual Enabled: true
+      Collision Enabled: false
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Suction Lift Markers
+      Enabled: true
+      Topic:
+        Value: /suction_lift_debug/markers
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: EE Preview Path
+      Enabled: true
+      Topic:
+        Value: /suction_lift_debug/path
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Line Style: Lines
+      Line Width: 0.02
+      Color: 255; 210; 20
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+    Frame Rate: 60
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 2.1
+      Pitch: 0.55
+      Yaw: 0.15
+      Focal Point:
+        X: 0.65
+        Y: 0.0
+        Z: 0.15
+Window Geometry:
+  Height: 850
+  Width: 1250

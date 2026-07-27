@@ -33,6 +33,18 @@ class Config:
     CONVEYOR_SPEED: float = 0.083
     CONVEYOR_TOPIC: str = "/conveyor/speed"
     CONVEYOR_STALE_SECONDS: float = 2.0
+    # Belt-speed source. "encoder" (기본, 기존 그대로): ConveyorSpeedTracker가
+    # CONVEYOR_TOPIC(엔코더 노드 발행)을 구독. "camera": 엔코더 없이
+    # CameraSpeedTracker가 지나가는 물체들의 per-object 속도 fit(detection_intake)
+    # 을 집계해 벨트 속도를 추론하고, CONVEYOR_TOPIC에 발행까지 대신한다
+    # (camera_debug 역보정/belt_viz 호환 — 엔코더 노드와 동시 사용 금지).
+    # env GP8_CONVEYOR_SOURCE / launch conveyor_source:=.
+    CONVEYOR_SOURCE: str = field(
+        default_factory=lambda: _env_default("GP8_CONVEYOR_SOURCE", "encoder")
+    )
+    # camera 모드 갱신 배치: 서로 다른 물체 이만큼이 fit을 내면 그들의 중앙값으로
+    # 1회 갱신 (한 물체는 한 배치에만 기여). 1 = 물체마다 갱신.
+    CONVEYOR_CAMERA_BATCH_N: int = 3
     TARGET_DISTANCE: float = 1.2
 
     # Fixed lead (s) folded into the throw-landing projection so the aim
@@ -76,7 +88,55 @@ class Config:
     # to 0.062 for firmer contact.
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
-    GRASP_Z: float = 0.062
+    GRASP_Z: float = field(             # [m] env GP8_GRASP_Z / launch grasp_z:=
+        default_factory=lambda: float(os.environ.get("GP8_GRASP_Z", "0.062"))
+    )
+    # --- Throw pick: belt-tracking descend (PickWaitMode.TRACK_DESCEND) -------
+    # The throw pick no longer waits PARKED at the grasp. It parks at TRACK_Z_START
+    # (above the belt), and on the object's arrival runs one cartesian segment that
+    # FOLLOWS the object downstream (-Y at belt speed, zero relative velocity) while
+    # the TCP Z ramps TRACK_Z_START -> TRACK_Z_END at TRACK_Z_SPEED. The cup therefore
+    # settles onto a co-moving object instead of dropping onto one that is sliding
+    # underneath it. The throw then starts from wherever that segment ended (further
+    # downstream and lower than the nominal grasp).
+    # All three are absolute base-frame quantities, env/launch/CLI overridable so they
+    # can be swept per run without a rebuild:
+    #   GP8_TRACK_Z_START / track_z_start:= / --track-z-start   [m, absolute TCP Z]
+    #   GP8_TRACK_Z_END   / track_z_end:=   / --track-z-end     [m, absolute TCP Z]
+    #   GP8_TRACK_Z_SPEED / track_z_speed:= / --track-z-speed   [m/s descent rate]
+    # NaN (the default) means "derive from GRASP_Z": start = GRASP_Z + TRACK_Z_HOVER,
+    # end = GRASP_Z. So an un-flagged run descends the hover height onto the normal
+    # grasp plane. TRACK_Z_SPEED <= 0 DISABLES tracking and restores the old parked
+    # WAIT_AT_GRASP pick.
+    # Defaults below are the values that tracked best on HW at belt 0.223 m/s
+    # (start 0.12 / end 0.03 / speed 0.2). Pass "nan" to restore the derive-from-
+    # GRASP_Z behaviour (start = GRASP_Z + TRACK_Z_HOVER, end = GRASP_Z).
+    TRACK_Z_START: float = field(       # [m] env GP8_TRACK_Z_START ("nan" -> GRASP_Z + TRACK_Z_HOVER)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "0.12"))
+    )
+    TRACK_Z_END: float = field(         # [m] env GP8_TRACK_Z_END ("nan" -> GRASP_Z)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "0.03"))
+    )
+    TRACK_Z_SPEED: float = field(       # [m/s] env GP8_TRACK_Z_SPEED (<=0 disables tracking)
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.2"))
+    )
+    # Hover height above GRASP_Z used when TRACK_Z_START is left at NaN. Also the
+    # clearance the parked cup keeps over an approaching object before the descend.
+    TRACK_Z_HOVER: float = 0.05         # [m]
+    # Extra lead added to the TRACK_DESCEND arrival_lead: start the follow+descend
+    # this many seconds EARLIER. The follow is open-loop parallel tracking at belt
+    # speed, so any lag in when it PHYSICALLY starts (dispatch/settle latency)
+    # persists as a fixed downstream offset — the cup lands that far BEHIND the
+    # object. Dialing this up starts the descend earlier and cancels that offset.
+    # Empirical knob: observed miss d[m] at belt v[m/s] ~= TRACK_LEAD_T*v, so start
+    # with TRACK_LEAD_T ~= d/v (e.g. 5 cm behind at 0.10 m/s -> ~0.5). Positive =
+    # earlier; too large lands the cup ahead of a late object. Only applied in
+    # TRACK_DESCEND (see ThrowSkill.arrival_lead). env/launch/CLI overridable.
+    # Default 0.3 tracked best on HW at belt 0.223 m/s.
+    #   GP8_TRACK_LEAD_T / track_lead_t:= / --track-lead-t   [s]
+    TRACK_LEAD_T: float = field(        # [s] env GP8_TRACK_LEAD_T
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_LEAD_T", "0.3"))
+    )
     # CAP on how early suction primes, now that priming is POSITION-triggered
     # (position_and_prime fires at max(cup-parked, arrival - SUCTION_LEAD)). The cup
     # is always parked at the grasp before suction fires; this only bounds how far
@@ -119,6 +179,31 @@ class Config:
     RELEASE_LEAD: float = field(        # [s]  env GP8_RELEASE_LEAD / launch release_lead:=
         default_factory=lambda: float(os.environ.get("GP8_RELEASE_LEAD", "-0.1"))
     )
+    # Z plane used by the runtime RViz point-mass ballistic preview.  This does
+    # not affect motion or release control; it only defines where the displayed
+    # object trajectory is considered to land.
+    THROW_VIZ_IMPACT_Z: float = field(  # [m] env GP8_THROW_VIZ_IMPACT_Z
+        default_factory=lambda: float(os.environ.get("GP8_THROW_VIZ_IMPACT_Z", "0.0"))
+    )
+    # Runtime ballistic evaluation target.  The XY defaults match the throw
+    # heading target that was historically hard-coded in throw_skill.py.
+    # GOAL_RADIUS is the acceptable horizontal miss distance (roughly the bin
+    # opening radius); these values affect planning direction/evaluation only,
+    # never the robot's safety limits.
+    THROW_GOAL_X: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_X", "1.1"))
+    )
+    THROW_GOAL_Y: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_Y", "-0.25"))
+    )
+    THROW_GOAL_RADIUS: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_RADIUS", "0.10"))
+    )
+    # Optional JSON list of throw bins. Empty keeps the existing single-goal
+    # behavior; launch exposes this as ``throw_bins:=...``.
+    THROW_BINS: str = field(
+        default_factory=lambda: os.environ.get("GP8_THROW_BINS", "")
+    )
 
     # Per-cycle timing log (suction-on -> throw start -> release). Empty = off.
     PICK_LOG_CSV: str = field(
@@ -129,21 +214,76 @@ class Config:
     AMBUSH_MAX_WAIT: float = 25.0       # give up waiting for arrival after this [s]
 
     # Trajectory sampling / joint limit scales. Affects the post-throw chain
-    # and the pre-pick _move_through (anything via trajectory()/opt_time);
-    # NOT the NN-driven throw motion itself (that uses params.T / params.w).
-    TRAJ_HZ: float = 20.0
+    # and the pre-pick _move_through (anything via trajectory()/opt_time), and
+    # the RobustThrow NLP arc sampling + release-index granularity.
+    # 20 -> 50 Hz (2026-07-24 사용자): throw arc(t_f~0.4-0.6s)가 50ms 간격이면
+    # 8~12점뿐이고 release 타이밍 granularity도 50ms라 거칠었다. 50Hz면 arc가
+    # 2.5배 촘촘하고 release가 20ms 단위로 정밀. 스트림이 250Hz로 리샘플하므로
+    # 실제 모션 부드러움은 이미 250Hz — 여긴 리샘플 전 밀도/타이밍 해상도용.
+    # warm DB(연속 B-spline)와는 무관 (샘플링만 바뀜, 재빌드 불필요).
+    TRAJ_HZ: float = 50.0
     JOINT_VEL_LIMIT_SCALE: float = 0.9    # 90% of nominal joint velocity (safety margin)
     JOINT_ACCEL_LIMIT_SCALE: float = 6.0  # M2 = M1 × this (aggressive accel/decel)
 
     # Loop cooldown
     TIME_STEP: float = 1.0 / 25.0
-    FRAME_COOLDOWN_DISTANCE: float = 0.8
+    FRAME_COOLDOWN_DISTANCE: float = 0.85
 
     # Spatial-dedup threshold for intake. A new detection within this
     # radius of an existing tracked object is treated as the same physical
     # object (so successive camera frames re-detecting it don't enqueue
     # duplicates). 5 cm covers typical position noise.
     OBJECT_MATCH_EPSILON: float = 0.05
+
+    # Belt-direction (Y) dedup tolerance GROWTH per second of dead reckoning,
+    # as a fraction of belt speed. A track that hasn't been re-detected for
+    # `age` seconds has been extrapolated by v*age, and the belt-speed estimate
+    # is only good to a few percent — so its predicted Y is uncertain by
+    # ~OBJECT_MATCH_DRIFT_FRAC * v * age. Without this the fixed 5 cm window is
+    # exceeded whenever the main loop is busy dispatching a multi-second
+    # trajectory (no intake runs during it), and the SAME object re-spawns as a
+    # second track at its true position. Across-belt (X) needs no growth term —
+    # the object doesn't drift sideways. 0.25 = tolerate a 25% belt-speed error.
+    OBJECT_MATCH_DRIFT_FRAC: float = 0.25
+    # Hard cap on that grown Y window [m], so a very stale track can't swallow a
+    # genuinely different object further down the belt. Generous is safe here:
+    # the first detection re-anchors the stale track (age -> 0), so every OTHER
+    # detection in the same frame is matched against the tight base window —
+    # two objects in one frame stay separate as long as they are > eps apart.
+    OBJECT_MATCH_EPS_Y_MAX: float = 0.20
+    # Cap for the queue MERGE pass, which is deliberately TIGHTER than the
+    # intake cap above. Intake compares a fresh camera detection against a
+    # prediction (the detection is ground truth, so a wide window is safe);
+    # merging compares two PREDICTIONS with no new evidence, so a wide window
+    # there would delete a genuinely separate object. 10 cm still catches a
+    # drift-spawned twin (~8 cm after a 4 s loop stall) while keeping objects
+    # spaced a normal belt gap apart distinct.
+    OBJECT_MERGE_EPS_Y_MAX: float = 0.10
+
+    # 검출↔트랙 연관 방식. "hungarian"(기본): 프레임의 검출 전체×트랙 전체의
+    # 비용(창-정규화 거리 합 = "전체 거리")을 scipy 최적 할당으로 한 번에
+    # 최소화 — 허용창이 겹칠 만큼 붙어 오는 이웃 물체들의 트랙 교차(스왑)를
+    # 방지한다. "greedy": 구 선착순 매칭 (검출마다 창 안 첫 트랙). 두 방식의
+    # 게이트(창 밖 = 매칭 불가)는 동일하므로, 물체 간격이 창보다 넓으면 결과도
+    # 동일하다. env GP8_TRACK_ASSOC.
+    TRACK_ASSOC: str = field(
+        default_factory=lambda: _env_default("GP8_TRACK_ASSOC", "hungarian")
+    )
+
+    # Per-object camera-speed diagnostic. Fit each object's apparent speed from
+    # the (t, y) anchors accumulated in the camera box, but keep control timing
+    # on the conveyor encoder speed; the fit is logged only for calibration.
+    # The anchors are keyed off the SAME match verdict TRACK_ASSOC produces, so a
+    # swap there feeds the fit a foreign object's positions — another reason the
+    # hungarian default matters here.
+    # Fitted only when there are >= MIN_ANCHORS spanning >= MIN_SPAN_S with fit
+    # RMS <= MAX_RMS, and the result is clamped to belt*(1 +/- CLAMP_FRAC) — a
+    # fit outside that band is rejected as a likely mis-association.
+    OBJECT_VEL_WINDOW_S: float = 1.5      # only anchors newer than this are fit [s]
+    OBJECT_VEL_MIN_ANCHORS: int = 4       # need >= this many detections to fit
+    OBJECT_VEL_MIN_SPAN_S: float = 0.3    # anchors must span >= this in time [s]
+    OBJECT_VEL_MAX_RMS: float = 0.02      # reject the fit if residual RMS > this [m]
+    OBJECT_VEL_CLAMP_FRAC: float = 0.25   # accept v_est only within belt*(1 +/- this)
 
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads
     # whose ETA < move_time * factor — i.e. objects that will reach the

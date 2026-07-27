@@ -45,6 +45,7 @@ setup(
         (os.path.join("share", package_name, "launch"), glob("launch/*.py")),
         (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
         (os.path.join("share", package_name, "rviz"), glob("rviz/*.rviz")),
+        (os.path.join("share", package_name, "urdf"), glob("urdf/*.xacro")),
     ],
     package_data={
         f"{package_name}.gui": ["static/*", "static/css/*"],
@@ -81,6 +82,16 @@ setup(
             # Standalone keyboard suction toggle for the adv4ncr driver (TCP 50242
             # Simple Message IoServer; no ROS service needed). Run supervised.
             "suction_keys = gp8_control.tests.suction_keys:main",
+            # Static-object suction pick check: park at GRASP_Z, suction + hold,
+            # lift 10 cm (no torch; system python OK). Conveyor stopped.
+            "suction_lift_debug = gp8_control.tests.suction_lift_debug:main",
+            # Supervised low-speed Z descent with suction ON.  Records the TCP
+            # clearance when the operator marks visible object attachment.
+            "suction_attach_range_debug = "
+            "gp8_control.tests.suction_attach_range_debug:main",
+            # Preserve the current TCP X/Y/orientation, move to a requested
+            # base-frame Z, then hold suction ON until the operator releases it.
+            "suction_hold_at_z = gp8_control.tests.suction_hold_at_z:main",
         ],
     },
 )

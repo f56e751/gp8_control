@@ -10,6 +10,7 @@ itself stays small — domain logic lives in ``perception/``,
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -24,7 +25,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.conveyor import ConveyorSpeedTracker
+from gp8_control.conveyor import CameraSpeedTracker, ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -114,7 +115,18 @@ class GP8App:
             self.cfg.MAX_REACH, drop_below_y=-self.cfg.MAX_REACH,
         )
         self.frame_gate = FrameGate(self.cfg.FRAME_COOLDOWN_DISTANCE)
-        self.detection_intake = DetectionIntake(self.cfg.OBJECT_MATCH_EPSILON)
+        self.detection_intake = DetectionIntake(
+            self.cfg.OBJECT_MATCH_EPSILON,
+            drift_frac=self.cfg.OBJECT_MATCH_DRIFT_FRAC,
+            eps_y_max=self.cfg.OBJECT_MATCH_EPS_Y_MAX,
+            merge_eps_y_max=self.cfg.OBJECT_MERGE_EPS_Y_MAX,
+            assoc=self.cfg.TRACK_ASSOC,
+            vel_window_s=self.cfg.OBJECT_VEL_WINDOW_S,
+            vel_min_anchors=self.cfg.OBJECT_VEL_MIN_ANCHORS,
+            vel_min_span_s=self.cfg.OBJECT_VEL_MIN_SPAN_S,
+            vel_max_rms=self.cfg.OBJECT_VEL_MAX_RMS,
+            vel_clamp_frac=self.cfg.OBJECT_VEL_CLAMP_FRAC,
+        )
 
     # ------------------------------------------------------------------
     # Setup
@@ -131,19 +143,40 @@ class GP8App:
         )
 
         self.traj_ctrl = TrajectoryController(self._node)
-        self.moveit_ctrl = MoveItController(self._node)
+        # MoveItController는 현재 어디서도 호출되지 않는다 (초기 자세 이동도
+        # trajectory()로 처리). 기본은 생성하지 않아 move_group 의존과 그
+        # __init__의 30초 대기를 없앤다. 옛 동작이 필요하면 GP8_USE_MOVEIT=1.
+        self.moveit_ctrl = (
+            MoveItController(self._node)
+            if os.environ.get("GP8_USE_MOVEIT", "0").lower() in ("1", "true", "yes")
+            else None
+        )
         # camera_debug node owns the perception stream + corrections; we just
         # subscribe to its corrected detection list.
         self._node.create_subscription(
             String, "/camera_debug/detections",
             self._on_camera_debug_detections, 10,
         )
-        self.conveyor = ConveyorSpeedTracker(
-            self._node,
-            self.cfg.CONVEYOR_TOPIC,
-            self.cfg.CONVEYOR_SPEED,
-            self.cfg.CONVEYOR_STALE_SECONDS,
-        )
+        # Belt-speed source (cfg.CONVEYOR_SOURCE): 기본 "encoder"는 기존
+        # ConveyorSpeedTracker 그대로. "camera"는 엔코더 없이 지나가는 물체들의
+        # 속도 fit(detection_intake._update_velocity)을 집계해 추론 —
+        # speed_sink로 fit을 공급받고, CONVEYOR_TOPIC 발행도 대신한다.
+        if str(self.cfg.CONVEYOR_SOURCE).strip().lower() == "camera":
+            self.conveyor = CameraSpeedTracker(
+                self._node,
+                self.cfg.CONVEYOR_TOPIC,
+                self.cfg.CONVEYOR_SPEED,
+                self.cfg.CONVEYOR_STALE_SECONDS,
+                batch_n=self.cfg.CONVEYOR_CAMERA_BATCH_N,
+            )
+            self.detection_intake.speed_sink = self.conveyor.observe
+        else:
+            self.conveyor = ConveyorSpeedTracker(
+                self._node,
+                self.cfg.CONVEYOR_TOPIC,
+                self.cfg.CONVEYOR_SPEED,
+                self.cfg.CONVEYOR_STALE_SECONDS,
+            )
 
         self.traj_ctrl.wait_for_servers()
         # Now that every subscription + service/action client exists and servers
@@ -208,7 +241,14 @@ class GP8App:
             M1=self.M1,
             M2=self.M2,
             max_reach=self.cfg.MAX_REACH,
-            target_distance=self.cfg.TARGET_DISTANCE,
+            # Previous behavior kept the NN's bin-distance input fixed at 1.2 m,
+            # regardless of the configured throw-goal position:
+            # target_distance=self.cfg.TARGET_DISTANCE,
+            # Keep the existing theta/coordinate-alignment convention, but make
+            # the distance input match the bin's base-frame XY radius.
+            target_distance=float(np.hypot(
+                self.cfg.THROW_GOAL_X, self.cfg.THROW_GOAL_Y,
+            )),
             decoding=self.cfg.throw_decoding(),
             max_pick_lead=self.cfg.MAX_PICK_LEAD,
         )
@@ -257,12 +297,33 @@ class GP8App:
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)
+        skills = [self.throw_skill, self.push_skill]
         # Rule-based class routing (SKILL_BY_CLASS): cans -> push, PET bottles ->
         # throw; anything else -> default "throw". Swap this for an RL policy
         # later by replacing ActionSelector. FORCE_SKILL (env GP8_FORCE_SKILL /
-        # CLI --skill) pins every object to one skill for testing, overriding
-        # the class routing; empty -> normal per-class routing.
+        # CLI --skill / launch skill:=) pins every object to one skill for
+        # testing, overriding the class routing; empty -> normal per-class routing.
         force = self.cfg.FORCE_SKILL or None
+        # robust_throw (CasADi/IPOPT NLP thrower) is OPTIONAL: its import pulls
+        # casadi + the THR planner modules (skills/throw_nlp.py, skills/throwing.py),
+        # which a lean install may not have. Import lazily HERE so plain throw/push
+        # runs never depend on them; explicitly selecting robust_throw without the
+        # deps must fail loudly, not fall back to a different thrower.
+        self.robust_throw_skill = None
+        try:
+            from gp8_control.skills.robust_throw_skill import RobustThrowSkill
+            self.robust_throw_skill = RobustThrowSkill(self.ctx)
+            skills.append(self.robust_throw_skill)
+        except ImportError as e:
+            if force == "robust_throw" or "robust_throw" in self.cfg.SKILL_BY_CLASS.values():
+                raise RuntimeError(
+                    "robust_throw skill was selected but its NLP deps are missing "
+                    "(need casadi in .venv + skills/throw_nlp.py + skills/throwing.py): "
+                    f"{e}"
+                ) from e
+            self._node.get_logger().info(
+                f"robust_throw skill unavailable ({e}); throw/push only."
+            )
         if force is not None:
             self._node.get_logger().warn(
                 f"ActionSelector FORCED to '{force}' skill for ALL objects "
@@ -274,7 +335,7 @@ class GP8App:
                 f"(default 'throw')"
             )
         self.selector = ActionSelector(
-            [self.throw_skill, self.push_skill],
+            skills,
             default="throw",
             by_class=self.cfg.SKILL_BY_CLASS,
             force=force,
@@ -585,12 +646,48 @@ def main(argv=None) -> None:
     )
     parser.add_argument(
         "--skill",
-        choices=["throw", "push"],
+        choices=["throw", "robust_throw", "push"],
         default=None,
         help=(
             "Force every object to this manipulation skill (testing aid). "
             "Overrides the GP8_FORCE_SKILL env var. Omit for normal "
-            "push/throw routing."
+            "push/throw routing. robust_throw = NLP (CasADi/IPOPT) thrower; "
+            "requires casadi in .venv."
+        ),
+    )
+    # Throw pick belt-tracking descend (skills/throw_skill.py). The throw pick
+    # follows the object downstream at belt speed while lowering the cup from
+    # --track-z-start to --track-z-end at --track-z-speed. Omit any of them to keep
+    # the env / Config default (heights default to GRASP_Z + hover / GRASP_Z).
+    parser.add_argument(
+        "--track-z-start", type=float, default=None, metavar="M",
+        help=(
+            "Throw pick: absolute TCP Z [m] the cup waits at before the "
+            "belt-tracking descend. Default: GP8_TRACK_Z_START, else GRASP_Z + 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--track-z-end", type=float, default=None, metavar="M",
+        help=(
+            "Throw pick: absolute TCP Z [m] the belt-tracking descend ends at "
+            "(contact height). Default: GP8_TRACK_Z_END, else GRASP_Z."
+        ),
+    )
+    parser.add_argument(
+        "--track-z-speed", type=float, default=None, metavar="MPS",
+        help=(
+            "Throw pick: descent rate [m/s] during the belt-tracking follow. "
+            "<=0 disables tracking (old parked wait-at-grasp pick). "
+            "Default: GP8_TRACK_Z_SPEED, else 0.10."
+        ),
+    )
+    parser.add_argument(
+        "--track-lead-t", type=float, default=None, metavar="S",
+        help=(
+            "Throw pick: start the belt-tracking follow+descend this many seconds "
+            "EARLIER, to cancel a fixed downstream landing offset (object leading "
+            "the cup at touchdown). ~= observed_miss[m] / belt[m/s]. "
+            "Default: GP8_TRACK_LEAD_T, else 0.0."
         ),
     )
     # parse_known_args so ROS 2 / ros2 launch-injected args (e.g. --ros-args)
@@ -600,6 +697,14 @@ def main(argv=None) -> None:
     cfg = Config()
     if args.skill is not None:
         cfg.FORCE_SKILL = args.skill   # CLI flag wins over the env default
+    if args.track_z_start is not None:
+        cfg.TRACK_Z_START = args.track_z_start
+    if args.track_z_end is not None:
+        cfg.TRACK_Z_END = args.track_z_end
+    if args.track_z_speed is not None:
+        cfg.TRACK_Z_SPEED = args.track_z_speed
+    if args.track_lead_t is not None:
+        cfg.TRACK_LEAD_T = args.track_lead_t
 
     app = GP8App(cfg)
     app.run()

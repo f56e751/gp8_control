@@ -51,7 +51,8 @@ class Yaskawa():
         bound2 = (-np.radians(65), np.radians(145))
         bound3 = (-np.radians(70), np.radians(190))
         bound4 = (-np.radians(190), np.radians(190))
-        bound5 = (-np.radians(135), np.radians(135))
+        # Real cell J5 +방향 추가 장착판의 측정 상한과 일치시킨다.
+        bound5 = (-np.radians(135), 1.060747742652893)
         bound6 = (-np.radians(360), np.radians(360))
 
         bound7 = (-M1[0], M1[0])

@@ -213,9 +213,11 @@ class PickThrowPlanner:
     # Final NN query (full decoded params)
     # ------------------------------------------------------------------
     def compute_throw_params(
-        self, T_grasp: np.ndarray, T_aim2: np.ndarray, theta: float
+        self, T_grasp: np.ndarray, T_aim2: np.ndarray, theta: float,
+        target_distance: float | None = None,
     ) -> ThrowParams:
         x1, y1 = _rotate_xy(T_grasp[0, 3], T_grasp[1, 3], theta)
         x2, y2 = _rotate_xy(T_aim2[0, 3], T_aim2[1, 3], theta)
-        raw = self.predictor.predict((x1, y1), (x2, y2), self.target_distance)
+        distance = self.target_distance if target_distance is None else float(target_distance)
+        raw = self.predictor.predict((x1, y1), (x2, y2), distance)
         return ThrowParams.from_raw(raw, self.decoding)

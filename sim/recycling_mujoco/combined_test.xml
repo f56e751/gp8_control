@@ -132,7 +132,8 @@
               <geom type="mesh" rgba="0.2 0.2 0.8 1" mesh="link4" />
               <body name="link5">
                 <inertial pos="0 0 0.05" quat="0.5 0.5 -0.5 0.5" mass="1" diaginertia="0.002 0.001 0.001" />
-                <joint name="B_axis" class="size2" pos="0 0 0" axis="0 -1 0" range="-2.3561 2.3561" actuatorfrcrange="-5000 5000" />
+                <!-- +B is physically limited by the added wrist plate (measured 2026-07-14). -->
+                <joint name="B_axis" class="size2" pos="0 0 0" axis="0 -1 0" range="-2.3561 1.060747742652893" actuatorfrcrange="-5000 5000" />
                 <geom type="mesh" rgba="0.2 0.2 0.8 1" mesh="link5" />
                 <body name="link6">
                   <inertial pos="0.00393443 0 0.0491803" quat="0 0.727158 0 0.686471" mass="0.61" diaginertia="0.00367336 0.00219115 0.00161779" />
@@ -374,7 +375,7 @@
     <position name="L_axis_act" joint="L_axis" kp="5000" kv="100" forcerange="-5000 5000" ctrlrange="-1.1344 2.5307" />
     <position name="U_axis_act" joint="U_axis" kp="5000" kv="100" forcerange="-5000 5000" ctrlrange="-3.1415 3.1415" />
     <position name="R_axis_act" joint="R_axis" kp="5000" kv="100" forcerange="-5000 5000" ctrlrange="-3.1415 3.1415" />
-    <position name="B_axis_act" joint="B_axis" kp="5000" kv="100" forcerange="-5000 5000" ctrlrange="-2.3561 2.3561" />
+    <position name="B_axis_act" joint="B_axis" kp="5000" kv="100" forcerange="-5000 5000" ctrlrange="-2.3561 1.060747742652893" />
     <position name="T_axis_act" joint="T_axis" kp="5000" kv="100" forcerange="-5000 5000" ctrlrange="-3.1415 3.1415" />
     <velocity name="slider_act" joint="slider_joint" kv="80000" ctrlrange="0 10" forcerange="-5000 5000" />
   </actuator>
