@@ -140,7 +140,16 @@ LANDING_GATE: float = 0.03
 # 높이 올라가는 해를 후보·dispatch 양쪽에서 거른다 (빌더와 런타임 정합).
 MIN_TCP_X: float = 0.20
 MIN_TCP_Z: float = 0.04
-MAX_TCP_Z: float = 0.85
+MAX_TCP_Z: float = float(os.environ.get("GP8_MAX_TCP_Z", "0.85"))   # 플래너 런타임
+#   z 상한 게이트. GP8_MAX_TCP_Z 로 오버라이드 (예: 먼 1.683 허용하려면 0.95, 사실상
+#   off 는 99). post-solve 필터라 formulation 해시(_formulation_params)에 없음 →
+#   값 바꿔도 warm DB 무효화 X. 빌더 중 build_warm_db.py / _6pairs.py 는 0.85 고정,
+#   build_warm_db_12pairs.py / _128_12pairs.py 는 같은 GP8_MAX_TCP_Z env 를 읽는다.
+#   런타임만 올리고 DB 가 낮은 값으로 빌드돼 있으면 그 조합의 exact entry 가 없어
+#   매번 재풀이(느림) — 먼 조합을 빠르게 쓰려면 같은 값으로 DB 를 재빌드해야 한다.
+#   반대로 DB 가 더 높은 값(예 99)으로 빌드됐는데 런타임을 0.85 로 두면 저장 해가
+#   런타임 재검증에서 기각된다. skills/warm_db_128_12pairs.pkl 은 99 로 빌드됐고
+#   tests/run_static_pick_throw.sh 가 99 를 export 하므로 짝이 맞다.
 
 # DB 재사용(고속 경로) 허용치. target 은 tight(2mm) — 저장 궤적의 착탄이 그대로
 # 쓰이므로 target 을 넓히면 착지가 그만큼 어긋난다. 시작자세(p_lift)는 넓게(1.5cm)

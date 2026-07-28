@@ -66,7 +66,10 @@ from throwing import (
 N_CTRL = 12                     # 관절당 B-Spline 제어점 수
 DEGREE = 3                      # cubic (q̈가 구간별 선형 → knot 제약 = exact)
 N_WIN = 7                       # release 윈도우 적분 이산화 노드 수
-RELEASE_TIME = 0.05             # 윈도우 총 길이 (s). 긴 윈도우는 W_ACC가 너무 크면
+RELEASE_TIME = float(os.environ.get("GP8_RELEASE_TIME", "0.05"))   # 윈도우 총 길이 (s),
+# GP8_RELEASE_TIME 로 오버라이드 (formulation 해시 rt 키 — 바꾸면 warm DB 무효화;
+# skills.robust_throw_skill.THROW_WINDOW_T 가 이 값을 그대로 파생하므로 런타임/빌더가
+# 같은 env 로 일관됨). 긴 윈도우는 W_ACC가 너무 크면
 # 실패 — 스윙 ~3 m/s × 0.05s = 12~15cm 구간 전체에 mm 정확도를 강요해 basin이
 # 죽음 (1e7에서 최악 쌍 0/6 수렴). W_ACC를 1e4로 낮추면 같은 쌍 5/6 수렴,
 # 윈도우 오차 max ~6mm (bin 개구부 대비 무시 가능) — 2026-07-16 스윕.

@@ -44,30 +44,31 @@ POINTS=(
 # 여러 개면 지점 수와 같아야 하고 순서대로 1:1 매칭된다.
 # ============================================================================
 TARGETS=(
-    "1.20,0.225,0.02"
-    "1.20,0.075,0.02"
-    "1.20,-0.075,0.02"
-    "1.20,-0.225,0.02"
+    "1.20,0.225,0.05"
+    "1.20,0.075,0.05"
+    "1.20,-0.075,0.05"
+    "1.20,-0.225,0.05"
 
-    "1.441,0.225,0.085"
-    "1.441,0.075,0.085"
-    "1.441,-0.075,0.085"
-    "1.441,-0.225,0.085"
+    "1.45,0.225,0.05"
+    "1.45,0.075,0.05"
+    "1.45,-0.075,0.05"
+    "1.45,-0.225,0.05"
 
-    "1.683,0.225,0.15"
-    "1.683,0.075,0.15"
-    "1.683,-0.075,0.15"
-    "1.683,-0.225,0.15"
+    "1.7,0.225,0.05"
+    "1.7,0.075,0.05"
+    "1.7,-0.075,0.05"
+    "1.7,-0.225,0.05"
 )
 
 # 항상 붙는 추가 옵션 (예: "--vel-scale" "0.3", 셔플 재현은 "--seed" "42", "--shuffle-points" )
 # --shuffle-points: 지점 방문 순서를 무작위로 섞음. TARGETS 순서는 고정이라
 # "i번째 던지기 → TARGETS[i]"는 그대로, 어느 지점을 i번째로 집는지만 랜덤.
 # "--no-confirm" 
-EXTRA_ARGS=("--confirm-throw" "--vel-scale" "0.2" "--shuffle-points")
+EXTRA_ARGS=("--confirm-throw" "--vel-scale" "0.2")   # 144 교차곱 DB 라 셔플 OK
 
 # driver 스택: 1 = 스크립트 종료 후에도 유지(재실행 빠름), 0 = 종료 시 함께 정리
 KEEP_DRIVER=1
+# suction blow = 0.3
 
 # ============================================================================
 WS="$HOME/ros2_ws"
@@ -76,18 +77,43 @@ VENV_PY="$PKG_DIR/.venv/bin/python"
 DRIVER_LOG="/tmp/gp8_driver_bringup.log"
 JTC_ACTION="/joint_trajectory_controller/follow_joint_trajectory"
 
-# ── 144 교차곱(4cm/grip40mm) warm DB 연결 ──────────────────────────────────
-# 이 테스트를 skills/warm_db_grip40_144.pkl (12 start × 12 target 교차곱, GRIP_OFF
-# 4cm 로 빌드) 로 돌린다. 위 POINTS/TARGETS 가 DB 그리드와 일치하고 교차곱이라
-# --shuffle-points 여도 모든 (point,target) 조합이 exact-match (계획 ~0.1s).
-#   • GP8_GRIP_OFF=0.04 → 플래너 GRIP_OFF/launch_state 발사점이 4cm → FLIGHT_MODEL
-#     grip40mm → DB formulation 매칭 (안 맞으면 로더가 entry 무시하고 cold 재풀이).
-#   • GP8_THROW_WARM_DB → warm DB 파일을 144 DB 로 지정.
-# 둘 다 이 스크립트 실행에만 export (기본 2cm + warm_db.pkl 은 앱/다른 실행 그대로).
-# 연결 해제하려면 아래 두 export 를 주석 처리(그러면 기본 2cm + warm_db.pkl).
-WARM_DB_144="$PKG_DIR/skills/warm_db_grip40_144.pkl"
-export GP8_GRIP_OFF="${GP8_GRIP_OFF:-0.04}"
-export GP8_THROW_WARM_DB="${GP8_THROW_WARM_DB:-$WARM_DB_144}"
+# ── 2cm(grip20mm) warm DB 연결 (skills/warm_db_128_12pairs.pkl, rt=0.05) ─────
+# 2026-07-28 신규: 아래 POINTS × TARGETS **12×12 교차곱을 144/144 완전 커버**.
+# 초기값 128개 multistart 로 조합마다 게이트 통과 min-J 해 하나만 저장
+# (tools/build_warm_db_128_12pairs.py, PAIRED=False, 11133s/8workers 빌드).
+# 교차곱이라 --shuffle-points 를 붙여도 모든 조합이 exact-match(~0.1s) 된다.
+# ⚠ POINTS/TARGETS 를 고치면 이 DB 는 그 조합을 커버하지 못한다 — 빌더의
+#   TARGETS/P_STARTS 를 같이 고치고 재빌드해야 한다 (P_START z = press z+0.15).
+#   • GP8_GRIP_OFF=0.02 → 발사점 2cm → FLIGHT_MODEL grip20mm → DB 매칭.
+#   • rt 은 코드 기본 0.05 그대로 (이 DB 가 rt=0.05) — GP8_RELEASE_TIME 안 씀.
+#   • GP8_THROW_WARM_DB → 이 DB 지정.
+# 이전 DB 로 되돌리려면: GP8_THROW_WARM_DB=$PKG_DIR/skills/warm_db.pkl ./이스크립트
+# (warm_db.pkl = 144 교차곱 DB, target x=1.20/1.441/1.683 기준 — 셔플 가능)
+# 이 스크립트 실행에만 export.
+WARM_DB_2CM="$PKG_DIR/skills/warm_db_128_12pairs.pkl"
+export GP8_GRIP_OFF="${GP8_GRIP_OFF:-0.02}"
+export GP8_THROW_WARM_DB="${GP8_THROW_WARM_DB:-$WARM_DB_2CM}"
+# max-z(팔 z 상한) 게이트는 off(99) 유지가 **필수**. warm_db_128_12pairs.pkl 도
+# GP8_MAX_TCP_Z=99 로 빌드돼 아크 z>0.85 인 entry 가 들어 있다. 0.85 로 켜면 그
+# 저장 해가 런타임 재검증에서 기각돼(→ polish/실패) 오히려 문제.
+# ⚠ 팔이 높이 뜬다 — 천장/구조물 여유 확인. (앱/다른 실행은 기본 0.85.)
+# 144 entry 실측 (tools/arc_envelope.py 로 재확인 가능):
+#   target x  아크 z_max(>0.85 개수)   아크 z_min(<0.05)  착탄최악  qd최대
+#     1.20    0.995 (48개 중 11)       0.132 (0)          1.1mm    62.7%
+#     1.45    0.832 (48개 중  0)       0.058 (0)          1.6mm    66.0%
+#     1.70    0.913 (48개 중 22)       0.040 (32)        10.2mm    64.2%
+#   • 천장: 33/144 가 0.85 초과, 최고 0.995m — 가까운 1.20 이 제일 높이 뜬다
+#     (느리게 던지려고 아크를 크게 감아 올림). 먼 1.45 가 오히려 제일 낮다.
+#   • ⚠ **바닥/벨트**: 1.70 목표 48개 중 32개가 아크 최저 TCP z<0.05m, 최저
+#     0.040m 로 빌더 게이트 하한 MIN_TCP_Z(0.04)에 딱 붙어 있다. 게이트는 TCP
+#     기준이라 흡착컵과 매달린 물체는 그보다 더 내려간다 — 1.70 행 첫 실행은
+#     벨트 표면 접촉 여부를 반드시 눈으로 확인할 것.
+#   • 착탄/속도 여유는 전 조합 충분: 최악 10.2mm(게이트 30), qd 최대 66%(한계 100).
+export GP8_MAX_TCP_Z="${GP8_MAX_TCP_Z:-99}"
+# release 타이밍(suction_off 발화 waypoint). 0.0 = 윈도우 중앙 t* 에 발화(선행/지연
+# 없음). Positive=일찍, Negative=늦게. 앱/다른 실행 기본은 -0.1(0.1s 늦게). 이 값은
+# formulation 해시(_formulation_params)에 없어 바꿔도 warm DB 무효화 X — 재빌드 불필요.
+export GP8_RELEASE_LEAD="${GP8_RELEASE_LEAD:-0.0}"
 
 join_semi() { local IFS=";"; echo "$*"; }   # 배열 → "a;b;c"
 
@@ -165,9 +191,11 @@ echo "target: $TARGET_ARG"
 
 echo "=== [4/4] run static_pick_throw ==="
 echo "warm DB : $GP8_THROW_WARM_DB (GP8_GRIP_OFF=$GP8_GRIP_OFF → grip$(awk "BEGIN{printf \"%.0f\", $GP8_GRIP_OFF*1000}")mm)"
+echo "max-z   : GP8_MAX_TCP_Z=$GP8_MAX_TCP_Z$(awk "BEGIN{exit !($GP8_MAX_TCP_Z>1.5)}" && echo '  ⚠ 사실상 OFF — 팔이 높이 뜰 수 있음(천장 확인)')"
+echo "release : GP8_RELEASE_LEAD=$GP8_RELEASE_LEAD s (0=t* 중앙, +일찍 -늦게; rt=0.05 기본)"
 [ -f "$GP8_THROW_WARM_DB" ] || echo "  경고: warm DB 파일 없음 — cold 로 진행됨" >&2
 # 배열값 먼저 + CLI 뒤 — argparse는 같은 옵션 중복 시 마지막 것을 쓰므로
 # CLI --points/--target이 배열값을 덮어쓰고, 플래그는 그대로 추가된다.
-# GP8_GRIP_OFF / GP8_THROW_WARM_DB 는 위에서 export 됨 (144 DB 연결).
+# GP8_GRIP_OFF / GP8_THROW_WARM_DB 는 위에서 export 됨 (128-init 12쌍 DB 연결).
 env PYTHONPATH="$WS/src:${PYTHONPATH:-}" \
     "$VENV_PY" -m gp8_control.tests.static_pick_throw "${ARGS[@]}"
