@@ -108,17 +108,20 @@ class Config:
     # end = GRASP_Z. So an un-flagged run descends the hover height onto the normal
     # grasp plane. TRACK_Z_SPEED <= 0 DISABLES tracking and restores the old parked
     # WAIT_AT_GRASP pick.
-    # Defaults below are the values that tracked best on HW at belt 0.223 m/s
-    # (start 0.12 / end 0.03 / speed 0.2). Pass "nan" to restore the derive-from-
+    # Defaults below are the operator's current run configuration
+    # (start 0.12 / end 0.05 / speed 0.3). The earlier HW-tracked set at belt
+    # 0.223 m/s was end 0.03 / speed 0.2 — restore those if the cup starts
+    # missing rather than clearing. Pass "nan" to restore the derive-from-
     # GRASP_Z behaviour (start = GRASP_Z + TRACK_Z_HOVER, end = GRASP_Z).
+    # Mirrored in gp8_bringup.launch.py's track_z_* args — keep both in sync.
     TRACK_Z_START: float = field(       # [m] env GP8_TRACK_Z_START ("nan" -> GRASP_Z + TRACK_Z_HOVER)
         default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "0.12"))
     )
     TRACK_Z_END: float = field(         # [m] env GP8_TRACK_Z_END ("nan" -> GRASP_Z)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "0.03"))
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "0.05"))
     )
     TRACK_Z_SPEED: float = field(       # [m/s] env GP8_TRACK_Z_SPEED (<=0 disables tracking)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.2"))
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.3"))
     )
     # Hover height above GRASP_Z used when TRACK_Z_START is left at NaN. Also the
     # clearance the parked cup keeps over an approaching object before the descend.
@@ -184,12 +187,16 @@ class Config:
     # service round-trip + pneumatic vent lag (object releases after the
     # command is issued). Tune from the measured "IO call" latency in the log.
     # Positive = release earlier; NEGATIVE = release LATER. lead_steps =
-    # round(RELEASE_LEAD * TRAJ_HZ), release_idx = eta_idx - lead_steps, so
-    # -0.1 @ 20 Hz shifts release +2 waypoints (~0.1 s of trajectory time later).
+    # round(RELEASE_LEAD * TRAJ_HZ), release_idx = eta_idx - lead_steps, so at
+    # the current TRAJ_HZ=50 each 0.02 s shifts the release by one waypoint
+    # (-0.1 would shift it +5 waypoints, i.e. 0.1 s LATER).
+    # Default 0.0 = release exactly at the NN's eta waypoint, no correction.
     # Env-overridable (GP8_RELEASE_LEAD) so it can be tuned without a rebuild;
-    # the bringup launch exposes it as `release_lead:=<value>`.
+    # the bringup launch exposes it as `release_lead:=<value>`. The RViz preview
+    # (rviz:=true) logs a recommended value per throw — see ThrowVisualizer.
+    # Mirrored in gp8_bringup.launch.py's release_lead arg — keep both in sync.
     RELEASE_LEAD: float = field(        # [s]  env GP8_RELEASE_LEAD / launch release_lead:=
-        default_factory=lambda: float(os.environ.get("GP8_RELEASE_LEAD", "-0.1"))
+        default_factory=lambda: float(os.environ.get("GP8_RELEASE_LEAD", "0.0"))
     )
     # Z plane used by the runtime RViz point-mass ballistic preview.  This does
     # not affect motion or release control; it only defines where the displayed

@@ -120,8 +120,18 @@ def generate_launch_description():
     # shell-set GP8_RELEASE_LEAD is honored, else -0.1.
     release_lead_arg = DeclareLaunchArgument(
         "release_lead",
-        default_value=EnvironmentVariable("GP8_RELEASE_LEAD", default_value="-0.1"),
+        default_value=EnvironmentVariable("GP8_RELEASE_LEAD", default_value="0.0"),
         description="Throw suction-release lead [s]: +earlier / -later (RELEASE_LEAD).",
+    )
+    # Push stroke CONTACT height (config lives in skills/push_skill.py PUSH_HEIGHT,
+    # which everything else relative — START_LIFT / LIFT_HEIGHT / arc lift / floor
+    # gate — follows; only PUSH_CHAIN_TRANSIT_Z is absolute). Default 0.03 is the
+    # TEMPORARY post-tool-swap value, NOT a calibration — see the PUSH_HEIGHT
+    # comment block in push_skill.py for why and how to resolve it.
+    push_height_arg = DeclareLaunchArgument(
+        "push_height",
+        default_value=EnvironmentVariable("GP8_PUSH_HEIGHT", default_value="0.03"),
+        description="Push stroke contact TCP Z in base frame [m] (PUSH_HEIGHT).",
     )
     # Guaranteed parked vacuum-forming hold before the throw lift (config.py
     # MIN_SUCTION_HOLD). Places the grasp far enough downstream that the arm parks
@@ -146,8 +156,10 @@ def generate_launch_description():
     # track_z_end at track_z_speed. "nan" (default) derives the heights from grasp_z
     # (start = grasp_z + 0.05, end = grasp_z); track_z_speed:=0 disables tracking and
     # restores the old parked wait-at-grasp pick.
-    # track_z_* / track_lead_t defaults below are the values that tracked best on
-    # HW at belt 0.223 m/s. Pass "nan" to restore the derive-from-grasp_z heights.
+    # track_z_* defaults MIRROR config.py's TRACK_Z_* — keep both in sync. Current
+    # set is the operator's run configuration (start 0.12 / end 0.05 / speed 0.3);
+    # the earlier HW-tracked set at belt 0.223 m/s was end 0.03 / speed 0.2.
+    # Pass "nan" to restore the derive-from-grasp_z heights.
     track_z_start_arg = DeclareLaunchArgument(
         "track_z_start",
         default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="0.12"),
@@ -155,12 +167,12 @@ def generate_launch_description():
     )
     track_z_end_arg = DeclareLaunchArgument(
         "track_z_end",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.03"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.05"),
         description="Throw pick: TCP Z the descend ends at [m] (nan -> grasp_z).",
     )
     track_z_speed_arg = DeclareLaunchArgument(
         "track_z_speed",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_SPEED", default_value="0.2"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_SPEED", default_value="0.3"),
         description="Throw pick: descend rate while tracking the belt [m/s] (<=0 disables).",
     )
     track_lead_t_arg = DeclareLaunchArgument(
@@ -187,8 +199,9 @@ def generate_launch_description():
         description="Belt speed source: encoder (default) | camera (infer from tracked objects).",
     )
     rviz_arg = DeclareLaunchArgument(
-        "rviz", default_value="false",
-        description="Start RViz with live throw trajectory/release/ballistic markers.",
+        "rviz", default_value="true",
+        description="Start RViz with live throw trajectory/release/ballistic markers. "
+                    "Pass rviz:=false for a headless run.",
     )
     throw_viz_impact_z_arg = DeclareLaunchArgument(
         "throw_viz_impact_z",
@@ -396,6 +409,8 @@ def generate_launch_description():
             "GP8_MIN_SUCTION_HOLD": LaunchConfiguration("min_suction_hold"),
             # Throw/pick suction wait height: `grasp_z:=` -> GP8_GRASP_Z.
             "GP8_GRASP_Z": LaunchConfiguration("grasp_z"),
+            # Push stroke contact height: `push_height:=` -> GP8_PUSH_HEIGHT.
+            "GP8_PUSH_HEIGHT": LaunchConfiguration("push_height"),
             # Throw pick belt-tracking descend: `track_z_start/end/speed:=`.
             "GP8_TRACK_Z_START": LaunchConfiguration("track_z_start"),
             "GP8_TRACK_Z_END": LaunchConfiguration("track_z_end"),
@@ -435,6 +450,7 @@ def generate_launch_description():
         inc_factor_arg,
         acc_factor_arg,
         release_lead_arg,
+        push_height_arg,
         min_suction_hold_arg,
         grasp_z_arg,
         track_z_start_arg,
