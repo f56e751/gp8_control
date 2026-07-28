@@ -31,12 +31,12 @@ POINTS=(
     "0.40,-0.10,0.04"
     "0.40,-0.20,0.04"
     
-    # "0.50,0.30,0.04"
-    # "0.50,0.20,0.04"
-    # "0.50,0.10,0.04"
-    # "0.50,0.0,0.04"
-    # "0.50,-0.10,0.04"
-    # "0.50,-0.20,0.04"
+    "0.50,0.30,0.04"
+    "0.50,0.20,0.04"
+    "0.50,0.10,0.04"
+    "0.50,0.0,0.04"
+    "0.50,-0.10,0.04"
+    "0.50,-0.20,0.04"
 )
 
 # ============================================================================
@@ -46,18 +46,18 @@ POINTS=(
 TARGETS=(
     "1.20,0.225,0.02"
     "1.20,0.075,0.02"
-    # "1.20,-0.075,0.02"
-    # "1.20,-0.225,0.02"
+    "1.20,-0.075,0.02"
+    "1.20,-0.225,0.02"
 
-    # "1.441,0.225,0.085"
-    # "1.441,0.075,0.085"
+    "1.441,0.225,0.085"
+    "1.441,0.075,0.085"
     "1.441,-0.075,0.085"
     "1.441,-0.225,0.085"
 
     "1.683,0.225,0.15"
     "1.683,0.075,0.15"
-    # "1.683,-0.075,0.15"
-    # "1.683,-0.225,0.15"
+    "1.683,-0.075,0.15"
+    "1.683,-0.225,0.15"
 )
 
 # 항상 붙는 추가 옵션 (예: "--vel-scale" "0.3", 셔플 재현은 "--seed" "42", "--shuffle-points" )
@@ -75,6 +75,19 @@ PKG_DIR="$WS/src/gp8_control"
 VENV_PY="$PKG_DIR/.venv/bin/python"
 DRIVER_LOG="/tmp/gp8_driver_bringup.log"
 JTC_ACTION="/joint_trajectory_controller/follow_joint_trajectory"
+
+# ── 144 교차곱(4cm/grip40mm) warm DB 연결 ──────────────────────────────────
+# 이 테스트를 skills/warm_db_grip40_144.pkl (12 start × 12 target 교차곱, GRIP_OFF
+# 4cm 로 빌드) 로 돌린다. 위 POINTS/TARGETS 가 DB 그리드와 일치하고 교차곱이라
+# --shuffle-points 여도 모든 (point,target) 조합이 exact-match (계획 ~0.1s).
+#   • GP8_GRIP_OFF=0.04 → 플래너 GRIP_OFF/launch_state 발사점이 4cm → FLIGHT_MODEL
+#     grip40mm → DB formulation 매칭 (안 맞으면 로더가 entry 무시하고 cold 재풀이).
+#   • GP8_THROW_WARM_DB → warm DB 파일을 144 DB 로 지정.
+# 둘 다 이 스크립트 실행에만 export (기본 2cm + warm_db.pkl 은 앱/다른 실행 그대로).
+# 연결 해제하려면 아래 두 export 를 주석 처리(그러면 기본 2cm + warm_db.pkl).
+WARM_DB_144="$PKG_DIR/skills/warm_db_grip40_144.pkl"
+export GP8_GRIP_OFF="${GP8_GRIP_OFF:-0.04}"
+export GP8_THROW_WARM_DB="${GP8_THROW_WARM_DB:-$WARM_DB_144}"
 
 join_semi() { local IFS=";"; echo "$*"; }   # 배열 → "a;b;c"
 
@@ -151,7 +164,10 @@ echo "target: $TARGET_ARG"
 [ "$#" -gt 0 ] && echo "cli   : $*"
 
 echo "=== [4/4] run static_pick_throw ==="
+echo "warm DB : $GP8_THROW_WARM_DB (GP8_GRIP_OFF=$GP8_GRIP_OFF → grip$(awk "BEGIN{printf \"%.0f\", $GP8_GRIP_OFF*1000}")mm)"
+[ -f "$GP8_THROW_WARM_DB" ] || echo "  경고: warm DB 파일 없음 — cold 로 진행됨" >&2
 # 배열값 먼저 + CLI 뒤 — argparse는 같은 옵션 중복 시 마지막 것을 쓰므로
 # CLI --points/--target이 배열값을 덮어쓰고, 플래그는 그대로 추가된다.
+# GP8_GRIP_OFF / GP8_THROW_WARM_DB 는 위에서 export 됨 (144 DB 연결).
 env PYTHONPATH="$WS/src:${PYTHONPATH:-}" \
     "$VENV_PY" -m gp8_control.tests.static_pick_throw "${ARGS[@]}"

@@ -142,6 +142,14 @@ MIN_TCP_X: float = 0.20
 MIN_TCP_Z: float = 0.04
 MAX_TCP_Z: float = 0.85
 
+# DB 재사용(고속 경로) 허용치. target 은 tight(2mm) — 저장 궤적의 착탄이 그대로
+# 쓰이므로 target 을 넓히면 착지가 그만큼 어긋난다. 시작자세(p_lift)는 넓게(1.5cm)
+# — 저장 throw arc 는 q_start 에서 출발하는 관절 궤적이라, 물체를 그 자세까지 lift
+# 만 하면 던지기·착탄은 DB 와 동일하고 시작 편차는 lift 구간의 작은 드래그로 흡수됨.
+# 2mm 밖이면 매번 full NLP 재풀이(1~10s, W_ACC 1e6 stiff)로 떨어지던 문제를 없앤다.
+EXACT_TARGET_TOL: float = 2e-3     # target 매칭 2mm (착탄 정확도 보존)
+REUSE_START_TOL: float = 0.015     # 시작자세(p_lift) 재사용 1.5cm (grasp 지터 흡수)
+
 # cold multistart 초기해 변형 (lift 높이 시작 z≈0.7 기준). IPOPT는 local
 # solver라 한 초기해의 basin이 infeasible하면 실패만 반환 → 순차 재시도.
 # (sim처럼 fork 병렬화하지 않는 이유: ROS2 노드에서 fork는 DDS 스레드와
@@ -629,32 +637,40 @@ class RobustThrowSkill(ManipulationSkill):
         db = _load_warm_db(ctx.log)
         res, how = None, ""
 
-        # ---- ① exact-match 고속 경로: 저장된 최적 궤적을 그대로 사용 (재풀이 생략) --
-        # 이 (시작자세 p_lift, target) 쌍의 해가 DB에 이미 있으면 NLP 재풀이(실측
-        # 3~14s)를 건너뛰고 저장 궤적(P, t_f, t_star)을 그대로 dispatch 한다 —
-        # 결정적 static test(런타임 쌍 = 빌더 PAIRED 쌍)에선 계획 시간이 ~0.
-        # 저장 해는 빌더 게이트를 이미 통과했지만 실기 안전상 _solution_gates 로
-        # 재검증하고, q_lift 를 entry 의 q_start 로 맞춰 lift 가 저장 arc(P[0]=q_start)
-        # 와 연속이 되게 한다. (매칭 허용 2mm — 같은 산술로 만든 좌표라 실질 정확.)
+        # ---- ① exact/near-match 고속 경로: 저장된 최적 궤적을 그대로 사용 (재풀이 생략) --
+        # target 이 (거의) 같은 entry 중 시작자세(p_lift)가 가장 가까운 것을 골라, NLP
+        # 재풀이(실측 3~14s)를 건너뛰고 저장 궤적(P, t_f, t_star)을 그대로 dispatch 한다.
+        # target 은 EXACT_TARGET_TOL(2mm)로 tight(착탄=DB entry 그대로), 시작자세는
+        # REUSE_START_TOL(1.5cm)까지 허용 — q_lift 를 entry 의 q_start 로 맞춰 lift 가
+        # 저장 arc(P[0]=q_start)와 연속이 되게 하면, 시작 편차는 lift 구간의 작은
+        # 드래그로 흡수되고 던지기·착탄은 DB 와 동일하다 (실기 grasp 지터 대응).
+        # 저장 해는 빌더 게이트를 이미 통과했지만 실기 안전상 _solution_gates 로 재검증.
         if db:
+            best_e, best_ds = None, np.inf
             for e in db:
                 ps = e.get("p_start")
                 if ps is None:
                     continue
-                if (float(np.linalg.norm(np.asarray(e["target"]) - p_target)) < 2e-3
-                        and float(np.linalg.norm(np.asarray(ps, float) - p_lift)) < 2e-3):
-                    cand = dict(
-                        P=np.asarray(e["P"], float), t_f=float(e["t_f"]),
-                        t_star=float(e["t_star"]), J=float(e["J"]),
-                        release_time=THROW_WINDOW_T, lam_g=e.get("lam_g"),
-                        u_pos=e.get("u_pos"),
-                        pos_viol_dense=float(e.get("pos_viol_dense", 0.0)))
-                    why = self._solution_gates(cand, p_target)
-                    if why is None:
-                        res, how = cand, "exact-DB"
-                        q_lift = np.asarray(e["q_start"], dtype=float)
-                        break
-                    ctx.log.info(f"exact-DB 게이트 기각: {why} — polish 로 진행")
+                if float(np.linalg.norm(np.asarray(e["target"]) - p_target)) >= EXACT_TARGET_TOL:
+                    continue
+                ds = float(np.linalg.norm(np.asarray(ps, float) - p_lift))
+                if ds < best_ds:
+                    best_e, best_ds = e, ds
+            if best_e is not None and best_ds <= REUSE_START_TOL:
+                e = best_e
+                cand = dict(
+                    P=np.asarray(e["P"], float), t_f=float(e["t_f"]),
+                    t_star=float(e["t_star"]), J=float(e["J"]),
+                    release_time=THROW_WINDOW_T, lam_g=e.get("lam_g"),
+                    u_pos=e.get("u_pos"),
+                    pos_viol_dense=float(e.get("pos_viol_dense", 0.0)))
+                why = self._solution_gates(cand, p_target)
+                if why is None:
+                    res, how = cand, ("exact-DB" if best_ds < 2e-3
+                                      else f"reuse-DB({best_ds * 1e3:.0f}mm)")
+                    q_lift = np.asarray(e["q_start"], dtype=float)
+                else:
+                    ctx.log.info(f"reuse-DB 게이트 기각: {why} — polish 로 진행")
 
         # ---- ② 세션 캐시 + 파일 DB 최근접으로 warm start polish (재풀이) ----
         if res is None:
