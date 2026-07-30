@@ -153,7 +153,7 @@ Q_LO[0], Q_HI[0] = np.deg2rad(-60.0), np.deg2rad(60.0)
 # L(어깨 pitch, index 1): 뒤로 젖힘 ≤ 15° (2026-07-22 사용자 규칙). FK 확인:
 # q_L 음수 = 뒤로 (TCP x 감소; −15°에서 x ~0.55m). L은 부호 안 뒤집히는 축이라
 # URDF 컨벤션도 동일하게 q_L ≥ −15°.
-Q_LO[1] = np.deg2rad(-15.0)
+Q_LO[1] = np.deg2rad(float(os.environ.get("GP8_L_LO_DEG", "-15.0")))   # 로봇 J2 하한(=planner, 비반전축). GP8_L_LO_DEG 오버라이드.
 # L 상한: **q_L ≤ +30°** (2026-07-24 사용자 규칙). L은 SIGN=+1이라 플래너=로봇
 # 규약이 같아 그대로 로봇 J2 ≤ +30°를 뜻한다. 실기 한계(+145°)보다 훨씬 안쪽이라
 # dispatch 게이트 정합은 자동 충족되고, 목적은 자세 제한 — q_L이 커질수록 팔이
@@ -167,7 +167,7 @@ Q_HI[1] = np.deg2rad(30.0)
 # "U를 45도로 완화해"). 플래너 컨벤션은 '위 = 음수 q_U' (q_U_urdf = −q_U_planner,
 # corr(z_TCP, −q_U)=0.99)라 뒤집으면 플래너 범위 [−45°, +113°] — 하한만 여기서
 # 덮고 상한 +113°는 GP8_Q_MAX(정정된 datasheet)에서 옴.
-Q_LO[2] = np.deg2rad(-45.0)
+Q_LO[2] = np.deg2rad(float(os.environ.get("GP8_U_LO_DEG", "-45.0")))   # planner U 하한 = 로봇 J3 상한(부호반전: robot J3_max = -Q_LO[2]). GP8_U_LO_DEG 오버라이드.
 # U 상한: **로봇 J3 ≥ −45°** (2026-07-24 사용자 규칙). U는 SIGN=−1이라
 # 로봇 J3 = −q_U → J3 ≥ −45° ⟺ **q_U ≤ +45°**. Q_LO[2]=−45°와 합쳐 플래너
 # [−45°, +45°] = 로봇 J3 [−45°, +45°] (대칭).
