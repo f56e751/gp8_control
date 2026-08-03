@@ -132,6 +132,37 @@ detections. The existing grasp behaviour is retained by deriving its target
 from the transformed box centre. It also subscribes to `/conveyor/speed` for
 the back-projection. A live TUI shows raw vs corrected positions.
 
+#### Perception 네트워크/잔여 지연 측정
+
+카메라 PC에서 최신 `iitp_perception`의 live pipeline을 먼저 실행한다. 같은 8080
+포트의 `/latency`와 `/detections/stream`을 함께 사용하므로 별도 probe 서버는 없다.
+
+```bash
+# 카메라 PC (iitp_perception)
+./docker_local.sh
+# 이미 필요한 Python/CUDA 환경 안에 있다면: python3 main.py
+```
+
+그 상태에서 이 로봇 PC에서 다음을 실행한다.
+
+```bash
+python3 tools/measure_perception_latency.py \
+  --server http://<camera-pc-ip>:8080 \
+  --probes 40 --records 60
+```
+
+출력 마지막의 권장값을 `camera_debug` 실행 전에 적용한다.
+
+```bash
+export GP8_PERCEPTION_LATENCY_S=<출력된 값>
+export GP8_PERCEPTION_URL=http://<camera-pc-ip>:8080/detections/stream
+ros2 run gp8_control camera_debug
+```
+
+권장값은 모델 추론시간(`elapsed_s`)을 제외한 serialization + stream + network의
+중앙값이다. `camera_debug`가 `elapsed_s`와 frame age를 별도로 더하므로 출력값을
+그대로 사용해야 하며, 전체 end-to-end 값과 다시 합치면 추론시간이 중복된다.
+
 ### Skill 선택 — throw만 / push만 실행 (디버그)
 
 `gp8_manager` 는 매 객체를 `ActionSelector` 가 push/throw 스킬로 라우팅합니다.
