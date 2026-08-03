@@ -135,10 +135,11 @@ class Config:
     # with TRACK_LEAD_T ~= d/v (e.g. 5 cm behind at 0.10 m/s -> ~0.5). Positive =
     # earlier; too large lands the cup ahead of a late object. Only applied in
     # TRACK_DESCEND (see ThrowSkill.arrival_lead). env/launch/CLI overridable.
-    # Default 0.3 tracked best on HW at belt 0.223 m/s.
+    # Default 0.0: perception capture-to-receipt latency is now compensated
+    # live by camera_debug. Keep this only as an explicit empirical override.
     #   GP8_TRACK_LEAD_T / track_lead_t:= / --track-lead-t   [s]
     TRACK_LEAD_T: float = field(        # [s] env GP8_TRACK_LEAD_T
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_LEAD_T", "0.3"))
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_LEAD_T", "0.0"))
     )
     GRASP_Z: float = 0.062
     # Baseline wrist (joint 6, rad) for EVERY pick/aim/park pose. The suction

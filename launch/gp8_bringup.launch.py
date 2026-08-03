@@ -177,7 +177,7 @@ def generate_launch_description():
     )
     track_lead_t_arg = DeclareLaunchArgument(
         "track_lead_t",
-        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.3"),
+        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.0"),
         description="Throw pick: start the tracking descend this many s EARLIER to "
                     "cancel a downstream landing offset (~= miss[m]/belt[m/s]).",
     )
