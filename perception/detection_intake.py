@@ -72,10 +72,7 @@ class DetectionIntake:
 
     def __init__(self, eps: float, drift_frac: float = 0.25,
                  eps_y_max: float = 0.20, merge_eps_y_max: float = 0.10,
-                 assoc: str = "hungarian",
-                 vel_window_s: float = 1.5, vel_min_anchors: int = 4,
-                 vel_min_span_s: float = 0.3, vel_max_rms: float = 0.02,
-                 vel_clamp_frac: float = 0.25) -> None:
+                 assoc: str = "hungarian") -> None:
         #: spatial match radius [m] — OBJECT_MATCH_EPSILON on the app Config.
         self.eps = eps
         #: belt-direction tolerance growth per second of dead reckoning, as a
@@ -87,19 +84,6 @@ class DetectionIntake:
         self.merge_eps_y_max = merge_eps_y_max
         #: 검출↔트랙 연관 방식 (Config.TRACK_ASSOC): "hungarian" | "greedy".
         self.assoc = assoc
-        #: per-object velocity-fit policy (Config.OBJECT_VEL_*).
-        self.vel_window_s = vel_window_s
-        self.vel_min_anchors = vel_min_anchors
-        self.vel_min_span_s = vel_min_span_s
-        self.vel_max_rms = vel_max_rms
-        self.vel_clamp_frac = vel_clamp_frac
-        #: track_ids already logged as speed-deviating (one line per object).
-        self._vel_logged: set = set()
-        #: optional callback(v_fit) — CameraSpeedTracker.observe 등, 품질 게이트를
-        #: 통과한 물체별 속도 fit의 소비자. 벨트-밴드 클램프 **이전에** 호출한다:
-        #: camera 모드에선 클램프 기준(벨트 속도)이 바로 이 소비자의 추정치라,
-        #: 클램프 뒤에 보고하면 잘못된 초기 fallback에 갇혀 수렴하지 못한다.
-        self.speed_sink = None
 
     def _associate_hungarian(self, tracks, dets, v, detect_time):
         """프레임 전역 최적 연관 (Hungarian / scipy linear_sum_assignment).
@@ -134,54 +118,6 @@ class DetectionIntake:
         matched_j = {j for _, j in ok}
         return ([(tracks[i], dets[j]) for i, j in ok],
                 [dd for j, dd in enumerate(dets) if j not in matched_j])
-
-    def _update_velocity(self, obj, t: float, y: float, v_belt: float,
-                         logger=None) -> None:
-        """Append one (t, y) anchor and refit ``obj.v_est`` if the fit is trusted.
-
-        Belt travels -Y, so the anchor slope dy/dt is -v; v_est = -slope. The fit
-        is accepted only when there are enough anchors spanning enough time with a
-        small residual, AND the result sits within ``belt*(1 +/- clamp_frac)`` —
-        a fit outside that band is far more likely a mis-association or a bad
-        detection than a real >clamp speed, so it is rejected and the previous
-        v_est (or the global belt fallback) stands. Frozen when re-detections stop.
-        """
-        obj.y_anchors.append((float(t), float(y)))
-        cutoff = t - self.vel_window_s
-        obj.y_anchors = [(ta, ya) for (ta, ya) in obj.y_anchors if ta >= cutoff]
-        n = len(obj.y_anchors)
-        if n < self.vel_min_anchors:
-            return
-        ts = np.array([a[0] for a in obj.y_anchors], dtype=float)
-        ys = np.array([a[1] for a in obj.y_anchors], dtype=float)
-        if ts[-1] - ts[0] < self.vel_min_span_s:
-            return
-        # LSQ line fit y = slope*(t - t0) + b (t0-shift keeps the matrix well
-        # conditioned; wall-clock t values are huge).
-        A = np.vstack([ts - ts[0], np.ones(n)]).T
-        coef, *_ = np.linalg.lstsq(A, ys, rcond=None)
-        v_fit = -float(coef[0])
-        rms = float(np.sqrt(np.mean((ys - A @ coef) ** 2)))
-        if rms > self.vel_max_rms:
-            return                            # noisy/inconsistent — keep fallback
-        if self.speed_sink is not None:       # 클램프 이전 보고 (docstring 참고)
-            self.speed_sink(v_fit, obj.track_id)
-        if v_belt > 0.02:                     # clamp to belt band (skip if belt ~0)
-            lo, hi = v_belt * (1 - self.vel_clamp_frac), v_belt * (1 + self.vel_clamp_frac)
-            if not (lo <= v_fit <= hi):
-                return                        # out of band — reject as mis-association
-        obj.v_est = v_fit
-        # One diagnostic line per object when its speed deviates notably from the
-        # belt — this is the signal to confirm the rolling-can hypothesis on HW.
-        if (logger is not None and v_belt > 0.02
-                and abs(v_fit - v_belt) / v_belt > 0.10
-                and obj.track_id not in self._vel_logged):
-            self._vel_logged.add(obj.track_id)
-            logger.info(
-                f"[track-VEL] id={obj.track_id} {obj.class_name}: v_est "
-                f"{v_fit:.3f} m/s vs belt {v_belt:.3f} "
-                f"({100 * (v_fit - v_belt) / v_belt:+.0f}%, {n} anchors)"
-            )
 
     def _grown_eps_y(self, age: float, v: float, cap: float) -> float:
         """Belt-direction window for a track last seen ``age`` s ago.
@@ -283,10 +219,6 @@ class DetectionIntake:
             match.base_bbox_grasp = _freeze_bbox(dd["base_bbox_grasp"])
             match.base_bbox_aim = _freeze_bbox(dd["base_bbox_aim"])
             match.conf = dd["conf"]
-            # Record this sighting for the per-object speed fit (uses the same
-            # match verdict as identity — no extra association needed, so the
-            # anchors follow whatever TRACK_ASSOC decided this frame).
-            self._update_velocity(match, detect_time, dd["y"], v, logger)
             # Class is VOTED, not latched: add this frame's confidence-weighted
             # vote and adopt the running argmax (spawn frame is often the noisy
             # entry-edge frame). Log only the flip (no per-frame spam).
@@ -341,7 +273,6 @@ class DetectionIntake:
             # spawn class isn't flipped by one stray frame, but a low-confidence one
             # (the usual misfire) is easily outvoted. class_name stays det_class here.
             new_obj.vote_class(dd["cls"], dd["conf"])
-            self._update_velocity(new_obj, detect_time, dd["y"], v, logger)  # seed anchor
             queue.add(new_obj)
             existing.append(new_obj)  # dedupe within the same intake too
             if logger is not None:

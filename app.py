@@ -25,7 +25,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.conveyor import CameraSpeedTracker, ConveyorSpeedTracker
+from gp8_control.conveyor import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -121,11 +121,6 @@ class GP8App:
             eps_y_max=self.cfg.OBJECT_MATCH_EPS_Y_MAX,
             merge_eps_y_max=self.cfg.OBJECT_MERGE_EPS_Y_MAX,
             assoc=self.cfg.TRACK_ASSOC,
-            vel_window_s=self.cfg.OBJECT_VEL_WINDOW_S,
-            vel_min_anchors=self.cfg.OBJECT_VEL_MIN_ANCHORS,
-            vel_min_span_s=self.cfg.OBJECT_VEL_MIN_SPAN_S,
-            vel_max_rms=self.cfg.OBJECT_VEL_MAX_RMS,
-            vel_clamp_frac=self.cfg.OBJECT_VEL_CLAMP_FRAC,
         )
 
     # ------------------------------------------------------------------
@@ -157,26 +152,13 @@ class GP8App:
             String, "/camera_debug/detections",
             self._on_camera_debug_detections, 10,
         )
-        # Belt-speed source (cfg.CONVEYOR_SOURCE): 기본 "encoder"는 기존
-        # ConveyorSpeedTracker 그대로. "camera"는 엔코더 없이 지나가는 물체들의
-        # 속도 fit(detection_intake._update_velocity)을 집계해 추론 —
-        # speed_sink로 fit을 공급받고, CONVEYOR_TOPIC 발행도 대신한다.
-        if str(self.cfg.CONVEYOR_SOURCE).strip().lower() == "camera":
-            self.conveyor = CameraSpeedTracker(
-                self._node,
-                self.cfg.CONVEYOR_TOPIC,
-                self.cfg.CONVEYOR_SPEED,
-                self.cfg.CONVEYOR_STALE_SECONDS,
-                batch_n=self.cfg.CONVEYOR_CAMERA_BATCH_N,
-            )
-            self.detection_intake.speed_sink = self.conveyor.observe
-        else:
-            self.conveyor = ConveyorSpeedTracker(
-                self._node,
-                self.cfg.CONVEYOR_TOPIC,
-                self.cfg.CONVEYOR_SPEED,
-                self.cfg.CONVEYOR_STALE_SECONDS,
-            )
+        # Encoder telemetry is the single source of truth for belt speed.
+        self.conveyor = ConveyorSpeedTracker(
+            self._node,
+            self.cfg.CONVEYOR_TOPIC,
+            self.cfg.CONVEYOR_SPEED,
+            self.cfg.CONVEYOR_STALE_SECONDS,
+        )
 
         self.traj_ctrl.wait_for_servers()
         # Now that every subscription + service/action client exists and servers
