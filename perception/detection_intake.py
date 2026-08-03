@@ -84,8 +84,12 @@ class DetectionIntake:
         self.merge_eps_y_max = merge_eps_y_max
         #: 검출↔트랙 연관 방식 (Config.TRACK_ASSOC): "hungarian" | "greedy".
         self.assoc = assoc
+        #: camera_debug republishes its latest snapshot on a timer.  Process each
+        #: receipt timestamp once so class votes/association are frame-based.
+        self._last_receipt_time: float | None = None
 
-    def _associate_hungarian(self, tracks, dets, v, detect_time):
+    def _associate_hungarian(self, tracks, dets, v, detect_time,
+                             belt_distance_m=None):
         """프레임 전역 최적 연관 (Hungarian / scipy linear_sum_assignment).
 
         "전체 거리" = 채택된 (트랙, 검출) 짝들의 창-정규화 거리의 합. 이 합이
@@ -103,7 +107,7 @@ class DetectionIntake:
         for i, o in enumerate(tracks):
             age = detect_time - o.detect_time
             ox = float(o.T_grasp_base[0, 3])
-            oy = float(o.T_grasp_base[1, 3] - v * age)
+            oy = o.y_at(detect_time, v, belt_distance_m)
             eps_y = self._eps_y(age, v)
             for j, dd in enumerate(dets):
                 ndx = abs(ox - dd["x"]) / self.eps
@@ -147,6 +151,7 @@ class DetectionIntake:
         active_target: "Optional[TrackedObject]",
         v: float,
         logger=None,
+        belt_distance_m: float | None = None,
     ) -> int:
         """Update ``queue`` from one ``/camera_debug/detections`` snapshot.
 
@@ -161,6 +166,11 @@ class DetectionIntake:
         """
         if snapshot is None:
             return 0
+        detect_time = float(snapshot.get("receipt_time", time.time()))
+        if (self._last_receipt_time is not None
+                and detect_time <= self._last_receipt_time):
+            return 0
+        self._last_receipt_time = detect_time
         detections = [
             d for d in snapshot.get("detections", []) if d.get("in_workspace")
         ]
@@ -170,8 +180,6 @@ class DetectionIntake:
         # camera_debug already applied the camera→base transform, Z offsets, and
         # v*delay back-projection. ``receipt_time`` is the moment for which the
         # corrected positions are valid; the queue extrapolates forward from there.
-        detect_time = float(snapshot.get("receipt_time", time.time()))
-
         # Project every existing tracked object (active target + queue) forward to
         # ``detect_time``; a detection within ``eps`` of one is the SAME object.
         existing: list[TrackedObject] = []
@@ -183,7 +191,7 @@ class DetectionIntake:
         def _matches(obj: TrackedObject, det_x: float, det_y: float) -> bool:
             age = detect_time - obj.detect_time
             ox = float(obj.T_grasp_base[0, 3])
-            oy = float(obj.T_grasp_base[1, 3] - v * age)
+            oy = obj.y_at(detect_time, v, belt_distance_m)
             return (abs(ox - det_x) < eps
                     and abs(oy - det_y) < self._eps_y(age, v))
 
@@ -206,18 +214,21 @@ class DetectionIntake:
             ))
 
         def _reanchor(match: TrackedObject, dd: dict) -> None:
-            # Re-anchor the existing track to this fresh detection instead of
-            # adding a duplicate. Resetting the extrapolation reference
-            # (detect_time + pose) every frame keeps drift below the window so a
-            # 2nd "object" never spawns at the same spot.
+            # Keep the FIRST detection's Y/time/encoder anchor for control.
+            # Re-detections still refine lane X, Z/display geometry, confidence,
+            # and class, but a perspective-shifting bbox centre cannot push a
+            # queued object upstream and make every 2nd+ pick wait too long.
             nonlocal refreshed
-            match.T_aim_base = _make_transform(_R_GRASP_DEFAULT, dd["aim"])
-            match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, dd["grasp"])
-            match.detect_time = detect_time
+            match.T_aim_base[0, 3] = dd["aim"][0]
+            match.T_aim_base[2, 3] = dd["aim"][2]
+            match.T_grasp_base[0, 3] = dd["grasp"][0]
+            match.T_grasp_base[2, 3] = dd["grasp"][2]
             match.cam_pos = tuple(dd["cam"])
             match.cam_bbox = _freeze_bbox(dd["cam_bbox"])
             match.base_bbox_grasp = _freeze_bbox(dd["base_bbox_grasp"])
             match.base_bbox_aim = _freeze_bbox(dd["base_bbox_aim"])
+            match.bbox_encoder_distance_m = belt_distance_m
+            match.bbox_detect_time = detect_time
             match.conf = dd["conf"]
             # Class is VOTED, not latched: add this frame's confidence-weighted
             # vote and adopt the running argmax (spawn frame is often the noisy
@@ -239,7 +250,7 @@ class DetectionIntake:
         # 거리 합) 최소 조합. greedy: 구 선착순 (검출마다 창 안 첫 트랙).
         if self.assoc == "hungarian":
             pairs, unmatched = self._associate_hungarian(
-                existing, dets, v, detect_time)
+                existing, dets, v, detect_time, belt_distance_m)
         else:
             pairs, unmatched = [], []
             for dd in dets:
@@ -263,10 +274,13 @@ class DetectionIntake:
                 T_grasp_base=_make_transform(_R_GRASP_DEFAULT, dd["grasp"]),
                 class_name=dd["cls"],
                 detect_time=detect_time,
+                encoder_distance_m=belt_distance_m,
                 cam_pos=tuple(dd["cam"]),
                 cam_bbox=_freeze_bbox(dd["cam_bbox"]),
                 base_bbox_grasp=_freeze_bbox(dd["base_bbox_grasp"]),
                 base_bbox_aim=_freeze_bbox(dd["base_bbox_aim"]),
+                bbox_encoder_distance_m=belt_distance_m,
+                bbox_detect_time=detect_time,
                 conf=dd["conf"],
             )
             # Seed the class vote with the spawn frame's confidence so a confident
@@ -291,6 +305,7 @@ class DetectionIntake:
         # picks at empty space.
         merged = queue.merge_duplicates(
             detect_time, v, self.eps, self._eps_y_merge, logger=logger,
+            belt_distance_m=belt_distance_m,
         )
         added = max(0, added - merged)
 

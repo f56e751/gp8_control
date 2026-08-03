@@ -158,6 +158,7 @@ class GP8App:
             self.cfg.CONVEYOR_TOPIC,
             self.cfg.CONVEYOR_SPEED,
             self.cfg.CONVEYOR_STALE_SECONDS,
+            distance_topic=self.cfg.CONVEYOR_DISTANCE_TOPIC,
         )
 
         self.traj_ctrl.wait_for_servers()
@@ -521,13 +522,23 @@ class GP8App:
 
         def _serialize(obj: TrackedObject, is_target: bool) -> dict:
             age = now - obj.detect_time
-            y_now = float(obj.T_grasp_base[1, 3] - v * age)
+            distance_now = self.conveyor.distance_at(now)
+            y_now = float(obj.y_at(now, v, distance_now))
             cam = obj.cam_pos
             base_bbox = obj.base_bbox_grasp
             base_bbox_now = None
             if base_bbox is not None:
+                if (obj.bbox_encoder_distance_m is not None
+                        and distance_now is not None):
+                    bbox_travel = distance_now - obj.bbox_encoder_distance_m
+                else:
+                    bbox_time = (
+                        obj.bbox_detect_time
+                        if obj.bbox_detect_time is not None else obj.detect_time
+                    )
+                    bbox_travel = v * (now - bbox_time)
                 base_bbox_now = [
-                    [float(point[0]), float(point[1]) - v * age, float(point[2])]
+                    [float(point[0]), float(point[1]) - bbox_travel, float(point[2])]
                     for point in base_bbox
                 ]
             return {
@@ -577,9 +588,15 @@ class GP8App:
         detection→queue association lives there; the app keeps only the
         frame-gate bookkeeping keyed on whether anything new was added.
         """
+        receipt_time = (
+            float(self._cam_latest.get("receipt_time", now))
+            if self._cam_latest is not None else now
+        )
+        belt_distance_at_detection = self.conveyor.distance_at(receipt_time)
         added = self.detection_intake.ingest(
             self._cam_latest, self.queue, self._active_target,
             self.conveyor.current, self._node.get_logger(),
+            belt_distance_m=belt_distance_at_detection,
         )
         if added:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
@@ -611,7 +628,10 @@ class GP8App:
         self._publish_belt_state()                # live belt + queue snapshot
 
         self._ingest_detections(now)
-        self.queue.update(now, self.conveyor.current)
+        self.queue.update(
+            now, self.conveyor.current,
+            belt_distance_m=self.conveyor.distance_m,
+        )
         if not self.queue:
             self.frame_gate.reset()
             time.sleep(self.cfg.TIME_STEP)

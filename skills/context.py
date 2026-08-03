@@ -127,8 +127,9 @@ class SkillContext:
         Use the conveyor encoder speed consistently for dead reckoning, intercept
         planning, and arrival waits.
         """
-        v_obj = v
-        return target.T_grasp_base[1, 3] - v_obj * (now - target.detect_time)
+        distance_at = getattr(self.conveyor, "distance_at", None)
+        belt_distance = distance_at(now) if callable(distance_at) else None
+        return target.y_at(now, v, belt_distance)
 
     def log_action_timing(self, target: "TrackedObject", intercept_y: float, tag: str) -> None:
         """DIAGNOSTIC: object position vs the intercept at the instant the action fires.
@@ -368,7 +369,15 @@ class SkillContext:
             now = time.time()
             self.intake(now)
             if self.queue is not None:
-                self.queue.update(now, self.conveyor.current if self.conveyor else 0.0)
+                self.queue.update(
+                    now,
+                    self.conveyor.current if self.conveyor else 0.0,
+                    belt_distance_m=(
+                        self.conveyor.distance_at(now)
+                        if callable(getattr(self.conveyor, "distance_at", None))
+                        else None
+                    ),
+                )
             # Clamp non-negative: the loop body (spin + intake + queue.update)
             # can overrun the remaining time-to-deadline, making the delta
             # negative -> time.sleep() would raise "sleep length must be

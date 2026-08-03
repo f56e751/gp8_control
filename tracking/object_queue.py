@@ -1,9 +1,8 @@
 """Persistent tracked-object queue with conveyor-motion compensation.
 
-Each entry remembers ``detect_time`` so its current Y is recomputed every
-epoch from the live conveyor speed. Anything past ``-max_reach`` is
-dropped, the rest sorted ascending by current Y so the head is the next
-reachable target.
+Each entry remembers the encoder distance at first detection so its current Y
+is recomputed from actual belt travel.  ``speed * age`` remains a legacy
+fallback until the distance topic's first sample arrives.
 
 Frame-cooldown timing lives in ``FrameGate`` — this module is purely
 about object lifecycle.
@@ -29,6 +28,10 @@ class TrackedObject:
     T_grasp_base: np.ndarray
     class_name: str
     detect_time: float       # time.time() when this object was observed
+    # Continuous encoder distance [m] corresponding to detect_time.  The
+    # control Y anchor is intentionally frozen at first detection; later camera
+    # frames update appearance/X but cannot move a queued object upstream.
+    encoder_distance_m: float | None = None
     # Raw camera-frame position [cx, cy, cz] (m) reported by the perception
     # stream, kept verbatim for belt_viz / diagnostics. None on legacy paths.
     cam_pos: tuple | None = None
@@ -38,6 +41,10 @@ class TrackedObject:
     cam_bbox: tuple | None = None
     base_bbox_grasp: tuple | None = None
     base_bbox_aim: tuple | None = None
+    # BBox is visualization/output data and may refresh after the frozen control
+    # anchor, so retain its own encoder/time reference.
+    bbox_encoder_distance_m: float | None = None
+    bbox_detect_time: float | None = None
     # Latest detection confidence (camera_debug "confidence"); -1.0 until set.
     # Updated on every dedup re-anchor so it reflects the most recent sighting.
     conf: float = -1.0
@@ -55,6 +62,14 @@ class TrackedObject:
     # live each epoch (a class re-vote can re-route the object to a skill
     # without a veto) — only the LOG is once-per-track.
     veto_logged: bool = False
+
+    def y_at(self, now: float, conveyor_speed: float,
+             belt_distance_m: float | None = None) -> float:
+        """Current control Y from encoder travel, with speed×age fallback."""
+        anchor_y = float(self.T_grasp_base[1, 3])
+        if self.encoder_distance_m is not None and belt_distance_m is not None:
+            return anchor_y - (float(belt_distance_m) - self.encoder_distance_m)
+        return anchor_y - float(conveyor_speed) * (float(now) - self.detect_time)
 
     def vote_class(self, cls: str, conf: float) -> str:
         """Add a confidence-weighted vote for ``cls``; return the winning class.
@@ -107,7 +122,8 @@ class TrackedObjectQueue:
         return self._objects.pop(0)
 
     def merge_duplicates(self, now: float, v: float, eps_x: float,
-                         eps_y_fn, logger=None) -> int:
+                         eps_y_fn, logger=None,
+                         belt_distance_m: float | None = None) -> int:
         """Collapse tracks that are the same physical object; return how many
         were removed.
 
@@ -131,11 +147,11 @@ class TrackedObjectQueue:
         kept: list[TrackedObject] = []
         # Freshest first: the survivor of each pair is the best-anchored one.
         for obj in sorted(self._objects, key=lambda o: -o.detect_time):
-            oy = float(obj.T_grasp_base[1, 3]) - v * (now - obj.detect_time)
+            oy = obj.y_at(now, v, belt_distance_m)
             ox = float(obj.T_grasp_base[0, 3])
             twin = None
             for k in kept:
-                ky = float(k.T_grasp_base[1, 3]) - v * (now - k.detect_time)
+                ky = k.y_at(now, v, belt_distance_m)
                 kx = float(k.T_grasp_base[0, 3])
                 age = max(now - obj.detect_time, now - k.detect_time)
                 if abs(kx - ox) < eps_x and abs(ky - oy) < eps_y_fn(age, v):
@@ -170,7 +186,8 @@ class TrackedObjectQueue:
         except ValueError:
             pass
 
-    def update(self, now: float, conveyor_speed: float) -> None:
+    def update(self, now: float, conveyor_speed: float,
+               belt_distance_m: float | None = None) -> None:
         """Drop anything past the pick line (drop_below_y), then sort by current Y.
 
         Belt travels in -Y; the head ends up as the smallest current-y still
@@ -179,7 +196,7 @@ class TrackedObjectQueue:
         """
         v = conveyor_speed
         decorated = [
-            (obj.T_aim_base[1, 3] - v * (now - obj.detect_time), obj)
+            (obj.y_at(now, v, belt_distance_m), obj)
             for obj in self._objects
         ]
         decorated = [(y, obj) for y, obj in decorated if y > self._drop_below_y]

@@ -32,6 +32,7 @@ class Config:
     MAX_REACH: float = 0.65
     CONVEYOR_SPEED: float = 0.083
     CONVEYOR_TOPIC: str = "/conveyor/speed"
+    CONVEYOR_DISTANCE_TOPIC: str = "/conveyor/distance_mm"
     CONVEYOR_STALE_SECONDS: float = 2.0
     TARGET_DISTANCE: float = 1.2
 

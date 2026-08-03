@@ -545,12 +545,18 @@ class ThrowSkill(ManipulationSkill):
         # use that same safe, reachable height for the parametric arc endpoint
         # so the arc and chain share one Z convention.
         T_aim2_seed = secondary.T_aim_base.copy()
+        # Convert the frozen detection anchor to NOW using encoder distance.
+        # The pure planner can then project only the future throw lead from a
+        # zero-age pose instead of re-integrating current_speed over track age.
+        T_aim2_seed[1, 3] = ctx.object_y_now(
+            secondary, now, ctx.conveyor.current
+        )
         T_aim2_seed[2, 3] = float(ctx.cfg.INITIAL_T[2, 0])
         T_aim2, _, _, neg_wait2 = ctx.planner.plan_throw_landing(
             T_grasp1,
             T_aim2_seed,
             theta,
-            secondary.detect_time,
+            now,
             ctx.conveyor.current,
             now,
             fixed_delay=ctx.cfg.FIXED_DELAY_THROW,
