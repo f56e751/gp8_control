@@ -11,6 +11,7 @@ output purely through the documented wire contract:
       "capture_timestamp": <RealSense global-time epoch s or null>,
       "capture_age_s": <frame-to-inference-start seconds or null>,
       "capture_timestamp_domain": <RealSense timestamp domain>,
+      "server_send_timestamp": <epoch s, added immediately before stream write>,
       "bounding_boxes": [                # belt frame, metres; clockwise
         [[X_tl,Y_tl,Z], [X_tr,Y_tr,Z], [X_br,Y_br,Z], [X_bl,Y_bl,Z]], ...
       ],
@@ -31,7 +32,13 @@ import urllib.request
 EXPECTED_SCHEMA_VERSION = 2
 
 
-def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
+def stream_detections(
+    url,
+    on_record,
+    reconnect_delay=2.0,
+    verify_schema=True,
+    skip_initial_record=False,
+):
     """Connect to the NDJSON stream and call on_record(dict) for each record.
 
     Loops forever, reconnecting after `reconnect_delay` seconds whenever the
@@ -41,11 +48,20 @@ def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
     while True:
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
+                first_record = True
                 for raw in resp:
                     line = raw.strip()
                     if not line:
                         continue
                     record = json.loads(line)
+                    if first_record and skip_initial_record:
+                        # The server intentionally sends its cached latest
+                        # record immediately after each connection. Consumers
+                        # doing motion compensation should wait for the next
+                        # freshly produced frame.
+                        first_record = False
+                        continue
+                    first_record = False
                     if verify_schema and not warned:
                         version = record.get("schema_version")
                         if version != EXPECTED_SCHEMA_VERSION:

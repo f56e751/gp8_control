@@ -1,6 +1,6 @@
 import unittest
 
-from perception.latency import select_capture_age
+from perception.latency import live_capture_age, select_capture_age
 
 
 class TestPerceptionLatency(unittest.TestCase):
@@ -17,6 +17,18 @@ class TestPerceptionLatency(unittest.TestCase):
                     select_capture_age(value, 0.100),
                     (0.100, "estimated_frame_period"),
                 )
+
+    def test_live_capture_age_converts_server_clock_to_client_clock(self):
+        # Server is 4 ms ahead. A server capture at 10.100 corresponds to
+        # client time 10.096, received by the client at 10.236.
+        self.assertAlmostEqual(
+            live_capture_age(10.236, 10.100, 0.004), 0.140, places=6
+        )
+
+    def test_live_capture_age_rejects_invalid_or_stale_values(self):
+        self.assertIsNone(live_capture_age(10.0, None, 0.0))
+        self.assertIsNone(live_capture_age(10.0, 11.0, 0.0))
+        self.assertIsNone(live_capture_age(10.0, 7.0, 0.0))
 
 
 if __name__ == "__main__":

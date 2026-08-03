@@ -151,7 +151,13 @@ python3 tools/measure_perception_latency.py \
   --probes 40 --records 60
 ```
 
-출력 마지막의 권장값을 `camera_debug` 실행 전에 적용한다.
+최신 `camera_debug`는 `/latency`를 백그라운드에서 계속 probe하고, 각 프레임의
+`capture_timestamp`를 로봇 PC 시계로 환산한다. 따라서 정상적인 live timestamp가
+있으면 촬영부터 로봇 수신까지의 전체 나이를 프레임마다 직접 적용하며 아래 고정값은
+사용하지 않는다.
+
+출력 마지막의 권장값은 global timestamp 또는 clock sync가 일시적으로 없을 때만
+사용되는 fallback이다. 필요하면 `camera_debug` 실행 전에 적용한다.
 
 ```bash
 export GP8_PERCEPTION_LATENCY_S=<출력된 값>
@@ -160,11 +166,14 @@ ros2 run gp8_control camera_debug
 ```
 
 권장값은 모델 추론시간(`elapsed_s`)을 제외한 serialization + stream + network의
-중앙값이다. `camera_debug`가 `elapsed_s`와 frame age를 별도로 더하므로 출력값을
-그대로 사용해야 하며, 전체 end-to-end 값과 다시 합치면 추론시간이 중복된다.
+중앙값이다. fallback에서는 `camera_debug`가 `elapsed_s`와 frame age를 별도로
+더하므로 출력값을 그대로 사용해야 하며, 전체 end-to-end 값과 다시 합치면
+추론시간이 중복된다.
 최신 perception producer는 RealSense global frame timestamp로 프레임 촬영/USB
 전달부터 추론 시작까지의 `capture_age_s`도 보낸다. `camera_debug`는 이 실측값을
-우선 사용하고, 값이 없거나 유효하지 않을 때만 기존 프레임 주기 EMA로 fallback한다.
+포함한 capture-to-receipt 전체 시간을 live로 사용하고, 값이 없거나 clock sync가
+유효하지 않을 때만 기존 프레임 주기 EMA + `GP8_PERCEPTION_LATENCY_S`로 fallback한다.
+기본 probe 주기는 5초이며 `GP8_CLOCK_SYNC_INTERVAL_S`로 조정할 수 있다.
 
 ### Skill 선택 — throw만 / push만 실행 (디버그)
 

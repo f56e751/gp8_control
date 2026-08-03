@@ -19,6 +19,7 @@ Run alongside the bringup in its own terminal:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -31,7 +32,11 @@ from std_msgs.msg import Float64, String
 
 from gp8_control.perception import extrinsics
 from gp8_control.perception.bbox_geometry import as_bbox, bbox_center, bbox_to_base
-from gp8_control.perception.latency import select_capture_age
+from gp8_control.perception.clock_sync import (
+    ContinuousClockSync,
+    latency_url_from_stream,
+)
+from gp8_control.perception.latency import live_capture_age, select_capture_age
 from gp8_control.perception.perception_client import stream_detections
 
 
@@ -44,20 +49,14 @@ CONVEYOR_FALLBACK_MPS = 0.083
 PUBLISH_HZ = 10.0
 
 # --- Perception latency compensation (moving-object downstream bias) ---
-# The camera only self-reports its PROCESSING time (record["elapsed_s"]). It does
-# NOT include:
-#   (a) frame ACQUISITION age — the latest frame is up to one frame period (1/FPS)
-#       old before processing even starts, and
-#   (b) network/stream TRANSPORT from the camera PC to here.
-# Both leave the object physically v·L further DOWNSTREAM than the elapsed_s-only
-# back-projection places it (verified: static calibration is fine, moving objects
-# drift downstream, worse at higher belt speed). We fold L = (a)+(b) into the Y
-# back-projection. Tune on HW via the [latency] TUI line + these env vars.
-# Frame acquisition age = FRAME_AGE_FACTOR × (frame period). The frame period is
-# NOT hardcoded — it is estimated LIVE as an EMA of the inter-record ARRIVAL
-# interval, so it tracks the camera's real effective FPS (including stream jitter
-# and processing bottlenecks) without hand-setting it. CAMERA_FPS_FALLBACK only
-# seeds the estimate until the EMA warms up (and covers stalls).
+# Normal path: continuously synchronize the perception-PC clock through
+# /latency, convert each RealSense capture timestamp to the robot timeline, and
+# directly measure capture -> receipt age. This automatically includes camera,
+# inference, serialization, stream, network, and client parsing for that frame.
+#
+# Fallback path: if cross-host time or the producer timestamp is unavailable,
+# use elapsed_s + estimated frame age + the optional fixed residual below. The
+# frame age is estimated as FRAME_AGE_FACTOR × an EMA of record arrival periods.
 CAMERA_FPS_FALLBACK = float(os.environ.get("GP8_CAMERA_FPS", "30.0"))
 FPS_EMA_ALPHA = float(os.environ.get("GP8_FPS_EMA_ALPHA", "0.2"))     # EMA weight on the newest interval
 # Ignore inter-record gaps longer than this (reconnect/stall) so they don't
@@ -67,7 +66,21 @@ MAX_FRAME_GAP_S = float(os.environ.get("GP8_MAX_FRAME_GAP_S", "1.0"))
 # (frame + buffer), 0.5 = mean age of a uniformly-sampled frame.
 FRAME_AGE_FACTOR = float(os.environ.get("GP8_FRAME_AGE_FACTOR", "1.0"))
 # Residual fixed latency (transport + anything not in elapsed_s), seconds.
+# Used only while live cross-host clock synchronization is unavailable.
 PERCEPTION_EXTRA_LATENCY_S = float(os.environ.get("GP8_PERCEPTION_LATENCY_S", "0.0"))
+CLOCK_SYNC_INTERVAL_S = float(os.environ.get("GP8_CLOCK_SYNC_INTERVAL_S", "5.0"))
+CLOCK_SYNC_PROBES = int(os.environ.get("GP8_CLOCK_SYNC_PROBES", "8"))
+CLOCK_SYNC_TIMEOUT_S = float(os.environ.get("GP8_CLOCK_SYNC_TIMEOUT_S", "2.0"))
+CLOCK_SYNC_MAX_AGE_S = float(os.environ.get("GP8_CLOCK_SYNC_MAX_AGE_S", "15.0"))
+MAX_LIVE_CAPTURE_AGE_S = float(os.environ.get("GP8_MAX_CAPTURE_AGE_S", "2.0"))
+
+
+def _finite_float(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 class CameraDebugNode(Node):
@@ -82,6 +95,18 @@ class CameraDebugNode(Node):
         self._snap_lock = threading.Lock()
         self._snap: dict | None = None
 
+        self._stream_url = os.environ.get(
+            "GP8_PERCEPTION_URL", PERCEPTION_URL_DEFAULT
+        )
+        self._clock_sync = ContinuousClockSync(
+            latency_url_from_stream(self._stream_url),
+            interval_s=CLOCK_SYNC_INTERVAL_S,
+            probes=CLOCK_SYNC_PROBES,
+            timeout_s=CLOCK_SYNC_TIMEOUT_S,
+            max_age_s=CLOCK_SYNC_MAX_AGE_S,
+        )
+        self._clock_sync.start()
+
         # Live EMA of the inter-record interval -> estimated frame period (real FPS),
         # used for the frame-acquisition-age latency term (see _on_record).
         self._last_record_t: float | None = None
@@ -92,9 +117,6 @@ class CameraDebugNode(Node):
         )
         self.create_timer(1.0 / PUBLISH_HZ, self._publish_and_render)
 
-        self._stream_url = os.environ.get(
-            "GP8_PERCEPTION_URL", PERCEPTION_URL_DEFAULT
-        )
         self._stream_thread = threading.Thread(
             target=self._run_stream, name="camera-stream", daemon=True
         )
@@ -117,6 +139,7 @@ class CameraDebugNode(Node):
             stream_detections(
                 self._stream_url, self._on_record,
                 reconnect_delay=RECONNECT_DELAY,
+                skip_initial_record=True,
             )
         except Exception as e:
             self.get_logger().error(f"perception stream thread crashed: {e}")
@@ -157,8 +180,54 @@ class CameraDebugNode(Node):
         frame_age, frame_age_source = select_capture_age(
             record.get("capture_age_s"), estimated_frame_age
         )
-        extra_latency = frame_age + PERCEPTION_EXTRA_LATENCY_S
-        total_delay = delay_s + extra_latency
+        clock_estimate = self._clock_sync.estimate()
+        capture_timestamp = _finite_float(record.get("capture_timestamp"))
+        measured_total_age = None
+        if clock_estimate is not None and capture_timestamp is not None:
+            measured_total_age = live_capture_age(
+                receipt,
+                capture_timestamp,
+                clock_estimate.offset_s,
+                MAX_LIVE_CAPTURE_AGE_S,
+            )
+            if measured_total_age is None:
+                # The stream sends its cached record once on reconnect. Never
+                # turn an old cached detection into a fresh one via fallback.
+                self.get_logger().warn(
+                    "dropping stale/invalid timestamped perception record"
+                )
+                return
+
+        if measured_total_age is not None:
+            # Direct capture -> callback age. This already contains camera/USB,
+            # inference, server queue/serialization, network, and JSON parsing.
+            # Do not add elapsed_s or the fixed residual again.
+            total_delay = measured_total_age
+            latency_mode = "live_capture_to_receipt"
+            extra_latency = total_delay - delay_s
+            fixed_fallback_applied = 0.0
+        else:
+            # Legacy producer, stale clock estimate, or invalid global timestamp.
+            # Preserve the previous estimate so perception does not stop working.
+            extra_latency = frame_age + PERCEPTION_EXTRA_LATENCY_S
+            total_delay = delay_s + extra_latency
+            latency_mode = "fallback_components"
+            fixed_fallback_applied = PERCEPTION_EXTRA_LATENCY_S
+
+        server_send_ts = _finite_float(record.get("server_send_timestamp"))
+        post_inference_s = None
+        network_receive_s = None
+        if server_send_ts is not None:
+            inference_end_ts = stream_ts + delay_s
+            candidate = server_send_ts - inference_end_ts
+            if 0.0 <= candidate <= MAX_LIVE_CAPTURE_AGE_S:
+                post_inference_s = candidate
+            if clock_estimate is not None:
+                candidate = receipt - (
+                    server_send_ts - clock_estimate.offset_s
+                )
+                if 0.0 <= candidate <= MAX_LIVE_CAPTURE_AGE_S:
+                    network_receive_s = candidate
 
         offset_aim = extrinsics.DETECTION_OFFSET_AIM
         offset_grasp = extrinsics.DETECTION_OFFSET_GRASP
@@ -242,6 +311,7 @@ class CameraDebugNode(Node):
             "perception_delay_s": delay_s,
             "frame_age_s": frame_age,
             "frame_age_source": frame_age_source,
+            "latency_mode": latency_mode,
             "reported_capture_timestamp": record.get("capture_timestamp"),
             "reported_capture_timestamp_domain": record.get(
                 "capture_timestamp_domain"
@@ -250,10 +320,17 @@ class CameraDebugNode(Node):
             "est_fps": (1.0 / frame_period) if frame_period > 0.0 else None,
             "extra_latency_s": extra_latency,
             "applied_delay_s": total_delay,
-            # Transport estimate: receipt(local clock) − camera stream timestamp.
-            # ONLY meaningful if the two PCs' clocks are NTP-synced; else ignore
-            # its absolute value and tune PERCEPTION_EXTRA_LATENCY_S empirically.
-            "transport_est_s": (receipt - stream_ts) if stream_ts > 0.0 else None,
+            "fixed_fallback_latency_s": fixed_fallback_applied,
+            "server_post_inference_s": post_inference_s,
+            "network_receive_s": network_receive_s,
+            "server_send_timestamp": server_send_ts,
+            "clock_offset_s": (
+                clock_estimate.offset_s if clock_estimate is not None else None
+            ),
+            "clock_min_rtt_s": (
+                clock_estimate.min_rtt_s if clock_estimate is not None else None
+            ),
+            "clock_sync_error": self._clock_sync.last_error(),
             "detections": detections,
         }
         with self._snap_lock:
@@ -300,17 +377,40 @@ class CameraDebugNode(Node):
         applied = float(snap.get("applied_delay_s", delay))
         frame_age = float(snap.get("frame_age_s", 0.0))
         frame_age_source = str(snap.get("frame_age_source", "unknown"))
+        latency_mode = str(snap.get("latency_mode", "unknown"))
         est_fps = snap.get("est_fps", None)
         fps_str = f"{est_fps:.1f}" if est_fps is not None else "…"
-        transport = snap.get("transport_est_s", None)
-        transport_str = f"{transport:+.3f}s" if transport is not None else "n/a"
-        out.append(
-            f" [latency] elapsed {delay:.3f} + frame_age {frame_age:.3f} "
-            f"({frame_age_source}) "
-            f"(est_fps {fps_str}) + extra {PERCEPTION_EXTRA_LATENCY_S:.3f} "
-            f"= applied {applied:.3f}s (→ {applied * v * 100:+.1f} cm back-proj)   "
-            f"transport_est: {transport_str}\n\n"
+        offset = snap.get("clock_offset_s")
+        rtt = snap.get("clock_min_rtt_s")
+        clock_str = (
+            f"offset {float(offset) * 1000:+.2f}ms, "
+            f"minRTT {float(rtt) * 1000:.2f}ms"
+            if offset is not None and rtt is not None
+            else "clock sync unavailable"
         )
+        if latency_mode == "live_capture_to_receipt":
+            post = snap.get("server_post_inference_s")
+            network = snap.get("network_receive_s")
+            post_str = f"{float(post):.3f}" if post is not None else "n/a"
+            network_str = (
+                f"{float(network):.3f}" if network is not None else "n/a"
+            )
+            out.append(
+                f" [latency LIVE] frame→infer {frame_age:.3f} "
+                f"({frame_age_source}) + infer {delay:.3f} + "
+                f"server {post_str} + wire/client {network_str} "
+                f"= applied {applied:.3f}s "
+                f"(→ {applied * v * 100:+.1f} cm back-proj)\n"
+                f"                {clock_str}\n\n"
+            )
+        else:
+            out.append(
+                f" [latency FALLBACK] elapsed {delay:.3f} + frame_age "
+                f"{frame_age:.3f} ({frame_age_source}, est_fps {fps_str}) + "
+                f"fixed {PERCEPTION_EXTRA_LATENCY_S:.3f} = applied "
+                f"{applied:.3f}s (→ {applied * v * 100:+.1f} cm back-proj)\n"
+                f"                    {clock_str}\n\n"
+            )
         if not detections:
             out.append(" (no objects in latest record)\n")
         else:
@@ -338,7 +438,6 @@ class CameraDebugNode(Node):
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
-
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CameraDebugNode()
@@ -349,6 +448,7 @@ def main(args=None) -> None:
     finally:
         sys.stdout.write("\n")
         sys.stdout.flush()
+        node._clock_sync.stop()
         node.destroy_node()
         rclpy.shutdown()
 
