@@ -34,6 +34,13 @@ def _make_transform(R: np.ndarray, t) -> np.ndarray:
     return T
 
 
+def _freeze_bbox(box) -> tuple | None:
+    """Store a JSON box as an immutable tuple-of-tuples, preserving ``None``."""
+    if box is None:
+        return None
+    return tuple(tuple(float(v) for v in point) for point in box)
+
+
 def _fmt_votes(votes: dict) -> str:
     """Compact 'cls:weight' dump (highest first) for the reclass log."""
     return "{" + ", ".join(
@@ -257,6 +264,9 @@ class DetectionIntake:
                 cls=d.get("class", "?"),
                 conf=float(d.get("confidence", -1.0)),
                 cam=d.get("cam", [0.0, 0.0, 0.0]),
+                cam_bbox=d.get("cam_bbox"),
+                base_bbox_grasp=d.get("base_bbox_grasp"),
+                base_bbox_aim=d.get("base_bbox_aim"),
             ))
 
         def _reanchor(match: TrackedObject, dd: dict) -> None:
@@ -269,6 +279,9 @@ class DetectionIntake:
             match.T_grasp_base = _make_transform(_R_GRASP_DEFAULT, dd["grasp"])
             match.detect_time = detect_time
             match.cam_pos = tuple(dd["cam"])
+            match.cam_bbox = _freeze_bbox(dd["cam_bbox"])
+            match.base_bbox_grasp = _freeze_bbox(dd["base_bbox_grasp"])
+            match.base_bbox_aim = _freeze_bbox(dd["base_bbox_aim"])
             match.conf = dd["conf"]
             # Record this sighting for the per-object speed fit (uses the same
             # match verdict as identity — no extra association needed, so the
@@ -319,6 +332,9 @@ class DetectionIntake:
                 class_name=dd["cls"],
                 detect_time=detect_time,
                 cam_pos=tuple(dd["cam"]),
+                cam_bbox=_freeze_bbox(dd["cam_bbox"]),
+                base_bbox_grasp=_freeze_bbox(dd["base_bbox_grasp"]),
+                base_bbox_aim=_freeze_bbox(dd["base_bbox_aim"]),
                 conf=dd["conf"],
             )
             # Seed the class vote with the spawn frame's confidence so a confident

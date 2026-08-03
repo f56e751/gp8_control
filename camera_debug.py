@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Camera debug node — owns the perception → base-frame correction pipeline.
 
-Reads the camera's HTTP NDJSON detection stream, applies the camera→base
-transform, back-projects each detection's Y by ``belt_speed × perception_delay``,
-and publishes the corrected detection list on ``/camera_debug/detections``.
+Reads full four-corner boxes from the camera's HTTP NDJSON detection stream,
+applies the camera→base transform to every corner, back-projects each Y by
+``belt_speed × perception_delay``, and publishes the corrected detection list
+on ``/camera_debug/detections``.
 app.py subscribes to that topic instead of re-doing the corrections itself.
 
 A live TUI renders the raw camera positions next to the corrected base
@@ -29,6 +30,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float64, String
 
 from gp8_control.perception import extrinsics
+from gp8_control.perception.bbox_geometry import as_bbox, bbox_center, bbox_to_base
 from gp8_control.perception.perception_client import stream_detections
 
 
@@ -120,9 +122,9 @@ class CameraDebugNode(Node):
 
     def _on_record(self, record: dict) -> None:
         """One incoming NDJSON record from the camera PC → corrected snapshot."""
-        positions = record.get("positions") or []
+        bounding_boxes = record.get("bounding_boxes") or []
         class_names = record.get("class_names") or []
-        confidences = record.get("confidences") or [0.0] * len(positions)
+        confidences = record.get("confidences") or [0.0] * len(bounding_boxes)
         delay_s = float(record.get("elapsed_s") or 0.0)
         stream_ts = float(record.get("timestamp") or 0.0)
 
@@ -165,13 +167,19 @@ class CameraDebugNode(Node):
         sy = extrinsics.SIGN_CY_TO_BASE_Y * extrinsics.SCALE_CY_TO_BASE_Y
 
         detections = []
-        for pos, cls, conf in zip(positions, class_names, confidences):
-            # New format: cx = across-belt offset (m), cy = along-belt offset
-            # with + upstream (toward camera). Depth no longer sent — pick
-            # height comes from GRASP_Z downstream.
-            cx = float(pos[0]) if len(pos) > 0 else 0.0
-            cy = float(pos[1]) if len(pos) > 1 else 0.0
-            cz = float(pos[2]) if len(pos) > 2 else 0.0   # for display only
+        for box, cls, conf in zip(bounding_boxes, class_names, confidences):
+            try:
+                cam_bbox = as_bbox(box)
+            except (TypeError, ValueError) as exc:
+                self.get_logger().warn(
+                    f"ignoring malformed perception bounding box: {exc}"
+                )
+                continue
+
+            # The producer sends all four projected corners.  Preserve them
+            # through the base-frame conversion, and derive the grasp centre
+            # from the complete box so the robot keeps its existing behaviour.
+            cx, cy, cz = bbox_center(cam_bbox)
             # Workspace = on the belt centerline laterally. Across-belt is now
             # already in belt-frame meters so the same ±0.2 m filter applies.
             in_ws = (-ws_x_abs < cx < ws_x_abs)
@@ -182,6 +190,21 @@ class CameraDebugNode(Node):
             x_base = ref_x + sx * cx
             y_base = ref_y + sy * cy
             z_base = ref_z
+
+            bbox_transform = dict(
+                ref_x=ref_x,
+                ref_y=ref_y,
+                ref_z=ref_z,
+                scale_x=sx,
+                scale_y=sy,
+                y_back_projection=v * total_delay,
+            )
+            base_bbox_grasp = bbox_to_base(
+                cam_bbox, z_offset=offset_grasp, **bbox_transform
+            )
+            base_bbox_aim = bbox_to_base(
+                cam_bbox, z_offset=offset_aim, **bbox_transform
+            )
 
             # Apply Z offsets for aim / grasp, back-project Y by v*delay so the
             # position is "where the object is at receipt time."
@@ -196,13 +219,16 @@ class CameraDebugNode(Node):
             detections.append({
                 "class": cls,
                 "confidence": float(conf),
-                "cam": [cx, cy, cz],
+                "cam": [float(cx), float(cy), float(cz)],
+                "cam_bbox": cam_bbox.tolist(),
                 "base_grasp": [float(base_grasp[0]),
                                float(base_grasp[1]),
                                float(base_grasp[2])],
                 "base_aim":   [float(base_aim[0]),
                                float(base_aim[1]),
                                float(base_aim[2])],
+                "base_bbox_grasp": base_bbox_grasp.tolist(),
+                "base_bbox_aim": base_bbox_aim.tolist(),
                 "in_workspace": bool(in_ws),
             })
 

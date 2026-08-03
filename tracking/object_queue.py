@@ -32,6 +32,12 @@ class TrackedObject:
     # Raw camera-frame position [cx, cy, cz] (m) reported by the perception
     # stream, kept verbatim for belt_viz / diagnostics. None on legacy paths.
     cam_pos: tuple | None = None
+    # Full projected detection box, retained in both source belt frame and the
+    # corrected base frame. Corner order follows the stream contract:
+    # top-left, top-right, bottom-right, bottom-left.
+    cam_bbox: tuple | None = None
+    base_bbox_grasp: tuple | None = None
+    base_bbox_aim: tuple | None = None
     # Latest detection confidence (camera_debug "confidence"); -1.0 until set.
     # Updated on every dedup re-anchor so it reflects the most recent sighting.
     conf: float = -1.0

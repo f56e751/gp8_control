@@ -6,9 +6,11 @@ output purely through the documented wire contract:
 
     GET http://<camera-pc-ip>:8080/detections/stream   (NDJSON, one record/line)
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "timestamp": <epoch s>, "elapsed_s": <inference s>,
-      "positions":   [[X, Y, Z], ...],   # camera frame, metres
+      "bounding_boxes": [                # belt frame, metres; clockwise
+        [[X_tl,Y_tl,Z], [X_tr,Y_tr,Z], [X_br,Y_br,Z], [X_bl,Y_bl,Z]], ...
+      ],
       "class_names": ["metal"|"transparent"|"cardboard", ...],
       "confidences": [<float>, ...]      # parallel arrays, aligned by index
     }
@@ -23,7 +25,7 @@ import urllib.error
 import urllib.request
 
 # Schema this client was written against. A mismatch is warned about once.
-EXPECTED_SCHEMA_VERSION = 1
+EXPECTED_SCHEMA_VERSION = 2
 
 
 def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
@@ -61,11 +63,11 @@ def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
 
 
 def _demo(record):
-    for (x, y, z), cls, conf in zip(
-        record["positions"], record["class_names"], record["confidences"]
+    for box, cls, conf in zip(
+        record["bounding_boxes"], record["class_names"], record["confidences"]
     ):
-        # Replace with: camera->robot frame transform, then feed your controller.
-        print(f"  {cls:11s} conf={conf:.2f}  pos=({x:.3f}, {y:.3f}, {z:.3f}) m")
+        points = " ".join(f"({x:.3f},{y:.3f},{z:.3f})" for x, y, z in box)
+        print(f"  {cls:11s} conf={conf:.2f}  bbox={points} m")
 
 
 if __name__ == "__main__":

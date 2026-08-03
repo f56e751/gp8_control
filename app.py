@@ -538,16 +538,29 @@ class GP8App:
         objs = []
 
         def _serialize(obj: TrackedObject, is_target: bool) -> dict:
-            y_now = float(obj.T_grasp_base[1, 3] - v * (now - obj.detect_time))
+            age = now - obj.detect_time
+            y_now = float(obj.T_grasp_base[1, 3] - v * age)
             cam = obj.cam_pos
+            base_bbox = obj.base_bbox_grasp
+            base_bbox_now = None
+            if base_bbox is not None:
+                base_bbox_now = [
+                    [float(point[0]), float(point[1]) - v * age, float(point[2])]
+                    for point in base_bbox
+                ]
             return {
                 "class": obj.class_name,
                 "y_now": y_now,
                 "x": float(obj.T_grasp_base[0, 3]),
                 "z": float(obj.T_grasp_base[2, 3]),
-                "age_s": float(now - obj.detect_time),
+                "age_s": float(age),
                 "is_target": is_target,
                 "cam": list(cam) if cam is not None else None,
+                "cam_bbox": (
+                    [list(point) for point in obj.cam_bbox]
+                    if obj.cam_bbox is not None else None
+                ),
+                "base_bbox_grasp": base_bbox_now,
             }
 
         # Currently-executing target (popped from the queue but still on the belt).

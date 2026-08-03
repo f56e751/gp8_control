@@ -17,7 +17,7 @@ the RL training stack.
 | `trajectory/trajectory_primitive.py` | `opt_time`, `trajectory_3points`, `new_trajectory`, etc. |
 | `controllers/trajectory_controller.py` | FJT action client with suction release-on-pass logic. |
 | `controllers/moveit_controller.py` | MoveIt 2 wrapper (used only for initial-pose planning). |
-| `camera_debug.py` | Perception node (`camera_debug`) — reads the camera PC's HTTP NDJSON stream, applies the camera→base transform + `v×delay` back-projection, and publishes corrected detections on `/camera_debug/detections`. **Must run for `app.py` to pick.** |
+| `camera_debug.py` | Perception node (`camera_debug`) — reads full four-corner boxes from the camera PC's HTTP NDJSON stream, transforms every corner to the base frame, applies `v×delay` back-projection, and publishes corrected detections on `/camera_debug/detections`. **Must run for `app.py` to pick.** |
 | `perception/` | Supports `camera_debug`: HTTP stream client (`perception_client`), camera/base extrinsics (`extrinsics`), and the control-side detection intake/dedup (`detection_intake`, consumed by `app.py`). |
 | `conveyor/` | `ConveyorSpeedTracker` — subscribes `/conveyor/speed` (encoder node) and exposes the live belt speed to the app + skills. |
 | `mock/mock_robot.py` | Fake MotoROS2 (incl. Point Queue Mode + real-time playback) for dev/sim without the physical robot. |
@@ -125,10 +125,12 @@ export GP8_PERCEPTION_URL=http://<camera-pc-ip>:8080/detections/stream
 ros2 run gp8_control camera_debug
 ```
 
-It reads the camera PC's HTTP stream (`GP8_PERCEPTION_URL`), applies the
+It reads schema-v2 full bounding boxes from the camera PC's HTTP stream
+(`GP8_PERCEPTION_URL`), transforms and preserves all four corners, applies the
 camera→base transform + `v×delay` back-projection, and publishes the corrected
-detections. It also subscribes to `/conveyor/speed` for the back-projection.
-A live TUI shows raw vs corrected positions.
+detections. The existing grasp behaviour is retained by deriving its target
+from the transformed box centre. It also subscribes to `/conveyor/speed` for
+the back-projection. A live TUI shows raw vs corrected positions.
 
 ### Skill 선택 — throw만 / push만 실행 (디버그)
 
