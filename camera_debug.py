@@ -31,6 +31,7 @@ from std_msgs.msg import Float64, String
 
 from gp8_control.perception import extrinsics
 from gp8_control.perception.bbox_geometry import as_bbox, bbox_center, bbox_to_base
+from gp8_control.perception.latency import select_capture_age
 from gp8_control.perception.perception_client import stream_detections
 
 
@@ -149,11 +150,13 @@ class CameraDebugNode(Node):
             if self._frame_period_ema is not None
             else 1.0 / max(CAMERA_FPS_FALLBACK, 1e-6)
         )
-        # Uncompensated latency beyond the camera's elapsed_s: frame acquisition
-        # age (a fraction of the estimated frame period) + a residual transport
-        # term. The object sits v·extra further DOWNSTREAM, so fold it into the Y
-        # back-projection below.
-        frame_age = FRAME_AGE_FACTOR * frame_period
+        # Prefer the producer's per-frame RealSense global timestamp. Older
+        # producers (or a camera without usable global time) fall back to the
+        # previous inter-arrival-period estimate.
+        estimated_frame_age = FRAME_AGE_FACTOR * frame_period
+        frame_age, frame_age_source = select_capture_age(
+            record.get("capture_age_s"), estimated_frame_age
+        )
         extra_latency = frame_age + PERCEPTION_EXTRA_LATENCY_S
         total_delay = delay_s + extra_latency
 
@@ -238,6 +241,11 @@ class CameraDebugNode(Node):
             "belt_mps": v,
             "perception_delay_s": delay_s,
             "frame_age_s": frame_age,
+            "frame_age_source": frame_age_source,
+            "reported_capture_timestamp": record.get("capture_timestamp"),
+            "reported_capture_timestamp_domain": record.get(
+                "capture_timestamp_domain"
+            ),
             "frame_period_s": frame_period,
             "est_fps": (1.0 / frame_period) if frame_period > 0.0 else None,
             "extra_latency_s": extra_latency,
@@ -291,12 +299,14 @@ class CameraDebugNode(Node):
         )
         applied = float(snap.get("applied_delay_s", delay))
         frame_age = float(snap.get("frame_age_s", 0.0))
+        frame_age_source = str(snap.get("frame_age_source", "unknown"))
         est_fps = snap.get("est_fps", None)
         fps_str = f"{est_fps:.1f}" if est_fps is not None else "…"
         transport = snap.get("transport_est_s", None)
         transport_str = f"{transport:+.3f}s" if transport is not None else "n/a"
         out.append(
             f" [latency] elapsed {delay:.3f} + frame_age {frame_age:.3f} "
+            f"({frame_age_source}) "
             f"(est_fps {fps_str}) + extra {PERCEPTION_EXTRA_LATENCY_S:.3f} "
             f"= applied {applied:.3f}s (→ {applied * v * 100:+.1f} cm back-proj)   "
             f"transport_est: {transport_str}\n\n"

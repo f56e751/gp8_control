@@ -108,10 +108,12 @@ def measure_stream(
     count: int,
     timeout: float,
     max_record_age_s: float,
-) -> tuple[list[float], list[float]]:
-    """Return (inference-to-receipt, post-inference residual) samples."""
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Return inference, residual, capture-age, and capture-to-receipt samples."""
     end_to_end = []
     residual = []
+    capture_ages = []
+    capture_to_receipt = []
     with urllib.request.urlopen(url, timeout=timeout) as response:
         while len(residual) < count:
             raw = response.readline()
@@ -133,7 +135,14 @@ def measure_stream(
                 continue
             end_to_end.append(total)
             residual.append(total - inference_s)
-    return end_to_end, residual
+            try:
+                capture_age = float(record.get("capture_age_s"))
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= capture_age <= max_record_age_s:
+                capture_ages.append(capture_age)
+                capture_to_receipt.append(capture_age + total)
+    return end_to_end, residual, capture_ages, capture_to_receipt
 
 
 def _ms(seconds: float) -> str:
@@ -175,7 +184,7 @@ def main() -> int:
     )
 
     print(f"measuring {args.records} live records: {stream_url}", flush=True)
-    totals, residuals = measure_stream(
+    totals, residuals, capture_ages, capture_totals = measure_stream(
         stream_url, offset, args.records, args.timeout, args.max_record_age,
     )
     recommendation = max(0.0, percentile(residuals, 50))
@@ -191,6 +200,21 @@ def main() -> int:
         f"  export GP8_PERCEPTION_LATENCY_S={recommendation:.6f}",
         flush=True,
     )
+    if capture_ages:
+        print(
+            "RealSense frame -> inference start:\n"
+            f"  median {_ms(percentile(capture_ages, 50))}, "
+            f"p95 {_ms(percentile(capture_ages, 95))}\n"
+            "RealSense frame -> robot receipt (full measured path):\n"
+            f"  median {_ms(percentile(capture_totals, 50))}, "
+            f"p95 {_ms(percentile(capture_totals, 95))}",
+            flush=True,
+        )
+    else:
+        print(
+            "RealSense capture_age_s: unavailable; update/restart the perception server.",
+            flush=True,
+        )
     if residual_median < -0.005:
         print(
             "WARNING: residual delay is negative. Check that the perception "

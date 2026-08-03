@@ -162,6 +162,9 @@ ros2 run gp8_control camera_debug
 권장값은 모델 추론시간(`elapsed_s`)을 제외한 serialization + stream + network의
 중앙값이다. `camera_debug`가 `elapsed_s`와 frame age를 별도로 더하므로 출력값을
 그대로 사용해야 하며, 전체 end-to-end 값과 다시 합치면 추론시간이 중복된다.
+최신 perception producer는 RealSense global frame timestamp로 프레임 촬영/USB
+전달부터 추론 시작까지의 `capture_age_s`도 보낸다. `camera_debug`는 이 실측값을
+우선 사용하고, 값이 없거나 유효하지 않을 때만 기존 프레임 주기 EMA로 fallback한다.
 
 ### Skill 선택 — throw만 / push만 실행 (디버그)
 

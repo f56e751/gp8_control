@@ -8,6 +8,9 @@ output purely through the documented wire contract:
     {
       "schema_version": 2,
       "timestamp": <epoch s>, "elapsed_s": <inference s>,
+      "capture_timestamp": <RealSense global-time epoch s or null>,
+      "capture_age_s": <frame-to-inference-start seconds or null>,
+      "capture_timestamp_domain": <RealSense timestamp domain>,
       "bounding_boxes": [                # belt frame, metres; clockwise
         [[X_tl,Y_tl,Z], [X_tr,Y_tr,Z], [X_br,Y_br,Z], [X_bl,Y_bl,Z]], ...
       ],
