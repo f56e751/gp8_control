@@ -170,9 +170,11 @@ grasp to the fixed bin (`THROW_BIN_X`/`THROW_BIN_Y`).
 ### Perception / tracking data path
 
 Live detections arrive on the `/camera_debug/detections` ROS topic, published by
-a separate `camera_debug` node that owns the HTTP NDJSON stream, the cam→base
-transform, Z offsets, and `v*delay` back-projection. `GP8App` only subscribes
-and reads pre-corrected base-frame poses. (`StreamDetectionSource` /
+a separate `camera_debug` node that owns the schema-v2 HTTP NDJSON stream,
+transforms all four bounding-box corners into the base frame, applies Z offsets
+and `v*delay` back-projection, and derives the legacy grasp target from the box
+centre. `GP8App` only subscribes and reads pre-corrected base-frame poses and
+the retained full boxes. (`StreamDetectionSource` /
 `DetectionIntake` / `_build_intake` also exist for an in-process intake path but
 are **not wired into `setup()`** currently — don't assume they're live.)
 `_intake_new_detections` does spatial dedup against `OBJECT_MATCH_EPSILON`

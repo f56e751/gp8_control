@@ -120,10 +120,12 @@ class TrajectoryController:
 
         # Pick-cycle timing telemetry (kept for the skills' logs).
         self.last_suction_on_t: float | None = None
+        self.last_suction_on_ack_t: float | None = None
         # Joint state snapshotted at the instant suction turned ON, so a skill can
         # FK it to the EE pose the vacuum actually fired at (diagnostic).
         self.last_suction_on_joints: list | None = None
         self.last_suction_off_t: float | None = None
+        self.last_suction_off_ack_t: float | None = None
         self.last_throw: dict | None = None
         self._last_throw_ok: bool = True   # #R3: last timed-release dispatch accepted? (pq_throw_segment ok)
 
@@ -177,6 +179,8 @@ class TrajectoryController:
         # ENQUEUE and return immediately, so a blocking TCP round-trip never stalls the
         # 250 Hz stream/servo loop at the release instant. FIFO preserves off-before-prime order.
         self._io_queue: "queue.Queue" = queue.Queue()
+        self._io_state_lock = threading.Lock()
+        self._io_requested_value: int | None = None
         self._io_thread = threading.Thread(target=self._io_worker, daemon=True)
         self._io_thread.start()
         self._io_closed = False
@@ -663,20 +667,30 @@ class TrajectoryController:
     # Suction / IO  —  SINGLE BLOCKER SEAM
     # ------------------------------------------------------------------
     def suction_on(self) -> None:
-        """Enqueue suction ON (non-blocking); the IO worker does the TCP write off the servo loop (#2)."""
-        self.last_suction_on_t = time.time()
+        """Request suction ON once; duplicate requested states are coalesced."""
+        requested_at = time.time()
+        with self._io_state_lock:
+            if self._io_requested_value == 0:
+                return
+            self._io_requested_value = 0
+        self.last_suction_on_t = requested_at
         # Snapshot the joint state AT the fire instant (this may run inside the
         # stream loop mid-move) so callers can FK the true EE pose the vacuum
         # fired at. list() to freeze it against the joint_states callback.
         self.last_suction_on_joints = (
             list(self.current_joints) if self.current_joints is not None else None
         )
-        self._io_queue.put((SUCTION_IO_ADDRESS, 0))
+        self._io_queue.put((SUCTION_IO_ADDRESS, 0, requested_at))
 
     def suction_off(self) -> None:
-        """Enqueue suction OFF (non-blocking); the IO worker does the TCP write off the servo loop (#2)."""
-        self.last_suction_off_t = time.time()
-        self._io_queue.put((SUCTION_IO_ADDRESS, 1))
+        """Request suction OFF once; duplicate requested states are coalesced."""
+        requested_at = time.time()
+        with self._io_state_lock:
+            if self._io_requested_value == 1:
+                return
+            self._io_requested_value = 1
+        self.last_suction_off_t = requested_at
+        self._io_queue.put((SUCTION_IO_ADDRESS, 1, requested_at))
 
     def close(self, timeout_sec: float = 5.0) -> None:
         """Drain pending suction writes and stop the IO worker cleanly.
@@ -712,13 +726,34 @@ class TrajectoryController:
             item = self._io_queue.get()
             if item is None:
                 break
-            addr, val = item
+            addr, val, requested_at = item
+            started_at = time.time()
             try:
-                self._call_io(addr, val)
+                applied = self._call_io(addr, val)
+                finished_at = time.time()
+                if applied:
+                    if val == 0:
+                        self.last_suction_on_ack_t = finished_at
+                        state = "ON"
+                    else:
+                        self.last_suction_off_ack_t = finished_at
+                        state = "OFF"
+                    self._node.get_logger().info(
+                        f"[IO] suction {state} controller-ack: "
+                        f"queue={(started_at - requested_at) * 1000.0:.1f}ms "
+                        f"roundtrip={(finished_at - started_at) * 1000.0:.1f}ms "
+                        f"total={(finished_at - requested_at) * 1000.0:.1f}ms"
+                    )
+                else:
+                    # Permit a later same-state call to retry after both TCP
+                    # attempts failed.  Do not overwrite a newer opposite state.
+                    with self._io_state_lock:
+                        if self._io_requested_value == val:
+                            self._io_requested_value = None
             except Exception as e:
                 self._node.get_logger().error(f"[IO] worker write addr={addr} val={val} error: {e}")
 
-    def _call_io(self, address: int, value: int) -> None:
+    def _call_io(self, address: int, value: int) -> bool:
         """Write a single IO bit via the controller's Simple Message IoServer (TCP 50242).
 
         Option A: adv4ncr has no /write_single_io ROS service, but its controller_driver
@@ -756,7 +791,8 @@ class TrajectoryController:
                     else:
                         self._node.get_logger().warn(
                             f"[IO] short/no reply ({len(reply)} B) for addr={address} val={value}")
-                    return
+                        return False
+                    return True
                 except OSError as e:
                     self._node.get_logger().warn(
                         f"[IO] TCP write failed (attempt {attempt}) to {self._io_ip}:{self._io_port}: "
@@ -770,3 +806,4 @@ class TrajectoryController:
             self._node.get_logger().error(
                 f"[IO] suction write addr={address} val={value} FAILED "
                 f"({self._io_ip}:{self._io_port}) — SAFETY: verify release before any real throw.")
+            return False

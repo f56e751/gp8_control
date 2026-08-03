@@ -6,9 +6,15 @@ output purely through the documented wire contract:
 
     GET http://<camera-pc-ip>:8080/detections/stream   (NDJSON, one record/line)
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "timestamp": <epoch s>, "elapsed_s": <inference s>,
-      "positions":   [[X, Y, Z], ...],   # camera frame, metres
+      "capture_timestamp": <RealSense global-time epoch s or null>,
+      "capture_age_s": <frame-to-inference-start seconds or null>,
+      "capture_timestamp_domain": <RealSense timestamp domain>,
+      "server_send_timestamp": <epoch s, added immediately before stream write>,
+      "bounding_boxes": [                # belt frame, metres; clockwise
+        [[X_tl,Y_tl,Z], [X_tr,Y_tr,Z], [X_br,Y_br,Z], [X_bl,Y_bl,Z]], ...
+      ],
       "class_names": ["metal"|"transparent"|"cardboard", ...],
       "confidences": [<float>, ...]      # parallel arrays, aligned by index
     }
@@ -23,10 +29,16 @@ import urllib.error
 import urllib.request
 
 # Schema this client was written against. A mismatch is warned about once.
-EXPECTED_SCHEMA_VERSION = 1
+EXPECTED_SCHEMA_VERSION = 2
 
 
-def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
+def stream_detections(
+    url,
+    on_record,
+    reconnect_delay=2.0,
+    verify_schema=True,
+    skip_initial_record=False,
+):
     """Connect to the NDJSON stream and call on_record(dict) for each record.
 
     Loops forever, reconnecting after `reconnect_delay` seconds whenever the
@@ -36,11 +48,20 @@ def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
     while True:
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
+                first_record = True
                 for raw in resp:
                     line = raw.strip()
                     if not line:
                         continue
                     record = json.loads(line)
+                    if first_record and skip_initial_record:
+                        # The server intentionally sends its cached latest
+                        # record immediately after each connection. Consumers
+                        # doing motion compensation should wait for the next
+                        # freshly produced frame.
+                        first_record = False
+                        continue
+                    first_record = False
                     if verify_schema and not warned:
                         version = record.get("schema_version")
                         if version != EXPECTED_SCHEMA_VERSION:
@@ -61,11 +82,11 @@ def stream_detections(url, on_record, reconnect_delay=2.0, verify_schema=True):
 
 
 def _demo(record):
-    for (x, y, z), cls, conf in zip(
-        record["positions"], record["class_names"], record["confidences"]
+    for box, cls, conf in zip(
+        record["bounding_boxes"], record["class_names"], record["confidences"]
     ):
-        # Replace with: camera->robot frame transform, then feed your controller.
-        print(f"  {cls:11s} conf={conf:.2f}  pos=({x:.3f}, {y:.3f}, {z:.3f}) m")
+        points = " ".join(f"({x:.3f},{y:.3f},{z:.3f})" for x, y, z in box)
+        print(f"  {cls:11s} conf={conf:.2f}  bbox={points} m")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,5 @@ belt-state concern is separate from camera/detection code.
 """
 
 from gp8_control.conveyor.conveyor_speed import ConveyorSpeedTracker
-from gp8_control.conveyor.camera_speed import CameraSpeedTracker
 
-__all__ = ["ConveyorSpeedTracker", "CameraSpeedTracker"]
+__all__ = ["ConveyorSpeedTracker"]

@@ -25,7 +25,7 @@ from rclpy.executors import MultiThreadedExecutor
 
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.conveyor import CameraSpeedTracker, ConveyorSpeedTracker
+from gp8_control.conveyor import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -121,11 +121,6 @@ class GP8App:
             eps_y_max=self.cfg.OBJECT_MATCH_EPS_Y_MAX,
             merge_eps_y_max=self.cfg.OBJECT_MERGE_EPS_Y_MAX,
             assoc=self.cfg.TRACK_ASSOC,
-            vel_window_s=self.cfg.OBJECT_VEL_WINDOW_S,
-            vel_min_anchors=self.cfg.OBJECT_VEL_MIN_ANCHORS,
-            vel_min_span_s=self.cfg.OBJECT_VEL_MIN_SPAN_S,
-            vel_max_rms=self.cfg.OBJECT_VEL_MAX_RMS,
-            vel_clamp_frac=self.cfg.OBJECT_VEL_CLAMP_FRAC,
         )
 
     # ------------------------------------------------------------------
@@ -157,26 +152,14 @@ class GP8App:
             String, "/camera_debug/detections",
             self._on_camera_debug_detections, 10,
         )
-        # Belt-speed source (cfg.CONVEYOR_SOURCE): 기본 "encoder"는 기존
-        # ConveyorSpeedTracker 그대로. "camera"는 엔코더 없이 지나가는 물체들의
-        # 속도 fit(detection_intake._update_velocity)을 집계해 추론 —
-        # speed_sink로 fit을 공급받고, CONVEYOR_TOPIC 발행도 대신한다.
-        if str(self.cfg.CONVEYOR_SOURCE).strip().lower() == "camera":
-            self.conveyor = CameraSpeedTracker(
-                self._node,
-                self.cfg.CONVEYOR_TOPIC,
-                self.cfg.CONVEYOR_SPEED,
-                self.cfg.CONVEYOR_STALE_SECONDS,
-                batch_n=self.cfg.CONVEYOR_CAMERA_BATCH_N,
-            )
-            self.detection_intake.speed_sink = self.conveyor.observe
-        else:
-            self.conveyor = ConveyorSpeedTracker(
-                self._node,
-                self.cfg.CONVEYOR_TOPIC,
-                self.cfg.CONVEYOR_SPEED,
-                self.cfg.CONVEYOR_STALE_SECONDS,
-            )
+        # Encoder telemetry is the single source of truth for belt speed.
+        self.conveyor = ConveyorSpeedTracker(
+            self._node,
+            self.cfg.CONVEYOR_TOPIC,
+            self.cfg.CONVEYOR_SPEED,
+            self.cfg.CONVEYOR_STALE_SECONDS,
+            distance_topic=self.cfg.CONVEYOR_DISTANCE_TOPIC,
+        )
 
         self.traj_ctrl.wait_for_servers()
         # Now that every subscription + service/action client exists and servers
@@ -538,16 +521,39 @@ class GP8App:
         objs = []
 
         def _serialize(obj: TrackedObject, is_target: bool) -> dict:
-            y_now = float(obj.T_grasp_base[1, 3] - v * (now - obj.detect_time))
+            age = now - obj.detect_time
+            distance_now = self.conveyor.distance_at(now)
+            y_now = float(obj.y_at(now, v, distance_now))
             cam = obj.cam_pos
+            base_bbox = obj.base_bbox_grasp
+            base_bbox_now = None
+            if base_bbox is not None:
+                if (obj.bbox_encoder_distance_m is not None
+                        and distance_now is not None):
+                    bbox_travel = distance_now - obj.bbox_encoder_distance_m
+                else:
+                    bbox_time = (
+                        obj.bbox_detect_time
+                        if obj.bbox_detect_time is not None else obj.detect_time
+                    )
+                    bbox_travel = v * (now - bbox_time)
+                base_bbox_now = [
+                    [float(point[0]), float(point[1]) - bbox_travel, float(point[2])]
+                    for point in base_bbox
+                ]
             return {
                 "class": obj.class_name,
                 "y_now": y_now,
                 "x": float(obj.T_grasp_base[0, 3]),
                 "z": float(obj.T_grasp_base[2, 3]),
-                "age_s": float(now - obj.detect_time),
+                "age_s": float(age),
                 "is_target": is_target,
                 "cam": list(cam) if cam is not None else None,
+                "cam_bbox": (
+                    [list(point) for point in obj.cam_bbox]
+                    if obj.cam_bbox is not None else None
+                ),
+                "base_bbox_grasp": base_bbox_now,
             }
 
         # Currently-executing target (popped from the queue but still on the belt).
@@ -582,9 +588,15 @@ class GP8App:
         detection→queue association lives there; the app keeps only the
         frame-gate bookkeeping keyed on whether anything new was added.
         """
+        receipt_time = (
+            float(self._cam_latest.get("receipt_time", now))
+            if self._cam_latest is not None else now
+        )
+        belt_distance_at_detection = self.conveyor.distance_at(receipt_time)
         added = self.detection_intake.ingest(
             self._cam_latest, self.queue, self._active_target,
             self.conveyor.current, self._node.get_logger(),
+            belt_distance_m=belt_distance_at_detection,
         )
         if added:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
@@ -616,7 +628,10 @@ class GP8App:
         self._publish_belt_state()                # live belt + queue snapshot
 
         self._ingest_detections(now)
-        self.queue.update(now, self.conveyor.current)
+        self.queue.update(
+            now, self.conveyor.current,
+            belt_distance_m=self.conveyor.distance_m,
+        )
         if not self.queue:
             self.frame_gate.reset()
             time.sleep(self.cfg.TIME_STEP)

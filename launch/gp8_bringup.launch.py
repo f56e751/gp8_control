@@ -177,7 +177,7 @@ def generate_launch_description():
     )
     track_lead_t_arg = DeclareLaunchArgument(
         "track_lead_t",
-        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.3"),
+        default_value=EnvironmentVariable("GP8_TRACK_LEAD_T", default_value="0.0"),
         description="Throw pick: start the tracking descend this many s EARLIER to "
                     "cancel a downstream landing offset (~= miss[m]/belt[m/s]).",
     )
@@ -189,14 +189,6 @@ def generate_launch_description():
         "skill",
         default_value=EnvironmentVariable("GP8_FORCE_SKILL", default_value=""),
         description="Force ALL objects to one skill: throw|robust_throw|push (empty = class routing).",
-    )
-    # 벨트 속도 소스: "encoder"(기본, 기존 ConveyorSpeedTracker 구독) 또는
-    # "camera"(엔코더 없이 지나가는 물체 추적으로 속도 추론 + /conveyor/speed
-    # 발행 대행 — 엔코더 노드와 동시 사용 금지).
-    conveyor_source_arg = DeclareLaunchArgument(
-        "conveyor_source",
-        default_value=EnvironmentVariable("GP8_CONVEYOR_SOURCE", default_value="encoder"),
-        description="Belt speed source: encoder (default) | camera (infer from tracked objects).",
     )
     rviz_arg = DeclareLaunchArgument(
         "rviz", default_value="true",
@@ -419,8 +411,6 @@ def generate_launch_description():
             "GP8_TRACK_LEAD_T": LaunchConfiguration("track_lead_t"),
             # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
             "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
-            # 벨트 속도 소스: `conveyor_source:=` -> GP8_CONVEYOR_SOURCE.
-            "GP8_CONVEYOR_SOURCE": LaunchConfiguration("conveyor_source"),
             # Visualization-only impact plane; never changes robot motion.
             "GP8_THROW_VIZ_IMPACT_Z": LaunchConfiguration("throw_viz_impact_z"),
             "GP8_THROW_GOAL_X": LaunchConfiguration("throw_goal_x"),
@@ -458,7 +448,6 @@ def generate_launch_description():
         track_z_speed_arg,
         track_lead_t_arg,
         skill_arg,
-        conveyor_source_arg,
         app_arg,
         moveit_arg,
         rviz_arg,
