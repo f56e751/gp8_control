@@ -34,6 +34,38 @@ class SimConfig:
     joint_names: tuple = ('joint_2_l', 'joint_3_u', 'joint_5_b', 'finger_joint')
     max_speed_deg: tuple = (385.0, 520.0, 550.0)  # deg/s  [repo env/robot_env_dt.py:40]
     max_speed_factor: float = 1.0                 # [repo env/robot_env_dt.py:47]
+
+    # --- joint limits -----------------------------------------------------
+    # Position limits.  Neither the paper nor the released code clips joint
+    # positions -- their ROS-Gazebo arm is driven by an effort controller, so
+    # the URDF limits act as physical hard stops and the policy never sees an
+    # out-of-range pose.  A self-contained integrator has no such stop, so the
+    # limits must be applied explicitly or the learned swing uses angles the
+    # real GP8 cannot reach.
+    # Values are the Motoman GP8 limits of joints 2/3/5 mapped into this
+    # planar frame.  CAREFUL WITH SIGNS: the planar convention here relates to
+    # the GP8 planner frame by q_L = t2, q_U = -t3, q_B = -t5, so the U and B
+    # bounds swap ends under negation:
+    #     q_L in [-65, 145] -> t2 in [ -65, 145]
+    #     q_U in [-190, 70] -> t3 in [ -70, 190]
+    #     q_B in [-135,135] -> t5 in [-135, 135]
+    q_min_deg: tuple = (-65.0, -70.0, -135.0)
+    q_max_deg: tuple = (145.0, 190.0, 135.0)
+    enforce_position_limits: bool = True
+
+    # Acceleration limit on the commanded joint velocity:
+    #     |w_t - w_{t-1}| <= qdd_max * dt,   qdd_max = qdd_factor * qd_max
+    # Not in the paper either (a real drive simply cannot step its velocity
+    # discontinuously; Gazebo's inertia enforced it for them).  Factor 3 =
+    # three times the velocity limit (user directive 2026-08-03), matching
+    # THR/dt_gp8_env.  The GP8 URDF velocity limits for these joints
+    # (386.7/520/550 deg/s) agree with the max_speed_deg above, so URDF-based
+    # and constant-based give the same 1160/1560/1650 deg/s^2.  A looser
+    # factor (THR's NLP convention is 5) lets the policy flip between
+    # accelerating and decelerating every control step, which reads as visible
+    # trembling in the rendered motion.
+    qdd_factor: float = 3.0
+    enforce_acceleration_limit: bool = True
     smooth_factor: float = 0.0                    # complementary velocity filter
     #                                               [repo env/robot_env_dt.py:20] (disabled)
 
@@ -74,6 +106,24 @@ class SimConfig:
     #   simulation-tuning step (Bayesian optimization, S4.4) would optimize.
     gravity: float = 9.81
 
+    # Which joint velocity the object inherits at release.
+    #   'segment' : mean velocity actually realized over the control step,
+    #               (q_k - q_{k-1})/dt  -- the DEFAULT and the physically
+    #               sensible one.
+    #   'instant' : the instantaneous value at the step boundary.
+    # Why this matters: the command of eq. (5.1) is re-issued every step
+    # relative to the *current* joint position, so with tau_act < dt the joint
+    # nearly reaches its setpoint inside the step and its instantaneous
+    # velocity has decayed to ~27% of the commanded w by the boundary (measured
+    # 0.27-0.41x, vs 0.84-0.89x for the segment mean).  Releasing on that decayed
+    # value throws at ~1/3 speed, i.e. ~1/9 range: under 'instant' even a
+    # CEM-optimal swing reaches only 1.68 m although goals go to 2.0 m.
+    # A real arm swinging at hundreds of deg/s cannot stop and restart every
+    # 100 ms, so 'instant' is a modelling artifact, not physics.  The same bug
+    # was found and fixed independently in THR/dt_gp8_env.py (its env predicted
+    # 1.70 m for throws that measured 1.04 m in the PyBullet rig).
+    release_velocity: str = 'segment'
+
     # --- object -----------------------------------------------------------
     # cube 1.5x1.5x1.5 cm, 15 g [paper S5.1]
     object_half_diag: float = 0.5 * 0.015 * np.sqrt(2)  # ground-contact height
@@ -90,6 +140,18 @@ class SimConfig:
     @property
     def max_speed_rad(self) -> np.ndarray:
         return np.asarray(self.max_speed_deg) * np.pi / 180.0
+
+    @property
+    def q_min_rad(self) -> np.ndarray:
+        return np.asarray(self.q_min_deg) * np.pi / 180.0
+
+    @property
+    def q_max_rad(self) -> np.ndarray:
+        return np.asarray(self.q_max_deg) * np.pi / 180.0
+
+    @property
+    def qdd_max_rad(self) -> np.ndarray:
+        return self.qdd_factor * self.max_speed_rad
 
 
 # A stand-in for the physical robot used by the sim2real fine-tuning demo:

@@ -17,7 +17,7 @@ import os
 import torch
 import torch.nn as nn
 
-from .trajectory_gpt2 import GPT2Config, GPT2Model   # vendored: was `from model.trajectory_gpt2 import ...`
+from .trajectory_gpt2 import GPT2Config, GPT2Model   # vendored
 
 
 class DecisionTransformer(nn.Module):
