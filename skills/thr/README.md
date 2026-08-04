@@ -15,6 +15,9 @@
 | `dt_model/dt_config.py` | `Thr_DT/config.py` | 없음 |
 | `dt_model/trajectory_gpt2.py` | `Thr_DT/model/trajectory_gpt2.py` | 없음 |
 | `dt_model/decision_transformer.py` | `Thr_DT/model/decision_transformer.py` | import 1줄 |
+| `dt_model/her.py` | `Thr_DT/agent/her.py` | 없음 |
+| `dt_model/trainer.py` | `Thr_DT/agent/trainer.py` | 없음 |
+| `dt_model/batch.py` | `Thr_DT/train_dt_offline.py` 의 `dataset_stats`·`make_get_batch` | 함수 2개 발췌 |
 | `tossingbot/{__init__,config,physics}.py` | `Thr_Phy/tossingbot/` | 없음 |
 | `weights/gp8_dt_best.pth` | `THR/weights_gp8/dt_best.pth` | 없음 |
 | `weights/gp8_dt_best_v9.pth` | `THR/weights_gp8_v9/dt_best.pth` | 없음 |
@@ -32,9 +35,14 @@ dt_model/decision_transformer.py
                                                                  → from .trajectory_gpt2 import …
 ```
 
-로직·상수·수식은 한 글자도 건드리지 않았다. 학습/데이터수집/시뮬(`dt_train_gp8.py`,
-`nlp_planner.py`, `sim/`, `bench_jitter.py`)은 가져오지 않았다 — 로봇에서는
-계획/추론만 한다. `nlp_planner.py` 를 안 가져온 이유는 pybullet 의존(시뮬 dry-run
+로직·상수·수식은 한 글자도 건드리지 않았다. 시뮬(`nlp_planner.py`, `sim/`,
+`bench_jitter.py`)과 오프라인 대규모 학습(`dt_train_gp8.py`)은 가져오지 않았다.
+
+`dt_model/batch.py` 만 파일 전체가 아니라 함수 2개 발췌인데, 원본
+`train_dt_offline.py` 가 `env.throw_env`(평면 시뮬)와 `evaluate_dt` 를 import 하기
+때문이다 — 로봇 rig 는 `dt_gp8_env`(GP8) 라서 평면 env 를 끌어올 이유가 없다.
+이 3개(her/trainer/batch)는 **실기 sim2real 파인튜닝**
+(`tools/collect_real_throws_gp8.py` → `tools/finetune_dt_gp8.py`)에만 쓰인다. `nlp_planner.py` 를 안 가져온 이유는 pybullet 의존(시뮬 dry-run
 충돌 검사)과 fork 기반 병렬 multistart 때문이고, 그 두 가지를 뺀 순차판이
 `skills/thr_planners.nlp_traj_fn` 이다 (거기 docstring 에 차이 3가지 명시).
 

@@ -408,6 +408,14 @@ def dt_traj_fn(target, p_start=None, v_start=None, ctx=None, logger=None,
     if k_rel is None:
         raise ValueError(f"DT 미-release (d_g={d_clip:.2f}m, {len(mem)}스텝 만료)")
 
+    return dt_plan_from_mem(mem, k_rel, x_land, p, d_clip, weights, logger)
+
+
+def dt_plan_from_mem(mem, k_rel, x_land, target, d_clip, weights, logger=None,
+                     alpha=None):
+    """rollout 결과(mem) → traj_fn plan dict. `dt_traj_fn` 과 실기 데이터 수집이
+    공유한다 (수집은 게인 적용 rollout 을 쓰므로 이 부분만 따로 뗐다)."""
+    p = np.asarray(target, float)
     model, arm, cfg, torch = load_dt(weights, logger)
     Qp, t_nodes, t_rel = dt_cem.traj_from_seq(arm, None, k_rel, mem=mem)
 
@@ -425,13 +433,63 @@ def dt_traj_fn(target, p_start=None, v_start=None, ctx=None, logger=None,
         Q = np.clip(Q, GP8_Q_MIN, GP8_Q_MAX)
         Qd = np.gradient(Q, ts, axis=0)
 
-    _log(logger, f"  DT: d_g={d_clip:.3f}m, {len(mem)}스텝, release k={k_rel} "
-                 f"→ t_rel={t_rel:.3f}s, 아크 {ts[-1]:.3f}s "
-                 f"(env 예측 착지 {x_land:.3f}m)")
+    _log(logger, f"  DT: d_g={d_clip:.3f}m"
+                 + (f", α={alpha:.2f}" if alpha is not None else "")
+                 + f", {len(mem)}스텝, release k={k_rel} → t_rel={t_rel:.3f}s, "
+                   f"아크 {ts[-1]:.3f}s (env 예측 착지 {x_land:.3f}m)")
     return dict(ts=ts, Q=Q, Qd=Qd, t_rel=float(t_rel), q_start=Q[0],
                 info=dict(model="dt", d_g=d_clip, x_land_env=x_land,
-                          k_rel=int(k_rel), n_steps=len(mem),
+                          k_rel=int(k_rel), n_steps=len(mem), alpha=alpha,
                           weights=os.path.basename(weights)))
+
+
+# --- 실기 데이터 수집용: 액션 게인 α 를 곱한 rollout [논문 §4.4] ----------------
+def dt_rollout_with_gain(d_goal, alpha, weights: str = DT_WEIGHTS,
+                         target_return=DT_TARGET_RETURN, logger=None):
+    """THR `dt_finetune_gp8._rollout_with_gain` 의 이식 (수정 없음).
+
+    `dt_rollout` 과 같되 **모터 액션에만** 게인 α 를 곱하고 [-1,1] 로 클립한다
+    (그리퍼 액션 a_gr 은 그대로 — 릴리즈 판정이 바뀌면 안 된다). 논문 §4.4 의
+    α ~ U(1, α_max) 로 실기 영역을 탐색해 reality gap 을 메우는 절차다.
+
+    저장하는 mem 의 액션은 **게인이 적용된, 실제로 실행되는 액션**이어야 한다 —
+    파인튜닝이 배워야 할 것이 '실제로 실행된 것'이기 때문.
+    리턴: (mem, k_rel, x_land_env).
+    """
+    model, arm, cfg, torch = load_dt(weights, logger)
+    arm.reset()
+    arm.update_target(np.array([float(d_goal), 0.0, 0.0]))
+
+    states = torch.zeros((0, model.state_dim), dtype=torch.float32)
+    actions = torch.zeros((0, model.act_dim), dtype=torch.float32)
+    rewards = torch.zeros(0, dtype=torch.float32)
+    rtg = torch.tensor(target_return, dtype=torch.float32).reshape(1, 1)
+    timesteps = torch.tensor(0, dtype=torch.long).reshape(1, 1)
+
+    mem, k_rel, x_land, done, k = [], None, None, False, 0
+    while not done:
+        s4 = arm.get_state()
+        state = np.append(s4, arm.target[0])
+        states = torch.cat([states, torch.from_numpy(state).reshape(
+            1, model.state_dim).float()])
+        actions = torch.cat([actions, torch.zeros((1, model.act_dim))])
+        rewards = torch.cat([rewards, torch.zeros(1)])
+        with torch.no_grad():
+            a = model.get_action(states, actions, rewards, rtg, timesteps)
+        a = a.detach().cpu().numpy().copy()
+        a[:-1] = np.clip(a[:-1] * float(alpha), -1.0, 1.0)      # 게인 [§4.4]
+        actions[-1] = torch.from_numpy(a).float()
+        gr_open = a[-1] < arm.gripper_thresh
+        reward, done, _, obj_pos, success = arm.step(a)
+        mem.append((s4, a.copy(), reward, done, success))
+        if gr_open and k_rel is None:
+            k_rel, x_land = k, float(obj_pos[0])
+        k += 1
+        rewards[-1] = reward
+        rtg = torch.cat([rtg, rtg[0, -1].reshape(1, 1)], dim=1)
+        timesteps = torch.cat(
+            [timesteps, torch.ones((1, 1), dtype=torch.long) * k], dim=1)
+    return mem, k_rel, x_land
 
 
 # ===========================================================================
