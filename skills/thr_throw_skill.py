@@ -119,16 +119,27 @@ if TYPE_CHECKING:
 LAND_GATE = {"nlp": 0.10, "dt": 0.40, "phy": 0.60}
 LAND_GATE_ENV = os.environ.get("GP8_THR_LAND_GATE")
 
-# 컨트롤러 증분 governor 모사에 쓰는 스트림 주기 (trajectory_controller.STREAM_DT)
-STREAM_PERIOD: float = 0.004
 # z 바닥 게이트를 arm 하기 전 요구하는 상승 여유 [m] (아래 GATE 2 주석 참고)
 Z_ARM_MARGIN: float = float(os.environ.get("GP8_THR_Z_ARM_MARGIN", "0.02"))
-# governor clamp 로 릴리즈 상태가 이만큼 넘게 바뀌면 거부
-MAX_LAG_DEG: float = float(os.environ.get("GP8_THR_MAX_LAG_DEG", "2.0"))
-MAX_CLAMP_SHIFT: float = float(os.environ.get("GP8_THR_MAX_CLAMP_SHIFT", "0.10"))
 
-# NLP 자체의 기둥 회피 제약을 되살릴지 (THR 기본은 False — 위 docstring 참고)
-if os.environ.get("GP8_THR_NLP_CART", "0") not in ("0", "", "false"):
+# 속도 게이트 기준 = **URDF/데이터시트 관절 속도 한계** (robots/gp8._VELOCITY_LIMITS,
+# S/L/U/R/B/T = 455/385/520/550/550/1000 °/s). 로봇이 물리적으로 낼 수 있는 속도이고
+# NLP·DT env 가 계획에 거는 한계(throwing.GP8_QD_MAX)와 같은 값이다.
+#
+# ⚠ 컨트롤러 외부증분 스트리밍 상한(robots/gp8._RT_STREAM_VELOCITY_LIMITS, 위 값의
+#   절반)은 **여기서 고려하지 않는다** (2026-08-04 사용자 지시). 그건 명령을 밀어넣는
+#   통로 크기의 문제라 컨트롤러 쪽(axis_increment_factor)에서 다룰 사안이고, 계획이
+#   로봇의 물리 한계를 지켰는지와는 별개다. 이전 버전은 이 상한으로 governor clamp 를
+#   모사해 거부/경고를 냈는데, 그 때문에 물리적으로 멀쩡한 궤적이 대량 기각됐다.
+VEL_GATE_MARGIN: float = float(os.environ.get("GP8_THR_VEL_MARGIN", "1.0"))
+
+# NLP 자체의 카타시안(기둥 회피) 제약 — **실기 기본은 ON** (2026-08-04 사용자 지시).
+# THR 은 시뮬용으로 이걸 껐고(위반을 보고만 함) 그 상태로 계획하면 스윙이 바닥/기둥을
+# 파고드는 해가 정상 수렴한다 (실측: 1.60 m 타겟에서 z_min=−0.021 m, x_min=+0.037 m).
+# 시뮬은 그래도 되지만 실기는 실제로 친다. GP8_THR_NLP_CART=0 으로 끌 수 있다.
+# 주의: 이 값은 warm DB 유효성 키(warm_db_params 의 'col')에 들어가므로, 켜고 끄면
+# 서로 다른 config 로 갈린다 — 각각의 DB 가 필요하다.
+if os.environ.get("GP8_THR_NLP_CART", "1") not in ("0", "", "false"):
     throw_nlp.CART_CONSTRAINTS = True
 
 # --- NLP 스윙 속도 노브 (실기 전용) ------------------------------------------
@@ -146,29 +157,6 @@ if _W1:
 _QDD = os.environ.get("GP8_THR_NLP_QDD_SCALE")
 if _QDD:
     throw_nlp.QDD_LIM = float(_QDD) * throw_nlp.GP8_QD_MAX
-
-
-def _rate_limited(q_cmd: np.ndarray, t_cmd: np.ndarray, rt: np.ndarray,
-                  period: float = STREAM_PERIOD):
-    """컨트롤러 증분 governor 를 모사해 실제로 나올 관절 궤적을 추정.
-
-    스트리머는 명령 경로를 4 ms 격자로 리샘플해 JGPC 로 publish 하고, YRC 증분
-    motion governor + B6 host command_limiter 가 per-cycle 증분을
-    `rt_stream_velocity_limits · period` 로 묶는다. 그 rate limiter 를 돌린다.
-    리턴: (grid, cmd, act, vel) — 전부 4 ms 격자, (6, m).
-    """
-    q_cmd = np.asarray(q_cmd, float)
-    t_cmd = np.asarray(t_cmd, float).ravel()
-    grid = np.arange(0.0, float(t_cmd[-1]) + 1e-12, period)
-    cmd = np.stack([np.interp(grid, t_cmd, q_cmd[j]) for j in range(q_cmd.shape[0])])
-    act = np.zeros_like(cmd)
-    act[:, 0] = cmd[:, 0]
-    step = np.asarray(rt, float) * period
-    for k in range(1, cmd.shape[1]):
-        act[:, k] = act[:, k - 1] + np.clip(cmd[:, k] - act[:, k - 1], -step, step)
-    vel = np.zeros_like(act)
-    vel[:, 1:] = np.diff(act, axis=1) / period
-    return grid, cmd, act, vel
 
 
 def _predict_landing(q_robot, qd_robot, land_z: float):
@@ -197,41 +185,18 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
     **여기가 실질적인 유일한 방어선**이다.
     리턴 dict: reject(str|None), warns(list), 진단 수치들.
     """
-    rt = getattr(robot, "rt_stream_velocity_limits", None)
-    rt = (np.asarray(robot.velocity_limits, float) if rt is None
-          else np.asarray(rt, float))
+    qd_lim = np.asarray(robot.velocity_limits, float)      # URDF/데이터시트
     jl = np.asarray(robot.joint_limits, float)
     p_target = np.asarray(p_target, float).ravel()
     gate = float(LAND_GATE_ENV) if LAND_GATE_ENV else LAND_GATE.get(model, 0.40)
     out: dict = {"reject": None, "warns": [], "land_gate": gate}
 
-    # --- 실기 추종 모사: governor clamp 가 릴리즈 상태를 바꾸는가 ---
-    #
-    # 기준선은 **계획의 해석적 릴리즈 상태**다. 스트리머(`_stream_trajectory`)가
-    # 위치+속도를 cubic Hermite 로 4 ms 리샘플하므로 knot 의 속도가 그대로
-    # 재현된다 — 즉 governor 가 개입하지 않는 한 실기 릴리즈 상태 = 계획 그대로다.
-    #
-    # governor 효과만 떼려면 rate limiter 를 태운 것과 안 태운 것을 **같은
-    # 추정기**로 비교해야 한다. 4 ms 후진차분은 해석적 q̇ 보다 ~2 ms 뒤처진 값을
-    # 주는데(빠른 아크에서 수십 cm 착지 차이), 양쪽에 똑같이 걸면 그 bias 가
-    # 상쇄되고 순수 clamp 효과만 남는다. 그 delta 를 해석적 기준선에 더한다.
-    #   (구버전은 후진차분값을 그대로 착지 예측으로 썼다 — 추정기 bias 가 예측에
-    #    섞여 DT 아크에서 착지가 20~28 cm 틀어지고 경고가 쏟아졌다. 2026-08-04 수정.)
-    _, cmd, act, act_v = _rate_limited(arc_q, arc_t, rt)
-    cmd_v = np.zeros_like(cmd)
-    cmd_v[:, 1:] = np.diff(cmd, axis=1) / STREAM_PERIOD
-    out["lag_deg"] = float(np.rad2deg(np.abs(cmd[:, -1] - act[:, -1]).max()))
-    p_ideal, p_eff, v_eff = _predict_landing(arc_q[:, -1], arc_qd[:, -1], p_target[2])
-    p_act, _, _ = _predict_landing(act[:, -1], act_v[:, -1], p_target[2])
-    p_cmd, _, _ = _predict_landing(cmd[:, -1], cmd_v[:, -1], p_target[2])
-    if p_ideal is not None and p_act is not None and p_cmd is not None:
-        delta = p_act - p_cmd                       # governor 효과만 (bias 상쇄)
-        p_land = p_ideal + delta
-        out["clamp_shift"] = float(np.linalg.norm(delta))
-    else:
-        p_land = p_ideal if p_act is not None else None
-        out["clamp_shift"] = float("nan")
-    out.update(p_land=p_land, p_eff=p_eff, v_eff=v_eff, p_land_ideal=p_ideal)
+    # --- 착지 예측: 계획의 **해석적** 릴리즈 상태 그대로 ---
+    #     스트리머(`_stream_trajectory`)가 위치+속도를 cubic Hermite 로 4 ms
+    #     리샘플하므로 knot 의 속도가 그대로 재현된다 — 즉 실기 릴리즈 상태는
+    #     계획 그대로다. 별도 보정 없이 이 값을 쓴다.
+    p_land, p_eff, v_eff = _predict_landing(arc_q[:, -1], arc_qd[:, -1], p_target[2])
+    out.update(p_land=p_land, p_eff=p_eff, v_eff=v_eff)
     out["d_land"] = float(np.linalg.norm(p_land)) if p_land is not None else float("nan")
     out["err"] = (float(np.linalg.norm(p_land - p_target[:2]))
                   if p_land is not None else float("nan"))
@@ -245,24 +210,15 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
                          f"({np.rad2deg(arc_q[j, k]):+.1f}°, 한계 "
                          f"[{np.rad2deg(jl[j, 0]):+.1f}, {np.rad2deg(jl[j, 1]):+.1f}]°)")
 
-    # --- ② 속도/추종: raw peak 이 아니라 모사한 릴리즈 상태로 판단 ---
-    ratio = np.abs(arc_qd) / rt[:, None]
+    # --- ② 관절 속도 한계 (URDF/데이터시트) ---
+    ratio = np.abs(arc_qd) / qd_lim[:, None]
     out["peak_vel_ratio"] = float(ratio.max())
-    out["ok_track"] = (out["lag_deg"] <= MAX_LAG_DEG
-                       and not (out["clamp_shift"] > MAX_CLAMP_SHIFT))
-    if not out["ok_track"] and out["reject"] is None:
+    out["ok_vel"] = out["peak_vel_ratio"] <= VEL_GATE_MARGIN
+    if not out["ok_vel"] and out["reject"] is None:
         j = int(np.argmax(ratio.max(axis=1)))
-        out["reject"] = (
-            f"증분 governor clamp 로 릴리즈 상태가 바뀐다 — 릴리즈 시점 추종 오차 "
-            f"{out['lag_deg']:.2f}° (한계 {MAX_LAG_DEG:.1f}°), 착지 이동 "
-            f"{out['clamp_shift'] * 100:.1f} cm (한계 {MAX_CLAMP_SHIFT * 100:.0f} cm). "
-            f"최대 속도 J{j + 1} {np.rad2deg(np.abs(arc_qd[j]).max()):.0f}°/s vs "
-            f"RT 상한 {np.rad2deg(rt[j]):.0f}°/s")
-    elif out["peak_vel_ratio"] > 1.0:
-        out["warns"].append(
-            f"아크 최대 속도가 RT 스트림 상한의 {out['peak_vel_ratio']:.2f}배 — "
-            f"governor 모사 결과 릴리즈 추종오차 {out['lag_deg']:.2f}° / 착지 이동 "
-            f"{out['clamp_shift'] * 100:.1f} cm 로 흡수된다")
+        out["reject"] = (f"관절속도 한계 초과 J{j + 1} "
+                         f"{np.rad2deg(np.abs(arc_qd[j]).max()):.0f}°/s > "
+                         f"{np.rad2deg(qd_lim[j] * VEL_GATE_MARGIN):.0f}°/s (URDF)")
 
     # --- ③ Cartesian 안전 엔벨로프 (THR fk = 실물 tool 0.240 기준) ---
     P = np.array([fk_pos(arc_q[:, k] * _PLANNER_SIGN) for k in range(arc_q.shape[1])])
@@ -273,8 +229,9 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
         out["reject"] = (f"Cartesian 엔벨로프 위반 (x_min={x_min:+.3f}m, "
                          f"z_min={z_min:+.3f}m, z_max={z_max:+.3f}m; 한계 "
                          f"x>{MIN_TCP_X:.2f}, {MIN_TCP_Z:.2f}<z<{MAX_TCP_Z:.2f})"
-                         + ("  ※ nlp 은 CART_CONSTRAINTS=False 라 계획에 기둥 회피가 "
-                            "없다 — GP8_THR_NLP_CART=1 로 되살릴 수 있다"
+                         + ("  ※ NLP 의 기둥 회피는 release 창까지만 활성이고 바닥"
+                            " 클리어런스는 hard 제약이 아니다 (throw_nlp 제약 3b) — "
+                            "감속 꼬리가 내려앉는 해는 여기서만 걸린다"
                             if model == "nlp" else ""))
 
     # --- ④ 착탄 ---
@@ -426,7 +383,6 @@ class ThrThrowSkill(RobustThrowSkill):
             t_rel=float(ts[i_rel]), half_window=half,
             d_land=chk["d_land"], err=chk["err"], p_land=chk["p_land"],
             v_eff=chk["v_eff"], sens_mm_per_10ms=sens,
-            lag_deg=chk["lag_deg"], clamp_shift=chk["clamp_shift"],
             peak_vel_ratio=chk["peak_vel_ratio"], plan_info=plan.get("info", {}))
         ctx.log.info(
             f"{self.model} throw: 아크 {ts[-1]:.3f}s ({len(ts)} 샘플), "
@@ -435,8 +391,8 @@ class ThrThrowSkill(RobustThrowSkill):
             + f", lift {l_ts[-1]:.2f}s | 예측 착지 {chk['d_land']:.3f} m "
               f"(목표 오차 {chk['err'] * 100:.1f} cm, 게이트 {chk['land_gate'] * 100:.0f}) | "
               f"|v_release|={np.linalg.norm(chk['v_eff']):.2f} m/s, "
-              f"민감도 {sens:.0f} mm/10 ms | 속도 peak {chk['peak_vel_ratio']:.2f}×RT, "
-              f"clamp {chk['clamp_shift'] * 100:.1f} cm")
+              f"민감도 {sens:.0f} mm/10 ms | 속도 peak "
+              f"{chk['peak_vel_ratio']:.2f}× (URDF 한계 대비)")
         return res, (l_traj, l_vel, l_ts)
 
     # ------------------------------------------------------------------
@@ -498,14 +454,11 @@ class ThrThrowSkill(RobustThrowSkill):
         # ---- 감속 + 체인 ----
         # M1 은 --vel-scale 로 줄인 ctx.M1 을 쓰지 않는다: 진입 속도가 M1 을 넘으면
         # trajectory() 가 그 관절 행을 0 으로 남긴다. 스윙 속도로 감속할 수 있어야
-        # 하므로 로봇 한계(실측 RT 상한과 데이터시트 중 작은 쪽)를 쓴다.
+        # 하므로 **URDF 관절 속도 한계**를 쓴다 (스트리밍 상한은 고려하지 않는다 —
+        # 위 VEL_GATE_MARGIN 주석 참고).
         q_end, qd_end = a_traj[:, -1], a_vel[:, -1]
-        rt = getattr(ctx.robot, "rt_stream_velocity_limits", None)
-        rt = (np.asarray(ctx.robot.velocity_limits, float) if rt is None
-              else np.asarray(rt, float))
-        M1_stop = np.minimum(
-            np.asarray(ctx.robot.velocity_limits, float) * ctx.cfg.JOINT_VEL_LIMIT_SCALE,
-            rt)
+        M1_stop = (np.asarray(ctx.robot.velocity_limits, float)
+                   * ctx.cfg.JOINT_VEL_LIMIT_SCALE)
         M2_stop = M1_stop * ctx.cfg.JOINT_ACCEL_LIMIT_SCALE
         if np.any(np.abs(qd_end) > M1_stop):
             j = int(np.argmax(np.abs(qd_end) - M1_stop))
@@ -628,8 +581,8 @@ class ThrThrowSkill(RobustThrowSkill):
             "model": self.model, "arc_T": res["t_f"], "lift_T": float(l_ts[-1]),
             "t_rel": t_rel, "half_window": half, "d_land": res["d_land"],
             "err": res["err"], "v_release": float(np.linalg.norm(res["v_eff"])),
-            "sens_mm_per_10ms": res["sens_mm_per_10ms"], "lag_deg": res["lag_deg"],
-            "clamp_shift": res["clamp_shift"], "release_idx": release_idx,
+            "sens_mm_per_10ms": res["sens_mm_per_10ms"],
+            "peak_vel_ratio": res["peak_vel_ratio"], "release_idx": release_idx,
             "n_steps_traj": int(traj.shape[1]),
         }
         # 부모의 CSV 로거가 참조하는 필드도 채워 둔다.
@@ -687,8 +640,7 @@ class ThrThrowSkill(RobustThrowSkill):
             "err_m": round(m.get("err", 0.0), 4),
             "v_release_mps": round(m.get("v_release", 0.0), 3),
             "sens_mm_per_10ms": round(m.get("sens_mm_per_10ms", 0.0), 1),
-            "lag_deg": round(m.get("lag_deg", 0.0), 3),
-            "clamp_shift_m": round(m.get("clamp_shift", 0.0), 4),
+            "peak_vel_ratio": round(m.get("peak_vel_ratio", 0.0), 3),
             "release_idx": m.get("release_idx", ""),
             "n_steps_traj": m.get("n_steps_traj", ""),
             "io_ms": round(lt["io_ms"], 1) if lt.get("io_ms") is not None else "",
