@@ -312,14 +312,19 @@ class ThrThrowSkill(RobustThrowSkill):
 
     name = "thr_throw"
 
-    def __init__(self, ctx, model: str = "nlp", weights: "Optional[str]" = None) -> None:
+    def __init__(self, ctx, model: str = "nlp", weights: "Optional[str]" = None,
+                 traj_fn=None) -> None:
         super().__init__(ctx)
         if model not in thr_planners.MODELS:
             raise ValueError(f"알 수 없는 모델: {model} "
                              f"(가능: {', '.join(thr_planners.MODELS)})")
         self.model = model
         self.weights = weights
-        self._traj_fn = thr_planners.get_traj_fn(model, weights, logger=ctx.log)
+        # traj_fn 주입: 실기 데이터 수집(tools/collect_real_throws_gp8.py)이 액션
+        # 게인 α 를 먹인 rollout 을 쓰기 위해 갈아끼운다. None 이면 모델 기본값.
+        # 주입해도 게이트·lift·감속·dispatch 는 전부 그대로 탄다.
+        self._traj_fn = (traj_fn if traj_fn is not None
+                         else thr_planners.get_traj_fn(model, weights, logger=ctx.log))
         self._last_thr_meta: dict = {}
         self._warned_tool = False
 
