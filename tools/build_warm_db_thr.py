@@ -301,6 +301,8 @@ def main():
 
         # 게이트 통과 해 중 J 최소 (없으면 J 최소 + gate_ok=False)
         # J 오름차순이라 '첫 게이트 통과' 가 곧 '통과 해 중 J 최소' 다.
+        # (2026-08-04: 한때 'RT 스트림 상한 이내인 해 우선' 규칙을 넣었다가 제거 —
+        #  스트리밍 상한은 게이트에서 빠졌다. thr_throw_skill.VEL_GATE_MARGIN 주석 참고.)
         feas.sort(key=lambda x: x[0])
         pick, pick_gate, pick_ok = None, None, False
         for J, tag, r in feas:
@@ -321,7 +323,6 @@ def main():
                      err_pred=float(pick_gate["err"]),
                      d_land=float(pick_gate["d_land"]),
                      peak_vel_ratio=float(pick_gate["peak_vel_ratio"]),
-                     clamp_shift=float(pick_gate["clamp_shift"]),
                      reject=pick_gate["reject"])
         thr_planners.db_merge_save([entry], args.out)   # 쌍 단위로 즉시 반영
         n_done += 1
@@ -332,6 +333,7 @@ def main():
               f"t_f={res['t_f']:.2f}s 수렴 {len(feas)}/{len(cands)} "
               f"착지오차 {pick_gate['err'] * 100:.1f}cm "
               f"vpeak {pick_gate['peak_vel_ratio']:.2f}× "
+
               f"[{el:.0f}s, ETA {eta / 60:.0f}분]"
               + ("" if pick_ok else f"\n      거부: {pick_gate['reject']}"),
               flush=True)

@@ -125,13 +125,12 @@ def _scan(model: str, weights, targets, points) -> None:
         ok = c["reject"] is None
         n_ok += int(ok)
         print(f"{head} | {'ok' if c['ok_joint'] else 'LIM!':>4} "
-              f"{'ok' if c['ok_track'] else 'TRK!':>4} "
+              f"{'ok' if c['ok_vel'] else 'VEL!':>4} "
               f"{'ok' if c['ok_cart'] else 'TCP!':>4} "
               f"{'ok' if c['ok_land'] else 'LAND':>4} | {c['d_land']:9.3f} "
               f"{c['err'] * 100:6.1f}c | {np.linalg.norm(c['v_eff']):5.2f} "
               f"{sens:6.0f}mm {half * 2e3:5.0f}ms | "
-              f"{c['clamp_shift'] * 100:5.1f}c {c['lag_deg']:5.2f} | "
-              f"{dt_plan:5.1f}s")
+              f"{c['peak_vel_ratio']:6.2f} | {dt_plan:5.1f}s")
         if c["reject"] is not None:
             notes.append(f"  거부 {np.round(tgt, 3)}: {c['reject']}")
         for w in c["warns"]:
@@ -140,7 +139,7 @@ def _scan(model: str, weights, targets, points) -> None:
     print(f"\n실행 가능: {n_ok}/{len(targets)} target")
     for line in notes:
         print(line)
-    print("\n관절=GP8 위치 한계 / 추종=증분 governor 모사 후 릴리즈 상태 보존 / "
+    print("\n관절=GP8 위치 한계 / 속도=URDF 관절속도 한계 / "
           "TCP=Cartesian 안전 엔벨로프 / 착탄=예측 오차 게이트")
     print("예측착지=THR 기하(tool 0.240) + 무항력 포물선 기준 착지 거리, "
           "민감도=릴리즈 10 ms 어긋남당 착지 변화")
