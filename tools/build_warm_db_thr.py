@@ -185,7 +185,10 @@ def gate_of(res, p_target, robot):
     Qd = (np.array([qd_of(t) for t in ts]) * _PLANNER_SIGN).T
     t_rel = float(res["t_star"])            # 윈도우 중앙 = 런타임 릴리즈 시점
     i = int(np.argmin(np.abs(ts - t_rel)))
-    c = check_arc(Q[:, :i + 1], Qd[:, :i + 1], ts[:i + 1], p_target, robot, "nlp")
+    # cart_blocking=True — **수집 시에는 카타시안 위반 해를 제외**한다
+    # (런타임은 보고만 한다; 2026-08-04 사용자 지시).
+    c = check_arc(Q[:, :i + 1], Qd[:, :i + 1], ts[:i + 1], p_target, robot, "nlp",
+                  cart_blocking=True)
     return c["reject"] is None, c
 
 

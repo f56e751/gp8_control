@@ -411,6 +411,40 @@ def dt_traj_fn(target, p_start=None, v_start=None, ctx=None, logger=None,
     return dt_plan_from_mem(mem, k_rel, x_land, p, d_clip, weights, logger)
 
 
+def _dt_segment_velocity(Qp, t_nodes, ts, t_rel):
+    """DT 10 Hz 노드 궤적 → dense 격자의 관절속도 (planner 6축).
+
+    **`np.gradient` 를 쓰지 않는다.** 명령 경로는 10 Hz 노드를 잇는 직선이므로
+    그 사이 속도는 상수(piecewise-constant)다. `np.gradient` 는 노드에서 양쪽
+    구간을 평균내는데, 하필 릴리즈가 노드에 있어서 릴리즈 속도가 뭉개진다.
+
+    실측 (d_g=1.35 m): env 의 릴리즈 속도(구간 평균)는 B = −294.4 °/s 인데
+    followthrough 첫 노드가 B 하한 10° 에 clip 되어 그 구간 기울기가 −193.9 로
+    줄고, gradient 가 둘을 평균내 **−244.2 °/s** 를 내보냈다 (17% 낮음).
+    사거리는 v² 에 비례하므로 (244/294)² ≈ 0.69 — 약 30% 짧게 날아간다.
+
+    그래서 각 dense 샘플에 **자기가 속한 구간의 기울기**를 주고, 릴리즈 노드만
+    **들어오는 구간**의 기울기를 쓴다. 물체는 그 스텝을 마친 순간 손을 떠나므로
+    이쪽이 물리적으로 맞고, Thr_DT env 의 릴리즈 규약(`release_velocity='segment'`,
+    `(q_k − q_{k−1})/Δt`, PAPER_TRACE §4.3)과도 정확히 일치한다.
+
+    (논문 §5.1 자체는 릴리즈 속도 규약을 명시하지 않는다 — 실기·Gazebo 에선 물리가
+     결정하므로. 재구현에서 '구간 평균' 으로 정한 것을 여기서도 따른다.)
+    """
+    node_dt = float(t_nodes[1] - t_nodes[0])
+    seg = np.diff(np.asarray(Qp, float), axis=0) / node_dt      # (n_seg, 3)
+    idx = np.clip(np.searchsorted(t_nodes, ts, side="right") - 1,
+                  0, len(seg) - 1)
+    # 릴리즈 노드 → 들어오는 구간 (한 칸 앞)
+    n_rel = int(round(float(t_rel) / node_dt))                  # 릴리즈 노드 번호
+    i_rel = int(np.argmin(np.abs(ts - float(t_rel))))
+    idx[i_rel] = max(0, min(n_rel - 1, len(seg) - 1))
+
+    Qd = np.zeros((len(ts), 6))
+    Qd[:, [1, 2, 4]] = seg[idx]                                 # L, U, B (S/R/T 정지)
+    return Qd
+
+
 def dt_plan_from_mem(mem, k_rel, x_land, target, d_clip, weights, logger=None,
                      alpha=None):
     """rollout 결과(mem) → traj_fn plan dict. `dt_traj_fn` 과 실기 데이터 수집이
@@ -425,13 +459,12 @@ def dt_plan_from_mem(mem, k_rel, x_land, target, d_clip, weights, logger=None,
     Q[:, 0] = yaw                                   # S: 조준 [§5.1]
     for j, col in enumerate([1, 2, 4]):             # L, U, B (planner 프레임 직접)
         Q[:, col] = np.interp(ts, t_nodes, Qp[:, j])
-    Qd = np.gradient(Q, ts, axis=0)
+    Qd = _dt_segment_velocity(Qp, t_nodes, ts, t_rel)
 
     viol = np.maximum(GP8_Q_MIN - Q, Q - GP8_Q_MAX).max()
     if viol > 1e-6:      # env 가 이미 클램프하므로 정상적으로는 발생하지 않음
         _log(logger, f"  (DT 궤적 위치한계 {np.rad2deg(viol):.2f}° 초과 → 클립)")
         Q = np.clip(Q, GP8_Q_MIN, GP8_Q_MAX)
-        Qd = np.gradient(Q, ts, axis=0)
 
     _log(logger, f"  DT: d_g={d_clip:.3f}m"
                  + (f", α={alpha:.2f}" if alpha is not None else "")
