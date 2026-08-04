@@ -48,13 +48,14 @@ THR 의 `dt_finetune_gp8.collect_real_throws` 는 이 '실기' 를 **PyBullet �
 ──────────────────────────────────────────────────────────────────────────────
 실행
 ──────────────────────────────────────────────────────────────────────────────
-    cd ~/ros2_ws && source install/setup.bash
-    PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python \\
-        -m gp8_control.tools.collect_real_throws_gp8 \\
-        --goals 0.9,1.1,1.3,1.5,1.7 --reps 5
+    cd ~/ros2_ws/src/gp8_control
+    ./tools/run_collect_real_throws_gp8.sh
 
-driver 스택이 떠 있어야 하고 gp8_manager 앱은 꺼져 있어야 한다
-(tests/run_static_pick_throw_*.sh 와 같은 전제).
+기본값은 --goals 1.1,1.3,1.5,1.7 --reps 5 이다. 다른 값을 쓰려면:
+    ./tools/run_collect_real_throws_gp8.sh --goals 1.1,1.3 --reps 3
+
+스크립트가 ROS/venv 환경을 로드하고 driver 스택을 확인해 없으면 자동 시작한다.
+gp8_manager 앱이 켜져 있으면 충돌 방지를 위해 실행하지 않는다.
 
 **착지 거리 입력 규약**: 로봇 **베이스 회전축(J1 축) 중심**에서 물체가 처음
 떨어진 지점까지의 **수평 거리 [m]**. 이것이 DT 의 목표 d_g 와 같은 정의다.
@@ -73,6 +74,16 @@ import threading
 import time
 
 import numpy as np
+
+
+# tests/run_static_pick_throw_dt.sh 의 24 cm TCP 픽 격자와 동일하다.
+# 수집 루프는 이 순서를 idx % len(points)로 순환한다.
+DEFAULT_POINTS = ";".join((
+    "0.40,0.30,0.02", "0.40,0.20,0.02", "0.40,0.10,0.02",
+    "0.40,0.0,0.02", "0.40,-0.10,0.02", "0.40,-0.20,0.02",
+    "0.50,0.30,0.02", "0.50,0.20,0.02", "0.50,0.10,0.02",
+    "0.50,0.0,0.02", "0.50,-0.10,0.02", "0.50,-0.20,0.02",
+))
 
 
 def _parse_goals(spec: str) -> list:
@@ -112,8 +123,8 @@ def main() -> None:
     ap.add_argument("--goals", default="0.9,1.1,1.3,1.5,1.7",
                     help="목표 거리 격자 [m] (균등 커버리지가 중요 — 모듈 docstring)")
     ap.add_argument("--reps", type=int, default=5, help="목표당 던지기 수")
-    ap.add_argument("--points", default="0.40,0.10,0.04;0.40,0.0,0.04;0.50,-0.10,0.04",
-                    help='물체 픽 지점 "x,y,z;..." — 순환하며 사용')
+    ap.add_argument("--points", default=DEFAULT_POINTS,
+                    help='물체 픽 지점 "x,y,z;..." — 기본 12개를 순환하며 사용')
     ap.add_argument("--yaw-deg", type=float, default=0.0,
                     help="던지는 방향 (base frame). 목표는 (d·cos, d·sin, --land-z)")
     ap.add_argument("--land-z", type=float, default=0.0,
@@ -142,6 +153,12 @@ def main() -> None:
         threadpoolctl.threadpool_limits(1)
     except ImportError:
         pass
+
+    # 수집물에는 **카타시안 위반 궤적을 넣지 않는다** (2026-08-04 사용자 지시).
+    # 런타임은 보고만 하지만, DB/데이터셋에 들어가면 그 해가 계속 재사용되므로
+    # 수집 경로에서는 제외한다 — warm DB 빌더도 같은 규칙(cart_blocking=True).
+    from gp8_control.skills import thr_throw_skill as _tts
+    _tts.CART_BLOCKING = True
 
     import rclpy
     from rclpy.executors import MultiThreadedExecutor

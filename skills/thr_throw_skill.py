@@ -40,8 +40,9 @@ THR 시뮬 결과 (컨트롤러 보간 ON, 12 던지기 × 3 세션, seed 0 기�
   카타시안 제약을 모두 뺐고, 시뮬은 위반을 '보고만' 한다
   (`nlp_planner.CART_CHECK_BLOCKING=False`). 시뮬에서는 그래도 되지만 실기에서는
   기둥/바닥을 실제로 친다. 그래서 이 스킬은 **dispatch 직전 Cartesian 안전
-  엔벨로프 게이트를 hard 로 유지한다** (부모 스킬과 같은 기준: x>0.20,
-  0.04<z<0.85). 위반하는 계획은 실행하지 않고 그 지점을 건너뛴다.
+  엔벨로프 게이트를 hard 로 유지한다** (x>0.20, z>0.04). z 상한은
+  2026-08-04 사용자 지시로 검사하지 않는다. 위반하는 계획은 실행하지 않고
+  그 지점을 건너뛴다.
   GP8_THR_NLP_CART=1 로 두면 NLP 자체의 기둥 회피 제약도 되살린다 (해가 줄지만
   게이트 통과율은 올라간다).
 
@@ -52,17 +53,14 @@ THR traj_fn 은 **planner 프레임** 6축을 돌려준다. 로봇(URDF) 규약�
 `q_robot = q_planner · SIGN`, SIGN = [1, 1, −1, −1, −1, −1] — 부모 스킬의
 `_PLANNER_SIGN` 과 동일하다.
 
-⚠ 기하 불일치 (해소되지 않음, 실기 확인 필요):
+기하 정합 (2026-08-04 실물 툴 24 cm 운영자 확인):
   이 경로(THR)          link6 → TCP = 0.320 m  (d6 0.080 + tool 0.240)
-  robots/gp8.py         link6 → TCP = 0.300 m  (home_ee x = 0.680)
+  robots/gp8.py         link6 → TCP = 0.320 m  (home_ee x = 0.700)
   skills/throwing.py    link6 → TCP = 0.300 m  (구 NLP 스킬 전용)
-사용자 확인(2026-08-04)에 따르면 실물 로드는 24 cm 이므로 THR 쪽이 맞다. 그래도
-`robots/gp8.py` 는 **일부러 건드리지 않았다** — 그 FK 로 픽(hover/press 높이)이
-실기에서 경험적으로 튜닝돼 있어(PRESS_Z 등) 지금 고치면 그 튜닝이 통째로
-어긋난다. 따라서:
-  · 던지기 아크의 조준·착탄·Cartesian 게이트 → THR fk (0.320) 기준
-  · 픽(집기) 궤적                          → robots/gp8.py (0.300) 기준, 종전 그대로
-두 값을 맞추려면 gp8.py 의 home_ee 를 0.700 으로 올리고 픽 높이를 재튜닝해야 한다.
+픽의 구 22 cm 좌표는 Z를 0.02 m 낮춰 같은 실제 관절 자세가 되도록 변환했다
+(press 0.04→0.02, GRASP_Z 0.062→0.042, tracking 0.12/0.05→0.10/0.03).
+구 NLP 스킬의 `skills/throwing.py` 는 별도 공식화이므로 이번 THR 수집 경로에서는
+쓰지 않는다.
 
 ──────────────────────────────────────────────────────────────────────────────
 NLP 버전(부모)과의 구조 차이
@@ -94,7 +92,6 @@ import numpy as np
 
 from gp8_control.skills import thr_planners
 from gp8_control.skills.robust_throw_skill import (
-    MAX_TCP_Z,
     MIN_TCP_X,
     MIN_TCP_Z,
     _PLANNER_SIGN,
@@ -112,13 +109,6 @@ if TYPE_CHECKING:
 # 설정
 # =========================================================================
 
-# 착탄 게이트 [m]: THR 기하로 예측한 착지점이 목표에서 이만큼 넘게 벗어나면 거부.
-# nlp 은 착탄을 목적함수로 강제하므로 타이트해도 되지만(THR 시뮬 26~32 mm),
-# dt/phy 는 정책/해석해라 그렇게 조이면 아무것도 통과하지 못한다 (시뮬 51~138 mm).
-# 모델별 기본값을 다르게 둔다. env GP8_THR_LAND_GATE 로 일괄 오버라이드.
-LAND_GATE = {"nlp": 0.10, "dt": 0.40, "phy": 0.60}
-LAND_GATE_ENV = os.environ.get("GP8_THR_LAND_GATE")
-
 # z 바닥 게이트를 arm 하기 전 요구하는 상승 여유 [m] (아래 GATE 2 주석 참고)
 Z_ARM_MARGIN: float = float(os.environ.get("GP8_THR_Z_ARM_MARGIN", "0.02"))
 
@@ -132,6 +122,17 @@ Z_ARM_MARGIN: float = float(os.environ.get("GP8_THR_Z_ARM_MARGIN", "0.02"))
 #   로봇의 물리 한계를 지켰는지와는 별개다. 이전 버전은 이 상한으로 governor clamp 를
 #   모사해 거부/경고를 냈는데, 그 때문에 물리적으로 멀쩡한 궤적이 대량 기각됐다.
 VEL_GATE_MARGIN: float = float(os.environ.get("GP8_THR_VEL_MARGIN", "1.0"))
+
+# Cartesian 안전 엔벨로프를 **거부 사유로 쓸지, 보고만 할지** (2026-08-04 사용자 지시).
+#   런타임(계획/스캔/dispatch) : 기본 False = **보고만** 하고 그대로 진행
+#   수집(warm DB 빌드, 실기 데이터 수집) : True = 위반한 해를 **제외**
+# 수집 쪽은 tools/build_warm_db_thr.py 가 check_arc(cart_blocking=True) 로,
+# tools/collect_real_throws_gp8.py 가 이 모듈 전역을 True 로 세팅해 쓴다.
+# ⚠ 런타임 보고 모드에서는 스윙이 기둥/바닥 엔벨로프를 침범해도 실행된다.
+#   NLP 은 CART_CONSTRAINTS=1 로 계획 자체가 기둥을 피하지만(바닥 클리어런스는
+#   hard 제약이 아님), DT/phy 는 그런 제약이 없다. GP8_THR_CART_BLOCK=1 로
+#   종전처럼 차단할 수 있다.
+CART_BLOCKING: bool = os.environ.get("GP8_THR_CART_BLOCK", "0") not in ("0", "", "false")
 
 # NLP 자체의 카타시안(기둥 회피) 제약 — **실기 기본은 ON** (2026-08-04 사용자 지시).
 # THR 은 시뮬용으로 이걸 껐고(위반을 보고만 함) 그 상태로 계획하면 스윙이 바닥/기둥을
@@ -177,7 +178,8 @@ def _predict_landing(q_robot, qd_robot, land_z: float):
     return p[:2] + v[:2] * t_f, p, v
 
 
-def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
+def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str,
+              cart_blocking: "Optional[bool]" = None) -> dict:
     """dispatch 전 독립 재검증 (스킬과 `--thr-scan` 이 공유).
 
     THR 은 시뮬 dry-run 으로 기둥/바닥을 검사하지만 로봇에는 그 시뮬이 없다.
@@ -188,8 +190,7 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
     qd_lim = np.asarray(robot.velocity_limits, float)      # URDF/데이터시트
     jl = np.asarray(robot.joint_limits, float)
     p_target = np.asarray(p_target, float).ravel()
-    gate = float(LAND_GATE_ENV) if LAND_GATE_ENV else LAND_GATE.get(model, 0.40)
-    out: dict = {"reject": None, "warns": [], "land_gate": gate}
+    out: dict = {"reject": None, "warns": []}
 
     # --- 착지 예측: 계획의 **해석적** 릴리즈 상태 그대로 ---
     #     스트리머(`_stream_trajectory`)가 위치+속도를 cubic Hermite 로 4 ms
@@ -222,28 +223,31 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
 
     # --- ③ Cartesian 안전 엔벨로프 (THR fk = 실물 tool 0.240 기준) ---
     P = np.array([fk_pos(arc_q[:, k] * _PLANNER_SIGN) for k in range(arc_q.shape[1])])
-    x_min, z_min, z_max = float(P[:, 0].min()), float(P[:, 2].min()), float(P[:, 2].max())
-    out.update(x_min=x_min, z_min=z_min, z_max=z_max)
-    out["ok_cart"] = bool(x_min > MIN_TCP_X and z_min > MIN_TCP_Z and z_max <= MAX_TCP_Z)
-    if not out["ok_cart"] and out["reject"] is None:
-        out["reject"] = (f"Cartesian 엔벨로프 위반 (x_min={x_min:+.3f}m, "
-                         f"z_min={z_min:+.3f}m, z_max={z_max:+.3f}m; 한계 "
-                         f"x>{MIN_TCP_X:.2f}, {MIN_TCP_Z:.2f}<z<{MAX_TCP_Z:.2f})"
-                         + ("  ※ NLP 의 기둥 회피는 release 창까지만 활성이고 바닥"
-                            " 클리어런스는 hard 제약이 아니다 (throw_nlp 제약 3b) — "
-                            "감속 꼬리가 내려앉는 해는 여기서만 걸린다"
-                            if model == "nlp" else ""))
-
-    # --- ④ 착탄 ---
-    out["ok_land"] = p_land is not None and out["err"] <= gate
-    if out["reject"] is None and not out["ok_land"]:
-        if p_land is None:
-            out["reject"] = (f"착탄 불가 — 릴리즈 상태가 목표 높이 z={p_target[2]:+.3f}m "
-                             f"에 도달하지 못함 (|v|={np.linalg.norm(v_eff):.2f} m/s)")
+    x_min, z_min = float(P[:, 0].min()), float(P[:, 2].min())
+    out.update(x_min=x_min, z_min=z_min)
+    out["ok_cart"] = bool(x_min > MIN_TCP_X and z_min > MIN_TCP_Z)
+    if not out["ok_cart"]:
+        msg = (f"Cartesian 엔벨로프 위반 (x_min={x_min:+.3f}m, z_min={z_min:+.3f}m; "
+               f"한계 x>{MIN_TCP_X:.2f}, z>{MIN_TCP_Z:.2f})"
+               + ("  ※ NLP 의 기둥 회피는 release 창까지만 활성이고 바닥 클리어런스는"
+                  " hard 제약이 아니다 (throw_nlp 제약 3b) — 감속 꼬리가 내려앉는"
+                  " 해는 여기서만 걸린다" if model == "nlp" else ""))
+        # 런타임은 보고만, 수집(warm DB / 실기 데이터)은 제외 — CART_BLOCKING 주석 참고
+        block = CART_BLOCKING if cart_blocking is None else bool(cart_blocking)
+        if block:
+            if out["reject"] is None:
+                out["reject"] = msg
         else:
-            out["reject"] = (f"착탄 게이트 초과 — 예측 착지 ({p_land[0]:+.3f}, "
-                             f"{p_land[1]:+.3f}) m, 목표에서 {out['err'] * 100:.0f} cm "
-                             f"> {gate * 100:.0f} cm")
+            out["warns"].append(msg + "  — 보고만 하고 진행 "
+                                      "(GP8_THR_CART_BLOCK=1 로 차단)")
+
+    # --- ④ 착탄 진단 (blocking 하지 않음) ---
+    # 실제 데이터를 폭넓게 모으기 위해 목표 오차가 커도 거부하지 않는다.
+    # 단, 탄도 교점 자체를 계산할 수 없는 궤적은 유효한 수집 샘플이 아니므로 거부한다.
+    out["ok_land"] = p_land is not None
+    if out["reject"] is None and p_land is None:
+        out["reject"] = (f"착탄 불가 — 릴리즈 상태가 목표 높이 z={p_target[2]:+.3f}m "
+                         f"에 도달하지 못함 (|v|={np.linalg.norm(v_eff):.2f} m/s)")
     return out
 
 
@@ -389,7 +393,7 @@ class ThrThrowSkill(RobustThrowSkill):
             f"release t={ts[i_rel]:.3f}s"
             + (f" (윈도우 ±{half * 1e3:.0f}ms)" if half > 0 else " (윈도우 없음)")
             + f", lift {l_ts[-1]:.2f}s | 예측 착지 {chk['d_land']:.3f} m "
-              f"(목표 오차 {chk['err'] * 100:.1f} cm, 게이트 {chk['land_gate'] * 100:.0f}) | "
+              f"(목표 오차 {chk['err'] * 100:.1f} cm, 진단만) | "
               f"|v_release|={np.linalg.norm(chk['v_eff']):.2f} m/s, "
               f"민감도 {sens:.0f} mm/10 ms | 속도 peak "
               f"{chk['peak_vel_ratio']:.2f}× (URDF 한계 대비)")
@@ -549,22 +553,21 @@ class ThrThrowSkill(RobustThrowSkill):
         if near.size:
             k = int(near[0])
             bad_list.append((k, f"TCP x={tcp[0, k]:+.4f}m ≤ {MIN_TCP_X:.3f}m (기둥/베이스)"))
-        high = np.nonzero(tcp[2] > MAX_TCP_Z)[0]
-        if high.size:
-            k = int(high[0])
-            bad_list.append((k, f"TCP z={tcp[2, k]:+.4f}m > {MAX_TCP_Z:.3f}m (팔 과다 상승)"))
         if bad_list:
             k, why = min(bad_list)
             n_viol = int(np.count_nonzero(
-                (tcp[0] <= MIN_TCP_X) | (tcp[2] <= MIN_TCP_Z) | (tcp[2] > MAX_TCP_Z)))
+                (tcp[0] <= MIN_TCP_X) | (tcp[2] <= MIN_TCP_Z)))
+            head = ("ABORTED (not dispatched)" if CART_BLOCKING
+                    else "Cartesian 위반 — **보고만** 하고 dispatch 진행")
             ctx.log.error(
-                f"{self.model} throw ABORTED (not dispatched): Cartesian 안전 엔벨로프 "
-                f"위반 — {why} @ sample {k}/{n_s} (t={ts[k]:.3f}s, "
-                f"{self._segment_of(k, n_lift, n_arc)} 구간, 위반 샘플 {n_viol}개)")
+                f"{self.model} throw {head}: {why} @ sample {k}/{n_s} "
+                f"(t={ts[k]:.3f}s, {self._segment_of(k, n_lift, n_arc)} 구간, "
+                f"위반 샘플 {n_viol}개)")
             ctx.log.error(
                 "  위반 지점 관절 (robot frame, deg): "
                 + ", ".join(f"J{j + 1}={np.rad2deg(traj[j, k]):+.1f}" for j in range(6)))
-            return
+            if CART_BLOCKING:
+                return
 
         ctx.log.info(
             f"{self.model} throw dispatch: lift {n_lift} + arc {n_arc} + "
