@@ -82,6 +82,43 @@ def targets():
     return [np.array([x, y, BIN_Z]) for x in BIN_X for y in BIN_Y]
 
 
+def _parse_sh_array(text, name):
+    """sh 의 `NAME=( "a,b,c" ... )` 배열을 파싱 → [(x,y,z), ...]."""
+    import re
+    m = re.search(rf'^{name}=\((.*?)^\)', text, re.S | re.M)
+    if not m:
+        raise ValueError(f"{name} 배열을 찾지 못했다")
+    out = []
+    for tok in re.findall(r'"([^"]*)"', m.group(1)):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = [float(x) for x in tok.split(",")]
+        if len(v) != 3:
+            raise ValueError(f"{name} 항목 '{tok}' 은 x,y,z 여야 한다")
+        out.append(v)
+    return out
+
+
+def from_sh(path):
+    """`tests/run_static_pick_throw_*.sh` 에서 POINTS/TARGETS 를 그대로 읽는다.
+
+    DB 의 target 이 실제 운용 좌표와 어긋나면 최근접 entry 가 수십~수백 mm 떨어져
+    polish 가 느려지고 해도 나빠진다 (2026-08-04 실측: bin 좌표를 1.10/1.35/1.60
+    → 1.20/1.441/1.683 으로 바꾸자 전 entry 가 83~100 mm 미스, 계획 0.4s → 2~3s
+    이고 게이트 통과율도 떨어졌다). sh 를 직접 읽어 그 desync 를 막는다.
+
+    리턴: (points [(x,y,P_START_Z)], targets [(x,y,z)])
+    """
+    text = open(path).read()
+    pts = _parse_sh_array(text, "POINTS")
+    tgts = _parse_sh_array(text, "TARGETS")
+    # 픽 지점의 z 는 프레스 높이지만 던지기 시작 TCP 는 P_START_Z 다 (THR 규약).
+    P = [np.array([x, y, thr_planners.P_START_Z]) for x, y, _ in pts]
+    T = [np.array(t, float) for t in tgts]
+    return P, T
+
+
 # ---------------------------------------------------------------------------
 # 초기해 128개
 # ---------------------------------------------------------------------------
@@ -164,18 +201,44 @@ def main():
                     help="이미 저장된 쌍도 다시 푼다 (기본은 건너뜀)")
     ap.add_argument("--pairs", default=None,
                     help='부분 재구축 "pi,ti;pi,ti;..." (0-based)')
+    ap.add_argument("--from-sh", default=None,
+                    help="tests/run_static_pick_throw_*.sh 에서 POINTS/TARGETS 를 "
+                         "읽어 그 좌표로 빌드 (실제 운용 좌표와 어긋나는 것을 방지 "
+                         "— 권장)")
+    ap.add_argument("--targets", default=None,
+                    help='타겟 직접 지정 "x,y,z;x,y,z;..." (--from-sh 대신)')
+    ap.add_argument("--points", default=None,
+                    help='시작점 직접 지정 "x,y;x,y;..." (z 는 P_START_Z 고정)')
     args = ap.parse_args()
 
     _init_worker()          # 부모도 1스레드 (게이트 계산이 BLAS 를 쓴다)
     thr_planners.WARM_DB_PATH = args.out
     robot = GP8()
-    P, T = points(), targets()
+    if args.from_sh:
+        P, T = from_sh(args.from_sh)
+        src = f"sh: {args.from_sh}"
+    else:
+        P, T = points(), targets()
+        src = "기본값 (THR OBJ_SLOTS × bin_targets)"
+        if args.points:
+            P = [np.array([float(v.split(",")[0]), float(v.split(",")[1]),
+                           thr_planners.P_START_Z])
+                 for v in args.points.split(";") if v.strip()]
+            src = "CLI"
+        if args.targets:
+            T = [np.array([float(x) for x in v.split(",")], float)
+                 for v in args.targets.split(";") if v.strip()]
+            src = "CLI"
     params = thr_planners.warm_db_params()
 
     print(f"=== THR NLP warm DB 빌드 ===")
     print(f"  출력   : {args.out}")
     print(f"  공식화 : {thr_planners.geometry_summary()}")
+    print(f"  좌표   : {src}")
     print(f"  쌍     : {len(P)} grasp × {len(T)} target = {len(P) * len(T)}")
+    print(f"  target : " + ", ".join(f"({t[0]:.3f},{t[1]:+.3f},{t[2]:+.3f})"
+                                     for t in T[:4])
+          + (" ..." if len(T) > 4 else ""))
     print(f"  초기해 : {args.n_init}/쌍  (총 {len(P) * len(T) * args.n_init} solve)")
     print(f"  워커   : {args.workers} (fork — 오프라인 프로세스라 안전)")
 
@@ -187,7 +250,10 @@ def main():
         for e in cfg["entries"]:
             have.add((tuple(np.round(np.asarray(e["p_start"], float), 3)),
                       tuple(np.round(np.asarray(e["target"], float), 3))))
-        print(f"  resume : 기존 entry {len(have)}개 건너뜀")
+        # 좌표가 다르면 하나도 안 걸린다 (키가 (p_start, target) 라운딩값이라
+        # 타겟을 바꾸면 전부 새 쌍이다) — 그래서 '로드' 와 '실제 skip' 을 구분해 찍는다.
+        print(f"  resume : 기존 entry {len(have)}개 로드 "
+              f"(같은 (시작점,타겟) 쌍만 건너뛴다)")
 
     todo = [(pi, ti) for pi in range(len(P)) for ti in range(len(T))]
     if args.pairs:

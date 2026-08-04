@@ -205,31 +205,33 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
     gate = float(LAND_GATE_ENV) if LAND_GATE_ENV else LAND_GATE.get(model, 0.40)
     out: dict = {"reject": None, "warns": [], "land_gate": gate}
 
-    # --- 실기 추종 모사: governor clamp 후 실제로 나올 릴리즈 상태 ---
-    #     착지 예측은 이쪽 기준 (로봇이 실제로 하게 될 동작).
+    # --- 실기 추종 모사: governor clamp 가 릴리즈 상태를 바꾸는가 ---
     #
-    #     ⚠ clamp 효과만 분리하려면 **같은 추정기로** 비교해야 한다. act 의 속도는
-    #     4 ms 격자 후진차분이라 계획의 해석적 q̇ 보다 ~2 ms 뒤처진 값을 준다 —
-    #     빠른 아크에서는 그 자체로 수십 cm 착지 차이가 난다. 그래서 기준선을
-    #     '해석적 q̇' 가 아니라 '**clamp 하지 않은 명령**을 같은 후진차분으로 본 값'
-    #     으로 잡는다. 그러면
-    #         clamp_shift    = governor 가 실제로 바꾼 양
-    #         resample_shift = 4 ms 격자 리샘플/차분이 바꾼 양 (진단용)
-    #     로 깨끗하게 갈린다.
+    # 기준선은 **계획의 해석적 릴리즈 상태**다. 스트리머(`_stream_trajectory`)가
+    # 위치+속도를 cubic Hermite 로 4 ms 리샘플하므로 knot 의 속도가 그대로
+    # 재현된다 — 즉 governor 가 개입하지 않는 한 실기 릴리즈 상태 = 계획 그대로다.
+    #
+    # governor 효과만 떼려면 rate limiter 를 태운 것과 안 태운 것을 **같은
+    # 추정기**로 비교해야 한다. 4 ms 후진차분은 해석적 q̇ 보다 ~2 ms 뒤처진 값을
+    # 주는데(빠른 아크에서 수십 cm 착지 차이), 양쪽에 똑같이 걸면 그 bias 가
+    # 상쇄되고 순수 clamp 효과만 남는다. 그 delta 를 해석적 기준선에 더한다.
+    #   (구버전은 후진차분값을 그대로 착지 예측으로 썼다 — 추정기 bias 가 예측에
+    #    섞여 DT 아크에서 착지가 20~28 cm 틀어지고 경고가 쏟아졌다. 2026-08-04 수정.)
     _, cmd, act, act_v = _rate_limited(arc_q, arc_t, rt)
     cmd_v = np.zeros_like(cmd)
     cmd_v[:, 1:] = np.diff(cmd, axis=1) / STREAM_PERIOD
     out["lag_deg"] = float(np.rad2deg(np.abs(cmd[:, -1] - act[:, -1]).max()))
-    p_land, p_eff, v_eff = _predict_landing(act[:, -1], act_v[:, -1], p_target[2])
+    p_ideal, p_eff, v_eff = _predict_landing(arc_q[:, -1], arc_qd[:, -1], p_target[2])
+    p_act, _, _ = _predict_landing(act[:, -1], act_v[:, -1], p_target[2])
     p_cmd, _, _ = _predict_landing(cmd[:, -1], cmd_v[:, -1], p_target[2])
-    p_ideal, _, v_ideal = _predict_landing(arc_q[:, -1], arc_qd[:, -1], p_target[2])
+    if p_ideal is not None and p_act is not None and p_cmd is not None:
+        delta = p_act - p_cmd                       # governor 효과만 (bias 상쇄)
+        p_land = p_ideal + delta
+        out["clamp_shift"] = float(np.linalg.norm(delta))
+    else:
+        p_land = p_ideal if p_act is not None else None
+        out["clamp_shift"] = float("nan")
     out.update(p_land=p_land, p_eff=p_eff, v_eff=v_eff, p_land_ideal=p_ideal)
-    out["clamp_shift"] = (float(np.linalg.norm(p_land - p_cmd))
-                          if (p_land is not None and p_cmd is not None)
-                          else float("nan"))
-    out["resample_shift"] = (float(np.linalg.norm(p_cmd - p_ideal))
-                             if (p_cmd is not None and p_ideal is not None)
-                             else float("nan"))
     out["d_land"] = float(np.linalg.norm(p_land)) if p_land is not None else float("nan")
     out["err"] = (float(np.linalg.norm(p_land - p_target[:2]))
                   if p_land is not None else float("nan"))
@@ -261,11 +263,6 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str) -> dict:
             f"아크 최대 속도가 RT 스트림 상한의 {out['peak_vel_ratio']:.2f}배 — "
             f"governor 모사 결과 릴리즈 추종오차 {out['lag_deg']:.2f}° / 착지 이동 "
             f"{out['clamp_shift'] * 100:.1f} cm 로 흡수된다")
-    if out["resample_shift"] > 0.05:
-        out["warns"].append(
-            f"4 ms 격자 리샘플만으로 착지가 {out['resample_shift'] * 100:.1f} cm "
-            f"움직인다 (governor 와 무관) — 릴리즈 순간 속도가 그만큼 빠르게 "
-            f"변한다는 뜻이라 실기 타이밍 여유가 작다")
 
     # --- ③ Cartesian 안전 엔벨로프 (THR fk = 실물 tool 0.240 기준) ---
     P = np.array([fk_pos(arc_q[:, k] * _PLANNER_SIGN) for k in range(arc_q.shape[1])])
@@ -430,7 +427,6 @@ class ThrThrowSkill(RobustThrowSkill):
             d_land=chk["d_land"], err=chk["err"], p_land=chk["p_land"],
             v_eff=chk["v_eff"], sens_mm_per_10ms=sens,
             lag_deg=chk["lag_deg"], clamp_shift=chk["clamp_shift"],
-            resample_shift=chk["resample_shift"],
             peak_vel_ratio=chk["peak_vel_ratio"], plan_info=plan.get("info", {}))
         ctx.log.info(
             f"{self.model} throw: 아크 {ts[-1]:.3f}s ({len(ts)} 샘플), "

@@ -50,6 +50,18 @@ import argparse
 import os
 import sys
 
+# BLAS/OpenMP 스레드 고정 — **numpy/casadi/torch import 보다 먼저** 해야 먹는다
+# (BLAS 가 로드 시점에 이 env 를 읽는다). 두 가지 이유:
+#   ① 실기: 코어 수만큼 스레드가 돌면 ros2_control 의 4 ms RT UDP 루프가 굶어
+#      RUN_STALL → comm-loss 로 간다 (2026-07-21 실기 재현).
+#   ② 속도: 8코어에서 IPOPT/BLAS 가 spin-wait 경합해 **오히려 느려진다**.
+#      실측(--thr-scan nlp, 타겟 2개): 9.0s(sys 20.8s) → 5.3s(sys 0.27s).
+# static_pick_throw.main() 도 threadpoolctl 을 부르지만 --thr-scan 은 그 전에
+# 리턴하므로 여기서 잡아야 스캔 경로까지 커버된다.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 
 from gp8_control.tests import static_pick_throw as base
@@ -118,7 +130,7 @@ def _scan(model: str, weights, targets, points) -> None:
               f"{'ok' if c['ok_land'] else 'LAND':>4} | {c['d_land']:9.3f} "
               f"{c['err'] * 100:6.1f}c | {np.linalg.norm(c['v_eff']):5.2f} "
               f"{sens:6.0f}mm {half * 2e3:5.0f}ms | "
-              f"{c['clamp_shift'] * 100:5.1f}c {c['resample_shift'] * 100:5.1f}c | "
+              f"{c['clamp_shift'] * 100:5.1f}c {c['lag_deg']:5.2f} | "
               f"{dt_plan:5.1f}s")
         if c["reject"] is not None:
             notes.append(f"  거부 {np.round(tgt, 3)}: {c['reject']}")
@@ -152,6 +164,11 @@ def main() -> None:
     sys.argv = [sys.argv[0]] + rest
 
     if thr_args.thr_scan:
+        try:                       # env 로 못 잡힌 라이브러리까지 런타임 제한
+            import threadpoolctl
+            threadpoolctl.threadpool_limits(1)
+        except ImportError:
+            pass
         from gp8_control.config import Config
         ap2 = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
         ap2.add_argument("--points", default="0.45,0.20,0.062")
