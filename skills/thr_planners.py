@@ -98,7 +98,10 @@ def warm_db_params() -> dict:
         q_lo=throw_nlp.Q_LO.tolist(),
         q_hi=throw_nlp.Q_HI.tolist(),
         qd_max=GP8_QD_MAX.tolist(),
-        col=((throw_nlp.COL_R, throw_nlp.COL_H)
+        # 카타시안 제약 유무·기준이 해의 basin/제약 개수를 바꾸므로 유효성 키다.
+        # 2026-08-05 부터 기준이 원기둥(COL_R/COL_H) → TCP 엔벨로프로 바뀌었다 —
+        # 키가 달라져 구 config 의 entry 와 자동으로 갈린다 (덮어쓰지 않는다).
+        col=(("env", throw_nlp.CART_MIN_X, throw_nlp.CART_MIN_Z)
              if throw_nlp.CART_CONSTRAINTS else "off"),
         pos_mode=getattr(throw_nlp, "POS_LIMIT_MODE", "colloc"),
         w1=throw_nlp.W1,
@@ -293,23 +296,35 @@ def nlp_traj_fn(target, p_start, v_start=None, ctx=None, logger=None):
 # 2) DT — GP8 rig 학습 Decision Transformer (THR dt_planner.gp8_dt_traj_fn)
 # ===========================================================================
 
-# 벤더링된 DT 체크포인트 3종과, 실기 bin 목표(1.10/1.35/1.60 m)에서 실측한 결과:
+# 벤더링된 DT 체크포인트 4종. 2026-08-05 재실측 (p_start 0.45/0.20/0.02, bin
+# 1.10/1.35/1.60 m, 현재 Cartesian 엔벨로프 x>0.20·z>0.02 기준):
 #
-#   gp8_dt_best.pth        THR weights_gp8/     2026-07-30  ← THR dt_planner 의 기본값
-#       d_g 1.10 만 릴리즈하고 착지 0.21 m, 1.35/1.60 은 10스텝 만료(미-release).
-#       현재 rig 에서는 **쓸 수 없다** (기하가 tool 0.240 으로 바뀌기 전 학습분).
-#   gp8_dt_best_v9.pth     THR weights_gp8_v9/  2026-08-03 17:04  ← 기본값
-#       1.10/1.35/1.60 전부 통과, 예측 착지 오차 6.2 / 7.9 / 1.2 cm.
-#   gp8_dt_ft2_real-11.pth THR weights_gp8_ft2/ 2026-08-03 16:17 (실기 11회 파인튜닝)
-#       너무 세게 던진다 (1.10 목표에 1.67 m 착지 — 56 cm 초과로 거부) + 릴리즈
-#       타이밍 민감도 59~104 mm/10 ms. 실기 파인튜닝 데이터를 다시 볼 것.
+#   가중치                  1.10    1.35    1.60   평균   엔벨로프
+#   gp8_dt_best_v9.pth      0.7c   17.6c   46.2c  21.5c   ok      ← 현재 기본값
+#   gp8_dt_ft2_real-11.pth 39.8c   13.7c   31.9c  28.5c   ok
+#   gp8_dt_nolag.pth        7.0c    7.9c    4.3c   6.4c   1/3 위반
+#   gp8_dt_nolag_cart.pth   5.9c   30.3c   17.4c  17.9c   ok
+#
+#   nolag  = tau_act 0.001 로 재수집·재학습 (지연 없는 데이터). 정확도는 최고지만
+#            1.10 m 에서 TCP x_min=0.162 로 엔벨로프를 침범한다.
+#   nolag_cart = 위에 엔벨로프 필터까지 걸어 재수집 (랜덤 궤적 48.6% 폐기, 1,073개).
+#            제약을 지키면서 v9 보다 나은 유일한 체크포인트.
+#   ft2_real-11 = 실기 11회 파인튜닝 — 너무 세게 던진다. 데이터 재확인 필요.
+#   (구 gp8_dt_best.pth 는 전 타깃 미-release 로 2026-08-05 삭제.
+#    필요하면 THR weights_gp8/dt_best.pth 또는 git 이력에서 복구.)
 #
 # jitter 영상(2026-08-03 17:27)이 어느 체크포인트로 렌더링됐는지는 결과 json 에
 # 기록이 없지만, v9 생성(17:04) 직후이고 위 실측상 v9 만 정상 동작하므로 v9 로
 # 본다. `--weights` / GP8_THR_DT_WEIGHTS 로 바꿔 `--thr-scan` 비교 가능.
 _THR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thr")
+# 기본 = 공식-충실 파이프라인 (2026-08-05): collect_data_gp8(무작위 1000, HER
+# k=0 버퍼) → 공식 하이퍼 학습. **DT_GP8_LIMITS=urdf 로 학습했으므로 로드 전에
+# 같은 환경변수가 서 있어야 한다** (run_static_pick_throw_dt.sh 가 export).
+# gp8_dt_ft_realproxy-36.pth 는 시뮬 real-proxy(지터+무작위파지+보간) 36던지기
+# 파인튜닝판 — 실기 파인튜닝 전의 참고용. 실기 수집 후에는
+# tools/collect_data_real_gp8.py → dt_finetune 산출물로 교체할 것.
 DT_WEIGHTS: str = os.environ.get(
-    "GP8_THR_DT_WEIGHTS", os.path.join(_THR_DIR, "weights", "gp8_dt_best_v9.pth"))
+    "GP8_THR_DT_WEIGHTS", os.path.join(_THR_DIR, "weights", "gp8_dt_official_k0.pth"))
 DT_TARGET_RETURN: float = float(os.environ.get("GP8_THR_DT_RETURN", "1.0"))
 
 _DT_LOCK = threading.Lock()
@@ -336,6 +351,20 @@ def load_dt(weights: str = DT_WEIGHTS, logger=None):
         ckpt = model.load(weights)
         model = model.to(torch.device("cpu")).eval()
         cfg = GP8Config()
+        # --- 학습 env 파라미터를 체크포인트에서 복원 ------------------------
+        # ⚠ DT 는 정책이라 **학습한 env 와 추론 env 가 같아야 한다.** 특히
+        #   tau_act(1차 액추에이터 지연)는 "ω 를 명령하면 관절이 얼마나 따라오나"를
+        #   정하는 값이라, 어긋나면 정책이 본 적 없는 상태분포로 굴러가 궤적이
+        #   통째로 달라진다 (실측: 0.05 로 학습한 가중치를 0.001 로 추론하면
+        #   평균 착지오차 22.7 → 31.8 cm, 최대 65 → 103 cm).
+        #   그래서 체크포인트에 값이 있으면 그것을 그대로 쓴다. 없으면(구버전)
+        #   env 기본값을 쓰고 그 사실을 로그로 남긴다.
+        for key in ("tau_act", "qdd_factor"):
+            if ckpt.get(key) is not None and float(getattr(cfg, key)) != float(ckpt[key]):
+                if logger is not None:
+                    logger.info(f"  DT env {key}: {getattr(cfg, key)} → {ckpt[key]} "
+                             f"(체크포인트 기록값 = 학습 시 값)")
+                setattr(cfg, key, float(ckpt[key]))
         arm = GP8ThrowArm(cfg, rng=np.random.default_rng(0))
         # τ(그리퍼 임계) = 학습셋 그리퍼 액션 평균 [논문 §5.1] — 체크포인트에 저장됨
         if ckpt.get("gripper_thresh") is not None:
@@ -411,38 +440,33 @@ def dt_traj_fn(target, p_start=None, v_start=None, ctx=None, logger=None,
     return dt_plan_from_mem(mem, k_rel, x_land, p, d_clip, weights, logger)
 
 
-def _dt_segment_velocity(Qp, t_nodes, ts, t_rel):
-    """DT 10 Hz 노드 궤적 → dense 격자의 관절속도 (planner 6축).
+def _dt_exec_curve(Qp, t_nodes, ts):
+    """DT 10 Hz 노드 → dense 격자 (위치·속도). **env 와 같은 함수**를 쓴다
+    (`dt_gp8_env.controller_curve` = 실기 MotoROS 3차 보간 이식).
 
-    **`np.gradient` 를 쓰지 않는다.** 명령 경로는 10 Hz 노드를 잇는 직선이므로
-    그 사이 속도는 상수(piecewise-constant)다. `np.gradient` 는 노드에서 양쪽
-    구간을 평균내는데, 하필 릴리즈가 노드에 있어서 릴리즈 속도가 뭉개진다.
+    왜 여기서 곡선을 고르면 안 되는가: env 는 릴리즈 상태를 이 곡선에서 읽어
+    착탄을 예측하고 DT 는 그 예측으로 학습됐다. 플래너가 다른 곡선을 내보내면
+    학습한 착탄과 실행 착탄이 어긋난다 — 규칙은 dt_gp8_env 한 곳에 둔다.
 
-    실측 (d_g=1.35 m): env 의 릴리즈 속도(구간 평균)는 B = −294.4 °/s 인데
-    followthrough 첫 노드가 B 하한 10° 에 clip 되어 그 구간 기울기가 −193.9 로
-    줄고, gradient 가 둘을 평균내 **−244.2 °/s** 를 내보냈다 (17% 낮음).
-    사거리는 v² 에 비례하므로 (244/294)² ≈ 0.69 — 약 30% 짧게 날아간다.
-
-    그래서 각 dense 샘플에 **자기가 속한 구간의 기울기**를 주고, 릴리즈 노드만
-    **들어오는 구간**의 기울기를 쓴다. 물체는 그 스텝을 마친 순간 손을 떠나므로
-    이쪽이 물리적으로 맞고, Thr_DT env 의 릴리즈 규약(`release_velocity='segment'`,
-    `(q_k − q_{k−1})/Δt`, PAPER_TRACE §4.3)과도 정확히 일치한다.
-
-    (논문 §5.1 자체는 릴리즈 속도 규약을 명시하지 않는다 — 실기·Gazebo 에선 물리가
-     결정하므로. 재구현에서 '구간 평균' 으로 정한 것을 여기서도 따른다.)
+    env 가 사다리꼴 적분(TRAPEZOID)을 쓰므로 각 구간 내부가 정확히 등가속도다.
+    노드에서의 곡선 속도 = 그 지점에서 DT 가 출력한 각속도이고, 가속도는 명령한
+    변화율 그대로다 — 수집 때 건 한계가 실행 곡선에서 그대로 성립한다.
     """
-    node_dt = float(t_nodes[1] - t_nodes[0])
-    seg = np.diff(np.asarray(Qp, float), axis=0) / node_dt      # (n_seg, 3)
-    idx = np.clip(np.searchsorted(t_nodes, ts, side="right") - 1,
-                  0, len(seg) - 1)
-    # 릴리즈 노드 → 들어오는 구간 (한 칸 앞)
-    n_rel = int(round(float(t_rel) / node_dt))                  # 릴리즈 노드 번호
-    i_rel = int(np.argmin(np.abs(ts - float(t_rel))))
-    idx[i_rel] = max(0, min(n_rel - 1, len(seg) - 1))
-
+    from gp8_control.skills.thr.dt_gp8_env import (FOLLOWTHROUGH_SMOOTH,
+                                                   controller_curve)
+    Q = np.zeros((len(ts), 6))
     Qd = np.zeros((len(ts), 6))
-    Qd[:, [1, 2, 4]] = seg[idx]                                 # L, U, B (S/R/T 정지)
-    return Qd
+    if FOLLOWTHROUGH_SMOOTH:
+        t_c, Q_c, V_c = controller_curve(Qp, float(t_nodes[1] - t_nodes[0]),
+                                         out_dt=DT)
+        for j, col in enumerate([1, 2, 4]):         # L, U, B (planner 프레임)
+            Q[:, col] = np.interp(ts, t_c, Q_c[:, j])
+            Qd[:, col] = np.interp(ts, t_c, V_c[:, j])
+    else:                                            # 구 선형보간 (재현용)
+        for j, col in enumerate([1, 2, 4]):
+            Q[:, col] = np.interp(ts, t_nodes, Qp[:, j])
+        Qd = np.gradient(Q, ts, axis=0)
+    return Q, Qd
 
 
 def dt_plan_from_mem(mem, k_rel, x_land, target, d_clip, weights, logger=None,
@@ -455,16 +479,14 @@ def dt_plan_from_mem(mem, k_rel, x_land, target, d_clip, weights, logger=None,
 
     yaw = math.atan2(p[1], p[0])
     ts = np.arange(0.0, t_nodes[-1] + DT / 2, DT)
-    Q = np.zeros((len(ts), 6))
+    Q, Qd = _dt_exec_curve(Qp, t_nodes, ts)
     Q[:, 0] = yaw                                   # S: 조준 [§5.1]
-    for j, col in enumerate([1, 2, 4]):             # L, U, B (planner 프레임 직접)
-        Q[:, col] = np.interp(ts, t_nodes, Qp[:, j])
-    Qd = _dt_segment_velocity(Qp, t_nodes, ts, t_rel)
 
     viol = np.maximum(GP8_Q_MIN - Q, Q - GP8_Q_MAX).max()
     if viol > 1e-6:      # env 가 이미 클램프하므로 정상적으로는 발생하지 않음
         _log(logger, f"  (DT 궤적 위치한계 {np.rad2deg(viol):.2f}° 초과 → 클립)")
         Q = np.clip(Q, GP8_Q_MIN, GP8_Q_MAX)
+        Qd = np.gradient(Q, ts, axis=0)
 
     _log(logger, f"  DT: d_g={d_clip:.3f}m"
                  + (f", α={alpha:.2f}" if alpha is not None else "")

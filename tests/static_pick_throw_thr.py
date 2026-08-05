@@ -17,17 +17,16 @@
 
   PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python \\
     -m gp8_control.tests.static_pick_throw_thr --model nlp \\
-    --points "0.45,0.20,0.04" --target "1.35,0,-0.08" --plan-only
+    --points "0.45,0.20,0.02" --target "1.35,0,-0.08" --plan-only
 
 보통은 tests/run_static_pick_throw_{nlp,dt,phy}.sh 로 실행한다.
 
 ──────────────────────────────────────────────────────────────────────────────
 NLP 판(static_pick_throw.py)과 달라지는 점
 ──────────────────────────────────────────────────────────────────────────────
-* **기하가 다르다**: THR 경로는 tool=0.240 (link6→TCP 0.32 m, 2026-08-03 URDF
-  기준 통일). 구 스킬/`robots/gp8.py` 는 0.220 (0.30 m) 그대로다. 던지기 조준·
-  게이트는 THR 기준, 픽(집기)은 gp8.py 기준으로 돈다 — 자세한 것은
-  `skills/thr_throw_skill.py` docstring.
+* **THR/픽 기하가 같다**: THR 경로와 `robots/gp8.py` 모두 tool=0.240
+  (link6→TCP 0.32 m)을 쓴다. 구 22 cm 픽 자세는 목표 Z를 2 cm 낮춰 동일한
+  실제 관절 자세로 보존한다.
 * **warm DB 를 쓰지 않는다.** 2026-08-03 공식화 변경(tool/rt/W1/QDD/한계)으로
   기존 skills/warm_db_*.pkl 은 전부 무효다. nlp 은 cold multistart 로 돈다 —
   지점당 수 초~수십 초. 로봇이 움직이기 전에 전 지점을 미리 계획하므로 실행 중
@@ -39,7 +38,7 @@ NLP 판(static_pick_throw.py)과 달라지는 점
 
 THR 전용 옵션 (나머지는 전부 static_pick_throw 와 동일):
   --model {nlp,dt,phy}  계획 모델 (기본 nlp, env GP8_THR_MODEL)
-  --weights PATH        dt 체크포인트 (기본 skills/thr/weights/gp8_dt_best.pth)
+  --weights PATH        dt 체크포인트 (기본 skills/thr/weights/gp8_dt_best_v9.pth)
   --thr-scan            지점을 돌기 전에 target 별 실현 가능성만 표로 출력하고
                         종료 (로봇 무명령, --plan-only 보다 가볍다)
 """
@@ -170,7 +169,7 @@ def main() -> None:
             pass
         from gp8_control.config import Config
         ap2 = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-        ap2.add_argument("--points", default="0.45,0.20,0.062")
+        ap2.add_argument("--points", default="0.45,0.20,0.042")
         ap2.add_argument("--target", default="1.35,0,-0.08")
         a2, _ = ap2.parse_known_args()
         pts = base._parse_points(a2.points, default_z=Config().GRASP_Z)

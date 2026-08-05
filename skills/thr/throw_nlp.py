@@ -52,7 +52,9 @@ from .throwing import (
     G,               # 9.81
     GP8_Q_MAX,       # 관절 위치 상한
     GP8_Q_MIN,       # 관절 위치 하한
-    GP8_QD_MAX,      # 관절 속도 한계 (가속도 한계 5×의 기준)
+    GP8_QD_MAX,      # 관절 속도 한계 (가속도 한계 3×의 기준)
+    TCP_X_MIN,       # Cartesian 엔벨로프 (아래 CART_MIN_X/Z 별칭의 단일 출처)
+    TCP_Z_MIN,
     _CHAIN,          # FK 체인 정의 (translation, 회전축) — 심볼릭 FK 포팅에 사용
     fk_frames,       # 수치 FK (초기자세 계산·검증·플롯용)
     ik_position,     # 위치 IK (시작 자세)
@@ -105,17 +107,23 @@ REFINE_TOL = 1e-6               # 위치 한계 dense 검증 허용 위반 (rad)
                                 #   가짜 미수렴 경고가 안 남 (물리적으론 6e-5°)
 MAX_REFINE = 6                  # adaptive refinement 최대 반복
 
-# 기둥(베이스+shoulder yoke) 회피 hard constraint (2026-07-16): wrist·그리퍼 로드
-# 50/75%·TCP 4점이 기둥 축 세그먼트(z∈[0, COL_H])에서 COL_R 이상 떨어질 것.
-# 캘리브레이션 (충돌/통과 실측 궤적 32개): 충돌 해는 기둥 관통(r 0.00~0.04) 또는
-# yoke 스침(로드 r 0.11~0.15, z 0.34~0.53), 통과 해는 지상에서 r ≥ 0.29 —
-# 지하 dip(z<0)은 세그먼트 거리의 z항이 슬랙이라 안 걸림. 시작 자세 wrist r ≥ 0.38.
-# (예전 TCP '바닥' hard 제약 0/148 전멸과 다른 점: 초기해가 이 제약을 위반하지 않음.)
+# Cartesian 안전 엔벨로프 (2026-08-05 사용자 지시) — **TCP 한 점의 반평면 2개**.
+#   x > CART_MIN_X : 로봇 앞쪽에 머문다   z > CART_MIN_Z : 바닥을 긁지 않는다
+# **값은 throwing.py 한 곳에만 둔다** (TCP_X_MIN/TCP_Z_MIN). 여기·dt_gp8_env·
+# 실기 게이트가 각자 복제하면 모델마다 다른 제약으로 심사받는다 — 2026-08-05
+# 실측으로 확인했다 (구 원기둥 기준으로 거른 DT 학습데이터가 반평면 게이트에
+# 걸렸다). 아래는 이 모듈 안에서 쓰던 이름을 유지하기 위한 별칭일 뿐이다.
+CART_MIN_X, CART_MIN_Z = TCP_X_MIN, TCP_Z_MIN
+
+# (구) 기둥 회피 원기둥 파라미터 — 2026-08-05 부터 **어떤 제약에도 쓰지 않는다**.
+# 기준이 "wrist·로드 50/75%·TCP 4점이 기둥 축 세그먼트(z∈[0,COL_H])에서 COL_R 이상"
+# 이었고, 위 엔벨로프와 포함관계가 아니다 (원기둥은 팔 전체 vs 기둥, 엔벨로프는
+# TCP vs 앞쪽·바닥). 되살릴 일이 있을까 싶어 값만 남긴다.
 COL_R = 0.18
 COL_H = 0.55
 
 # **카타시안(작업공간) 제약 전체 스위치** — 2026-07-31 사용자 "카타시안 제한은 모두
-# 없애". False면 위의 기둥 회피가 NLP에서 빠지고, 남는 hard constraint는 전부
+# 없애". False면 위의 Cartesian 엔벨로프가 NLP에서 빠지고, 남는 hard constraint는 전부
 # 관절공간(위치/속도/가속도 한계)과 시간 변수뿐이다. 이 값은 warm DB 유효성 키
 # (nlp_planner._warm_db_params의 'col')에 들어가므로, 되돌리면 예전 config의
 # entry가 다시 선택된다. 주의: 기둥/바닥 침범 궤적이 그대로 해로 나올 수 있고,
@@ -397,9 +405,8 @@ def _assemble_nlp(opti, P_free, t_f, t_star, q0, v0c, vfc, tgt, u_pos_nodes, rt,
             continue
         opti.subject_to(opti.bounded(Q_LO, P[:, k], Q_HI))
 
-    # -- 제약 3b: 기둥 회피 — collocation 노드 (비선형 FK 제약이라 hull 불가) --
-    # 기둥: wrist·로드·TCP 4점의 기둥 축 세그먼트(z∈[0,COL_H]) 거리 ≥ COL_R.
-    # z<0(지하 dip)·z>COL_H는 z항이 슬랙. 활성 구간은 release 창 끝(+버퍼)까지만 —
+    # -- 제약 3b: Cartesian 엔벨로프 — collocation 노드 (비선형 FK 제약이라 hull 불가) --
+    # TCP 가 x > CART_MIN_X, z > CART_MIN_Z. 활성 구간은 release 창 끝(+버퍼)까지만 —
     # 감속 꼬리는 지하로 다이브하며 축 근처를 지나는 게 일상이고 (dry-run 꼬리
     # 교체가 처리), 전 구간에 걸면 무충돌 basin까지 잘라 multistart가 전멸한다
     # (2026-07-16 실측: bin9/11 96샘플 전멸). t*·t_f가 변수라 노드별 활성 여부가
@@ -409,16 +416,23 @@ def _assemble_nlp(opti, P_free, t_f, t_star, q0, v0c, vfc, tgt, u_pos_nodes, rt,
     # CART_CONSTRAINTS=False (2026-07-31 사용자)면 이 블록 전체가 빠진다 — 남는
     # hard constraint는 관절공간 한계와 시간 변수뿐 (u_pos_nodes는 그때 무의미).
     if CART_CONSTRAINTS:
+        # 2026-08-05 사용자 지시: 카타시안 제약을 **TCP 안전 엔벨로프 하나로 통일**.
+        # 구현은 구 기둥 원기둥(COL_R/COL_H, wrist·로드·TCP 4점)을 대체한 것이고,
+        # 실기 게이트(gp8_control skills/thr_throw_skill.CART_MIN_X/Z)·DT 학습데이터
+        # 필터(dt_gp8_env.trajectory_ok_cartesian)와 **같은 기준**이다.
+        # 활성 구간도 실기 게이트와 맞춘다 — 게이트는 아크를 release 까지만 보므로
+        # 여기서도 release 창 끝까지만 걸고 감속 꼬리는 푼다 (꼬리까지 hard 로 걸면
+        # 무충돌 basin 까지 잘려 multistart 가 전멸한다 — 구 주석과 같은 이유).
         u_re = (t_star + rt / 2) / t_f + 0.08      # release 창 끝 + 버퍼 (u 단위)
         for u_c in u_pos_nodes:
             if float(u_c) == 0.0:
                 continue  # u=0: q=P₀=q_start 상수/파라미터 (결정변수 없음 — Opti가 거부)
             q_c, _, _ = spline_qs(P, float(u_c), t_f)
             act = 1.0 / (1.0 + cs.exp(40.0 * (float(u_c) - u_re)))
-            for pt in fk_col_points_sym(q_c):
-                d2 = (pt[0]**2 + pt[1]**2 + cs.fmax(pt[2] - COL_H, 0)**2
-                      + cs.fmax(-pt[2], 0)**2)
-                opti.subject_to(d2 >= COL_R**2 * act)
+            tcp = fk_col_points_sym(q_c)[-1]       # 4점 중 마지막 = TCP
+            slack = (1.0 - act) * 10.0             # act→0 이면 사실상 비활성
+            opti.subject_to(tcp[0] >= CART_MIN_X - slack)
+            opti.subject_to(tcp[2] >= CART_MIN_Z - slack)
 
     # -- 제약 2: 가속도 한계 — knot 노드 (cubic이라 전 구간 exact) --
     for u_k in np.unique(KNOTS):

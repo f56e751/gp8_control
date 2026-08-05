@@ -317,9 +317,25 @@ PUSH_JOINT6_ANGLE: float = - np.pi / 2.0
 # Env-overridable for RAISED-HEIGHT SHAKEDOWN runs (e.g. GP8_PUSH_HEIGHT=0.05
 # to exercise the new transit/gate/preposition code well clear of the belt).
 # Everything relative (START_LIFT, LIFT_HEIGHT, arc lift, floor gate) follows
-# automatically; only PUSH_CHAIN_TRANSIT_Z is absolute. Default = the
-# eye-calibrated contact height.
-PUSH_HEIGHT = float(os.environ.get("GP8_PUSH_HEIGHT", "0.01"))
+# automatically; only PUSH_CHAIN_TRANSIT_Z is absolute.
+#
+# ⚠ TEMPORARY 0.03 — NOT a calibration. The eye-calibrated value is 0.01, but
+# that calibration (2026-07-06, and every push HW validation on fix/pushing)
+# predates the 2026-07-21 tool swap `8e89062` "retune tool length for 22cm
+# gripper (was 24.5cm)", which moved M[0,3] 0.705 -> 0.680. For the SAME
+# commanded contact Z the flange now sits 25.0 mm LOWER (measured offline
+# across the whole intercept grid), while every push path's commanded floor
+# clearance is only ~±1 mm by design (PUSH_HEIGHT *is* "paddle touches belt").
+# Hence the observed strikes on push-only runs. 0.03 covers the 25 mm shift
+# plus the ~1 mm design margin so the belt can be worked while the real fix
+# is pending.
+# TO RESOLVE: re-run the eye calibration against the 22 cm tool and put the
+# measured number here (drop this block):
+#   ros2 launch gp8_control debug_robot.launch.py
+#   PYTHONPATH=$HOME/ros2_ws/src .venv/bin/python -m gp8_control.tests.push_height_test
+# then re-run tests/audit_push_floor.py with the MEASURED paddle geometry
+# (--pad-down/--pad-fore/--pad-halfw are still guesses).
+PUSH_HEIGHT = float(os.environ.get("GP8_PUSH_HEIGHT", "0.03"))
 
 # Extra Z (m) at the STROKE START over PUSH_HEIGHT. The stroke starts in the
 # back-lean swing, whose paddle bottom edge dips ~half-width*sin(25°) below

@@ -8,7 +8,7 @@
 > 아래 순서는 그 전제에서 시작한다. 0단계를 건너뛰지 말 것.
 
 전체 배경·설계 근거는 각 파일 docstring에 있다:
-- `skills/thr_throw_skill.py` — 모델 3종, 2026-08-03 업데이트 반영 내역, 기하 불일치
+- `skills/thr_throw_skill.py` — 모델 3종, 2026-08-03 업데이트 반영 내역, 기하 정합
 - `skills/thr_planners.py` — 로봇 이식에서 달라진 3가지, warm DB
 - `tools/build_warm_db_thr.py` — warm DB 저장 정책
 - `tools/collect_real_throws_gp8.py` — sim2real 수집 절차와 안전 장치
@@ -76,8 +76,8 @@ cd ~/ros2_ws/src/gp8_control/tests
 
 ⚠ 중단이 필요하면 Ctrl-C — 어느 경로로 끝나도 suction OFF가 나간다.
 
-**여기까지 통과해야 2단계로 간다.** 예측과 실제가 크게 다르면(>30 cm) 먼저
-5-B(기하 불일치)를 의심할 것.
+**여기까지 통과해야 2단계로 간다.** 예측과 실제가 크게 다르면(>30 cm) 5-B의
+24 cm TCP와 픽 Z 변환이 실행 환경에도 반영됐는지 먼저 확인할 것.
 
 ---
 
@@ -86,15 +86,23 @@ cd ~/ros2_ws/src/gp8_control/tests
 **목적**: `mem`(상태·액션열) + **실측 착지거리** 쌍을 모은다. 이것이 HER의 재료다.
 
 ```bash
-cd ~/ros2_ws && source install/setup.bash
-PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python \
-    -m gp8_control.tools.collect_real_throws_gp8 \
-    --goals 1.1,1.3,1.5,1.7 --reps 5
+cd ~/ros2_ws/src/gp8_control
+./tools/run_collect_real_throws_gp8.sh
 ```
 
-- [ ] 목표 격자를 `1.1,1.3,1.5,1.7` 로 시작 (드라이런상 **0.9 m는 α=1.0까지
-      낮춰도 게이트를 못 넘어 자동 skip** 된다 — 넣어도 데이터가 안 쌓인다)
+이 스크립트는 ROS 2, Motoman overlay, 작업공간, 프로젝트 venv를 순서대로
+로드하고 `rclpy`/PyTorch/CasADi import를 검사한다. `gp8_manager`가 꺼져 있는지
+확인하고, trajectory driver가 없으면 자동으로 시작한다. 기본 인자는
+`--goals 1.1,1.3,1.5,1.7 --reps 5`이며 필요하면 명령 뒤에 다른 값을 전달한다.
+
+```bash
+./tools/run_collect_real_throws_gp8.sh --goals 1.1,1.3 --reps 3
+```
+
+- [ ] 목표 격자를 `1.1,1.3,1.5,1.7` 로 시작
 - [ ] 4구간 × 5회 = **20 던지기**. 소요 1~1.5시간 (측정 시간 포함)
+- [ ] 픽 지점은 `run_static_pick_throw_dt.sh`와 같은 **12개**를 순서대로 순환한다.
+      20회 실행이면 12개를 한 바퀴 돈 뒤 앞의 8개를 다시 사용한다.
 - [ ] 매 던지기 후 **착지 거리 입력**
       - 규약: **베이스 회전축(J1) 중심 → 물체가 처음 떨어진 지점**의 수평거리 [m]
       - `1.23` 또는 `1.20,0.10`(x,y) 둘 다 가능
@@ -103,7 +111,8 @@ PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python \
 
 안전 동작 (자동, 개입 불필요):
 - α ~ U(1.0, **1.5**) — 논문 3.0 대신 (α는 모터 액션 배수라 실기에선 속도가 그만큼 오른다)
-- 게이트 실패 시 α를 ×0.9씩 낮춰 재시도 → α=1.0에서도 실패하면 그 던지기 skip
+- 관절/Cartesian 안전 게이트 실패 시 α를 ×0.9씩 낮춰 재시도 → α=1.0에서도
+  실패하면 그 던지기 skip. 착탄 목표 오차는 기록만 하고 거부 조건으로 쓰지 않는다.
 - 던지기 한 번마다 즉시 저장 → **중단해도 유실 없음. 재실행하면 이어붙는다**
 
 출력: `data_real/real_throws_<날짜>.pkl`
@@ -183,21 +192,17 @@ tail -f /tmp/warm_db_thr_build.log
 ```
 DB는 공식화별로 config가 공존하므로 예전 것을 덮어쓰지 않는다.
 
-### 5-B. 기하 불일치 (미해결, 실기 확인 필요)
+### 5-B. 기하 정합 (2026-08-04 해결)
 
 | 경로 | link6 → TCP |
 |---|---|
 | THR (던지기 조준·게이트) | **0.320 m** (d6 0.080 + tool 0.240) |
-| `robots/gp8.py` (픽 IK) | 0.300 m (home_ee x = 0.680) |
+| `robots/gp8.py` (픽 IK) | **0.320 m** (home_ee x = 0.700) |
 
-사용자 확인(2026-08-04)상 실물 로드는 24 cm 이므로 THR 쪽이 맞다. 그런데
-`robots/gp8.py` 는 **일부러 두었다** — 그 FK로 픽 높이(`PRESS_Z` 등)가 실기에서
-경험적으로 튜닝돼 있어 지금 고치면 그 튜닝이 통째로 어긋난다.
-
-맞추려면: `gp8.py` 의 `home_ee` x를 0.700으로 올리고 → 픽 높이 전부 재튜닝 →
-구 NLP 스킬의 warm DB(`skills/warm_db_*.pkl`) 재빌드. **별건으로 다룰 것.**
-
-실기 착지가 예측과 계통적으로 어긋나면(항상 2~3 cm 길거나 짧음) 여기를 의심한다.
+사용자 확인상 실물 로드는 24 cm다. `gp8.py`를 24 cm로 통일하고, 구 22 cm 모델과
+동일한 실제 픽 관절 자세가 되도록 픽 목표 Z를 모두 0.02 m 낮췄다. 주요 변환은
+press `0.04→0.02`, `GRASP_Z 0.062→0.042`, tracking start/end
+`0.12/0.05→0.10/0.03`이다.
 
 ### 5-C. NLP 먼 bin의 속도 상한
 

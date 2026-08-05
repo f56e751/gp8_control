@@ -125,19 +125,11 @@ class SkillContext:
         """Object's belt-frame Y at ``now`` (belt travels -Y, so Y decreases).
 
         Use the conveyor encoder speed consistently for dead reckoning, intercept
-        planning, and arrival waits.  A per-object fitted speed was introduced to
-        compensate for encoder scale error / objects drifting on the belt, but the
-        HW logs measured transparent objects at the acceptance-floor (~25% slower)
-        and accumulated 40--50 cm of false position error after camera visibility
-        ended.  Keep the old selection below as a commented record of that intent.
+        planning, and arrival waits.
         """
-        # Previous intent: why use this object's camera-fitted speed instead of the
-        # encoder?  It was meant to follow rolling/slipping objects independently.
-        # v_obj = target.v_est if getattr(target, "v_est", None) is not None else v
-        # Current policy: one belt speed for the complete timing chain, matching the
-        # last committed behaviour and avoiding mixed v_est/belt ETA calculations.
-        v_obj = v
-        return target.T_grasp_base[1, 3] - v_obj * (now - target.detect_time)
+        distance_at = getattr(self.conveyor, "distance_at", None)
+        belt_distance = distance_at(now) if callable(distance_at) else None
+        return target.y_at(now, v, belt_distance)
 
     def log_action_timing(self, target: "TrackedObject", intercept_y: float, tag: str) -> None:
         """DIAGNOSTIC: object position vs the intercept at the instant the action fires.
@@ -228,13 +220,8 @@ class SkillContext:
         """
         cfg = self.cfg
         x = float(target.T_grasp_base[0, 3])
-        # Previous intent: use a camera-fitted per-object speed for position,
-        # projected contact, and ETA so a rolling/slipping object can differ from
-        # the conveyor.  HW logs showed that estimate causing large stale-track
-        # errors, so retain the original line only as documentation.
-        # v_obj = target.v_est if getattr(target, "v_est", None) is not None else v
-        # Current policy: use the conveyor speed consistently, as object_y_now()
-        # and position_and_prime() do.
+        # Use the encoder speed consistently, as object_y_now() and
+        # position_and_prime() do.
         v_obj = v
         obj_y = self.object_y_now(target, now, v)
         denom = cfg.MAX_REACH ** 2 - x ** 2
@@ -382,7 +369,15 @@ class SkillContext:
             now = time.time()
             self.intake(now)
             if self.queue is not None:
-                self.queue.update(now, self.conveyor.current if self.conveyor else 0.0)
+                self.queue.update(
+                    now,
+                    self.conveyor.current if self.conveyor else 0.0,
+                    belt_distance_m=(
+                        self.conveyor.distance_at(now)
+                        if callable(getattr(self.conveyor, "distance_at", None))
+                        else None
+                    ),
+                )
             # Clamp non-negative: the loop body (spin + intake + queue.update)
             # can overrun the remaining time-to-deadline, making the delta
             # negative -> time.sleep() would raise "sleep length must be

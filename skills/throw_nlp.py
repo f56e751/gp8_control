@@ -66,10 +66,7 @@ from throwing import (
 N_CTRL = 12                     # 관절당 B-Spline 제어점 수
 DEGREE = 3                      # cubic (q̈가 구간별 선형 → knot 제약 = exact)
 N_WIN = 7                       # release 윈도우 적분 이산화 노드 수
-RELEASE_TIME = float(os.environ.get("GP8_RELEASE_TIME", "0.05"))   # 윈도우 총 길이 (s),
-# GP8_RELEASE_TIME 로 오버라이드 (formulation 해시 rt 키 — 바꾸면 warm DB 무효화;
-# skills.robust_throw_skill.THROW_WINDOW_T 가 이 값을 그대로 파생하므로 런타임/빌더가
-# 같은 env 로 일관됨). 긴 윈도우는 W_ACC가 너무 크면
+RELEASE_TIME = 0.05             # 윈도우 총 길이 (s). 긴 윈도우는 W_ACC가 너무 크면
 # 실패 — 스윙 ~3 m/s × 0.05s = 12~15cm 구간 전체에 mm 정확도를 강요해 basin이
 # 죽음 (1e7에서 최악 쌍 0/6 수렴). W_ACC를 1e4로 낮추면 같은 쌍 5/6 수렴,
 # 윈도우 오차 max ~6mm (bin 개구부 대비 무시 가능) — 2026-07-16 스윕.
@@ -153,7 +150,7 @@ Q_LO[0], Q_HI[0] = np.deg2rad(-60.0), np.deg2rad(60.0)
 # L(어깨 pitch, index 1): 뒤로 젖힘 ≤ 15° (2026-07-22 사용자 규칙). FK 확인:
 # q_L 음수 = 뒤로 (TCP x 감소; −15°에서 x ~0.55m). L은 부호 안 뒤집히는 축이라
 # URDF 컨벤션도 동일하게 q_L ≥ −15°.
-Q_LO[1] = np.deg2rad(float(os.environ.get("GP8_L_LO_DEG", "-15.0")))   # 로봇 J2 하한(=planner, 비반전축). GP8_L_LO_DEG 오버라이드.
+Q_LO[1] = np.deg2rad(-15.0)
 # L 상한: **q_L ≤ +30°** (2026-07-24 사용자 규칙). L은 SIGN=+1이라 플래너=로봇
 # 규약이 같아 그대로 로봇 J2 ≤ +30°를 뜻한다. 실기 한계(+145°)보다 훨씬 안쪽이라
 # dispatch 게이트 정합은 자동 충족되고, 목적은 자세 제한 — q_L이 커질수록 팔이
@@ -167,7 +164,7 @@ Q_HI[1] = np.deg2rad(30.0)
 # "U를 45도로 완화해"). 플래너 컨벤션은 '위 = 음수 q_U' (q_U_urdf = −q_U_planner,
 # corr(z_TCP, −q_U)=0.99)라 뒤집으면 플래너 범위 [−45°, +113°] — 하한만 여기서
 # 덮고 상한 +113°는 GP8_Q_MAX(정정된 datasheet)에서 옴.
-Q_LO[2] = np.deg2rad(float(os.environ.get("GP8_U_LO_DEG", "-45.0")))   # planner U 하한 = 로봇 J3 상한(부호반전: robot J3_max = -Q_LO[2]). GP8_U_LO_DEG 오버라이드.
+Q_LO[2] = np.deg2rad(-45.0)
 # U 상한: **로봇 J3 ≥ −45°** (2026-07-24 사용자 규칙). U는 SIGN=−1이라
 # 로봇 J3 = −q_U → J3 ≥ −45° ⟺ **q_U ≤ +45°**. Q_LO[2]=−45°와 합쳐 플래너
 # [−45°, +45°] = 로봇 J3 [−45°, +45°] (대칭).

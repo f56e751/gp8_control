@@ -39,11 +39,32 @@ def rollout(arm, motor_seq, k_rel, gripper_closed_val=1.0, open_val=-1.0):
         a[:3] = np.clip(motor_seq[k], -1.0, 1.0)
         a[3] = open_val if k >= k_rel else gripper_closed_val
         reward, done, term, obj_pos, success = arm.step(a)
-        temp_mem.append((state, a.copy(), reward, done, success))
+        # 무작위 수집과 같은 규약: 라벨은 **실현된 액션** (env가 속도·가속도·
+        # 위치 한계 교집합으로 투영한 뒤의 값). 2026-08-05.
+        temp_mem.append((state, arm.action_exec.copy(), reward, done, success))
         if success:
             x_land, released = float(obj_pos[0]), True
         k += 1
     return x_land, temp_mem, released
+
+
+# 카티시안 작업영역(TCP x > 0.20, z > 0.02) 위반에 대한 벌점 계수.
+# 왜 필요한가: 수집기는 위반 궤적을 버리는데(사용자 지시), CEM이 제약을 모른 채
+# 풀면 그 해의 섭동이 통째로 버려진다 — 실측 prior 롤아웃 496개가 이렇게
+# 폐기되어 원거리(≥1.2 m) 커버리지가 74%→62%로 떨어졌다. 벌점을 목적함수에
+# 넣어 **애초에 작업영역 안에서 데모 궤적을 뽑는다** (2026-08-05).
+# 단위 맞춤: 비용은 착탄 오차[m]이므로, 1 cm 위반이 10 cm 오차와 같은 무게.
+W_WORKSPACE = 10.0
+
+
+def workspace_violation(mem):
+    """궤적 상태들의 작업영역 위반 깊이 [m] (0이면 전 구간 만족)."""
+    from .dt_gp8_env import TCP_X_MIN, TCP_Z_MIN, tcp_xz
+    v = 0.0
+    for m in mem:
+        x, z = tcp_xz(np.asarray(m[0], float)[:3])
+        v = max(v, TCP_X_MIN - x, TCP_Z_MIN - z)
+    return max(v, 0.0)
 
 
 def _land_dist(p, v, z_obj, g=9.81):
@@ -91,7 +112,7 @@ def jitter_cost(arm, seq, k_rel, d_goal, jitter=0.05, n_probe=5, T=T_MAX):
     스텝 단위(±1스텝=±0.1 s) 강건성보다 사용자 스펙(±0.05 s)에 맞다 —
     ±1스텝을 요구하면 도달 범위가 1.2 m대로 좁아지는 것을 확인했다."""
     from .dt_gp8_env import PLANAR_IDX, SIM_DT, q6
-    from .throwing import fk_pos, jacobian
+    from throwing import fk_pos, jacobian
 
     x_land, mem, released = rollout(arm, seq, k_rel)
     if not released or x_land is None:
@@ -100,14 +121,21 @@ def jitter_cost(arm, seq, k_rel, d_goal, jitter=0.05, n_probe=5, T=T_MAX):
 
     # 시뮬이 실제로 재생하는 궤적으로 평가한다: 스텝 노드를 240 Hz로 편 뒤,
     # env가 보간 모드면 컨트롤러 보간(MotoROS Hermite)까지 거친다.
-    ts_e = np.arange(0.0, t_nodes[-1] + SIM_DT / 2, SIM_DT)
-    Q_e = np.column_stack([np.interp(ts_e, t_nodes, Qp[:, j]) for j in range(3)])
-    Qd_e = np.gradient(Q_e, ts_e, axis=0)
     if getattr(arm, "interp", None):
+        ts_e = np.arange(0.0, t_nodes[-1] + SIM_DT / 2, SIM_DT)
+        Q_e = np.column_stack([np.interp(ts_e, t_nodes, Qp[:, j])
+                               for j in range(3)])
+        Qd_e = np.gradient(Q_e, ts_e, axis=0)
         from sim.gp8_interp import controller_track
         ts_e, Q_e, Qd_e = controller_track(
             ts_e, Q_e, Qd_e, traj_hz=arm.interp.get("traj_hz"),
             period=arm.interp.get("period"), out_dt=SIM_DT)
+    else:
+        # env(release_state)·planner(gp8_dt_traj_fn)와 **같은** 공식 보간 곡선.
+        # 종전에는 여기만 선형보간이라 CEM이 다른 물리를 최적화했다 — 목표
+        # 1.35 m 해가 실제로는 1.72 m에 떨어졌다 (2026-08-05 발견).
+        from .dt_gp8_env import controller_curve
+        ts_e, Q_e, Qd_e = controller_curve(Qp, float(t_nodes[1] - t_nodes[0]))
 
     errs = []
     for dtj in np.linspace(-jitter, jitter, n_probe):
@@ -119,10 +147,16 @@ def jitter_cost(arm, seq, k_rel, d_goal, jitter=0.05, n_probe=5, T=T_MAX):
         qd6 = np.zeros(6)
         qd6[PLANAR_IDX] = qd3
         v3 = Jv @ qd6
+        # 착지 기준면은 env(_ballistic_landing)와 **같아야** 한다: 물체 반대각
+        # 위에 조준면 z_land(=−0.08, pit 바닥이 아니라 bin 조준점)를 더한 높이다.
+        # 종전에는 z_land를 빼먹어 CEM만 z=0 기준으로 풀었고, 그만큼 더 낙하하는
+        # 동안 수평으로 더 나가 원거리에서 13~41 cm 계통 오차가 났다 (2026-08-05).
+        z_ref = getattr(arm.cfg, "z_land", 0.0)
         d = _land_dist(np.array([p3[0], p3[2]]), np.array([v3[0], v3[2]]),
-                       arm.cfg.object_half_diag, arm.cfg.gravity)
+                       z_ref, arm.cfg.gravity)
         errs.append(1e3 if d is None else abs(d - d_goal))
-    return float(np.mean(errs) + 0.5 * np.max(errs)), x_land
+    pen = W_WORKSPACE * workspace_violation(mem)
+    return float(np.mean(errs) + 0.5 * np.max(errs) + pen), x_land
 
 
 def seq_cost(arm, seq, k_rel, d_goal, T=T_MAX, robust=True):
@@ -136,14 +170,15 @@ def seq_cost(arm, seq, k_rel, d_goal, T=T_MAX, robust=True):
     NLP 플래너가 W_ACC로 release 윈도우 '전 구간'의 착탄 정확도를 강제하는 것과
     같은 취지 — 세 모델이 각자의 방식으로 타이밍 강건성을 추구하게 둔다."""
     ks = [k_rel - 1, k_rel, k_rel + 1] if robust else [k_rel]
-    errs = []
+    errs, pen = [], 0.0
     for k in ks:
         if k < 1 or k >= T:
             continue
-        x_land, _, released = rollout(arm, seq, k)
+        x_land, mem, released = rollout(arm, seq, k)
         errs.append(1e3 if (not released or x_land is None)
                     else abs(x_land - d_goal))
-    return float(np.mean(errs) + 0.5 * np.max(errs))
+        pen = max(pen, W_WORKSPACE * workspace_violation(mem))
+    return float(np.mean(errs) + 0.5 * np.max(errs) + pen)
 
 
 def cem_throw(d_goal, cfg=None, n_iter=14, pop=160, elite=16, T=T_MAX,
@@ -165,25 +200,36 @@ def cem_throw(d_goal, cfg=None, n_iter=14, pop=160, elite=16, T=T_MAX,
 
     best = dict(cost=np.inf, x_land=None, motor_seq=None, k_rel=None,
                 temp_mem=None)
+    by_k = {}
     # 릴리즈 스텝별로 별도 분포를 유지 (k_rel은 이산 — 스텝마다 CEM을 돌리고
     # 최적 k_rel을 고른다. T가 10이라 전수 탐색이 저렴하다.)
     for k_rel in range(3, T):
         mu = np.zeros((T, 3))
         sd = np.full((T, 3), sigma0)
+        k_best = dict(cost=np.inf, x_land=None, motor_seq=None, k_rel=k_rel,
+                      temp_mem=None)
         for it in range(n_iter):
             cand = np.clip(mu[None] + sd[None] * rng.standard_normal((pop, T, 3)),
                            -1.0, 1.0)
             costs = np.array([cost_of(seq, k_rel) for seq in cand])
             idx = np.argsort(costs)[:elite]
             mu, sd = cand[idx].mean(0), cand[idx].std(0) + 1e-3
-            if costs[idx[0]] < best["cost"]:
+            if costs[idx[0]] < k_best["cost"]:
                 seq = cand[idx[0]]
                 x_land, mem, released = rollout(arm, seq, k_rel)
-                best = dict(cost=float(costs[idx[0]]), x_land=x_land,
-                            motor_seq=seq.copy(), k_rel=k_rel, temp_mem=mem)
+                k_best = dict(cost=float(costs[idx[0]]), x_land=x_land,
+                              motor_seq=seq.copy(), k_rel=k_rel, temp_mem=mem)
+        if k_best["motor_seq"] is not None:
+            # 같은 목표를 **다른 릴리즈 타이밍**으로 맞춘 해 — 스윙 모양이
+            # 실제로 다르다. prior의 행동 다양성은 여기서 나온다.
+            by_k[k_rel] = k_best
+            if k_best["cost"] < best["cost"]:
+                best = k_best
         if verbose:
-            print(f"    k_rel={k_rel}: best cost so far {best['cost']:.4f} "
-                  f"(x_land={best['x_land']})")
+            print(f"    k_rel={k_rel}: cost {k_best['cost']:.4f} "
+                  f"(x_land={k_best['x_land']}), 전체 best {best['cost']:.4f}")
+    best = dict(best)
+    best["by_k"] = by_k
     return best
 
 

@@ -441,6 +441,22 @@ class ThrowSkill(ManipulationSkill):
             f"model_distance={model_distance:.3f}m"
         )
 
+        # The first object is commonly locked while the queue still contains
+        # only that object, so request.secondary is None. More objects can be
+        # detected during the long ambush wait; bind the first one here, at
+        # actual throw time, just as next_chain_target() re-polls the live
+        # queue below. Without this late bind the NN arc falls back over the
+        # current grasp while the appended chain heads to the newly arrived
+        # next object, producing the observed first-cycle dogleg.
+        if secondary is None and ctx.queue:
+            secondary = next(iter(ctx.queue._objects), None)
+            if secondary is not None:
+                ctx.log.info(
+                    "Late-bound throw secondary from live queue: "
+                    f"id={secondary.track_id} {secondary.class_name} "
+                    f"x={secondary.T_aim_base[0, 3]:+.3f}"
+                )
+
         # A selected runtime bin behaves exactly like the existing fixed bin;
         # without throw_bins, preserve the legacy per-class/fallback flow.
         if selected_bin is not None:
@@ -523,11 +539,24 @@ class ThrowSkill(ManipulationSkill):
         if secondary is None:
             return T_aim1_fallback.copy()
 
+        # ``secondary.T_aim_base.z`` is camera_debug's display reference
+        # (REFERENCE_Z_BASE + DETECTION_OFFSET_AIM = 0.700 m), not an
+        # operational robot hover. The post-throw chain parks at INITIAL_T.z;
+        # use that same safe, reachable height for the parametric arc endpoint
+        # so the arc and chain share one Z convention.
+        T_aim2_seed = secondary.T_aim_base.copy()
+        # Convert the frozen detection anchor to NOW using encoder distance.
+        # The pure planner can then project only the future throw lead from a
+        # zero-age pose instead of re-integrating current_speed over track age.
+        T_aim2_seed[1, 3] = ctx.object_y_now(
+            secondary, now, ctx.conveyor.current
+        )
+        T_aim2_seed[2, 3] = float(ctx.cfg.INITIAL_T[2, 0])
         T_aim2, _, _, neg_wait2 = ctx.planner.plan_throw_landing(
             T_grasp1,
-            secondary.T_aim_base.copy(),
+            T_aim2_seed,
             theta,
-            secondary.detect_time,
+            now,
             ctx.conveyor.current,
             now,
             fixed_delay=ctx.cfg.FIXED_DELAY_THROW,
@@ -536,10 +565,20 @@ class ThrowSkill(ManipulationSkill):
             neg_wait2 is not None
             or T_aim2[0, 3] < 0.1
             or T_aim2[2, 3] < 0.0
-            or T_aim2[2, 3] > ctx.cfg.MAX_REACH
         )
         if infeasible:
+            ctx.log.warn(
+                "Next-object throw aim infeasible; using current-object hover: "
+                f"secondary aim=({T_aim2[0, 3]:+.3f}, "
+                f"{T_aim2[1, 3]:+.3f}, {T_aim2[2, 3]:+.3f})m, "
+                f"past_reach={neg_wait2 is not None}"
+            )
             return T_aim1_fallback.copy()
+        ctx.log.info(
+            "Next-object throw arc endpoint: "
+            f"({T_aim2[0, 3]:+.3f}, {T_aim2[1, 3]:+.3f}, "
+            f"{T_aim2[2, 3]:+.3f})m"
+        )
         return T_aim2
 
     # ------------------------------------------------------------------
@@ -649,6 +688,24 @@ class ThrowSkill(ManipulationSkill):
         else:
             chain_target = ctx.lifted_standby_joint(aim_joint2)
             chain_dest = "lifted standby"
+
+        # Make the two post-release destinations explicit in the HW log. This
+        # distinguishes the NN arc endpoint (aim_joint2) from the appended
+        # chain endpoint and makes any remaining XY mismatch directly visible.
+        try:
+            T_arc_end = ctx.robot.forward_kinematics(
+                np.append(start_q5, float(grasp_joint[-1]))
+            )
+            T_chain_end = ctx.robot.forward_kinematics(chain_target[:6])
+            ctx.log.info(
+                "Throw endpoint TCP: "
+                f"arc=({T_arc_end[0, 3]:+.3f}, {T_arc_end[1, 3]:+.3f}, "
+                f"{T_arc_end[2, 3]:+.3f})m -> "
+                f"chain=({T_chain_end[0, 3]:+.3f}, {T_chain_end[1, 3]:+.3f}, "
+                f"{T_chain_end[2, 3]:+.3f})m [{chain_dest}]"
+            )
+        except Exception as exc:  # diagnostic only; never block a throw
+            ctx.log.warn(f"Throw endpoint TCP logging failed: {exc}")
 
         # 6-DOF chain: the ARC is 5-DOF (the NN drives joints 1-5; J6 stays
         # parked at the pick wrist), but the chain must be able to ROTATE the
