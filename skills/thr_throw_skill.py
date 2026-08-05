@@ -40,11 +40,12 @@ THR 시뮬 결과 (컨트롤러 보간 ON, 12 던지기 × 3 세션, seed 0 기�
   카타시안 제약을 모두 뺐고, 시뮬은 위반을 '보고만' 한다
   (`nlp_planner.CART_CHECK_BLOCKING=False`). 시뮬에서는 그래도 되지만 실기에서는
   기둥/바닥을 실제로 친다. 그래서 이 스킬은 **dispatch 직전 Cartesian 안전
-  엔벨로프 게이트를 hard 로 유지한다** (x>0.20, z>0.04). z 상한은
-  2026-08-04 사용자 지시로 검사하지 않는다. 위반하는 계획은 실행하지 않고
-  그 지점을 건너뛴다.
-  GP8_THR_NLP_CART=1 로 두면 NLP 자체의 기둥 회피 제약도 되살린다 (해가 줄지만
-  게이트 통과율은 올라간다).
+  엔벨로프를 검사한다** — TCP 한 점에 대한 **x>0.20, z>0.02** (2026-08-05 사용자
+  지시). z 상한은 2026-08-04 지시로 검사하지 않는다. 런타임은 위반해도 **보고만**
+  하고 진행하며(CART_BLOCKING), 수집(warm DB·실기 데이터)에서만 제외한다.
+  ⚠ 이 엔벨로프는 NLP 옵티마이저의 기둥 회피(throw_nlp.COL_R=0.18/COL_H=0.55 원기둥,
+  wrist·로드·TCP 4점)나 DT 학습데이터 필터(dt_gp8_env.trajectory_clears_column,
+  같은 원기둥)와 **다른 기준**이다 — 세 기준이 서로를 대체하지 않는다.
 
 ──────────────────────────────────────────────────────────────────────────────
 각도 규약 / 기하
@@ -92,11 +93,10 @@ import numpy as np
 
 from gp8_control.skills import thr_planners
 from gp8_control.skills.robust_throw_skill import (
-    MIN_TCP_X,
-    MIN_TCP_Z,
     _PLANNER_SIGN,
     RobustThrowSkill,
 )
+from gp8_control.skills.thr import throwing as _thr_throwing
 from gp8_control.skills.thr import throw_nlp
 from gp8_control.skills.thr.throwing import G, fk_pos, landing_error, launch_state
 from gp8_control.trajectory.trajectory_primitive import trajectory
@@ -108,6 +108,16 @@ if TYPE_CHECKING:
 # =========================================================================
 # 설정
 # =========================================================================
+
+# THR 경로 전용 Cartesian 안전 엔벨로프 (2026-08-05 사용자 지시: x>0.20, z>0.02).
+# robust_throw_skill 의 MIN_TCP_X/MIN_TCP_Z (구 NLP 스킬용, z>0.04) 와 **분리**한다 —
+# 그쪽은 tool 0.220 기준의 별도 공식화라 같이 움직이면 안 된다.
+# 형태: TCP 한 점에 대한 반평면 2개 (x = 로봇 앞쪽, z = 바닥). 2026-08-05 부터
+# NLP 옵티마이저(throw_nlp 제약 3b)·DT 학습데이터 필터(dt_gp8_env.
+# trajectory_ok_cartesian)와 **같은 기준**이고, 값은 thr/throwing.py 한 곳에서
+# 온다. 환경변수로 덮으면 그 셋이 갈라지니 진단 목적으로만 쓸 것.
+CART_MIN_X: float = float(os.environ.get("GP8_THR_MIN_X", _thr_throwing.TCP_X_MIN))
+CART_MIN_Z: float = float(os.environ.get("GP8_THR_MIN_Z", _thr_throwing.TCP_Z_MIN))
 
 # z 바닥 게이트를 arm 하기 전 요구하는 상승 여유 [m] (아래 GATE 2 주석 참고)
 Z_ARM_MARGIN: float = float(os.environ.get("GP8_THR_Z_ARM_MARGIN", "0.02"))
@@ -225,10 +235,10 @@ def check_arc(arc_q, arc_qd, arc_t, p_target, robot, model: str,
     P = np.array([fk_pos(arc_q[:, k] * _PLANNER_SIGN) for k in range(arc_q.shape[1])])
     x_min, z_min = float(P[:, 0].min()), float(P[:, 2].min())
     out.update(x_min=x_min, z_min=z_min)
-    out["ok_cart"] = bool(x_min > MIN_TCP_X and z_min > MIN_TCP_Z)
+    out["ok_cart"] = bool(x_min > CART_MIN_X and z_min > CART_MIN_Z)
     if not out["ok_cart"]:
         msg = (f"Cartesian 엔벨로프 위반 (x_min={x_min:+.3f}m, z_min={z_min:+.3f}m; "
-               f"한계 x>{MIN_TCP_X:.2f}, z>{MIN_TCP_Z:.2f})"
+               f"한계 x>{CART_MIN_X:.2f}, z>{CART_MIN_Z:.2f})"
                + ("  ※ NLP 의 기둥 회피는 release 창까지만 활성이고 바닥 클리어런스는"
                   " hard 제약이 아니다 (throw_nlp 제약 3b) — 감속 꼬리가 내려앉는"
                   " 해는 여기서만 걸린다" if model == "nlp" else ""))
@@ -535,28 +545,28 @@ class ThrThrowSkill(RobustThrowSkill):
                     ctx.robot.forward_kinematics(traj[:, k]), float)[:3, 3]
         bad_list: list = []
         # z 바닥 검사는 팔이 바닥을 '확실히' 벗어난 뒤부터 건다. 출발점(프레스 자세)이
-        # 마침 MIN_TCP_Z 근처면(--points z=0.04 == MIN_TCP_Z 가 기본), lift 첫 샘플의
+        # 마침 CART_MIN_Z 근처면(--points z=0.02 == CART_MIN_Z), lift 첫 샘플의
         # 0.2 mm 수준 수치 딥까지 위반으로 잡혀 던지기가 통째로 막힌다 (실측: phy
         # 3건 중 2건). 원래 의도는 '한 번 올라갔다가 다시 내려오는 꼬리 다이브'를
         # 잡는 것이므로, ARM 여유(2 cm)만큼 올라간 뒤부터 검사를 arm 한다.
-        cleared = np.nonzero(tcp[2] > MIN_TCP_Z + Z_ARM_MARGIN)[0]
+        cleared = np.nonzero(tcp[2] > CART_MIN_Z + Z_ARM_MARGIN)[0]
         if cleared.size == 0:
-            bad_list.append((0, f"궤적 전체가 z ≤ {MIN_TCP_Z + Z_ARM_MARGIN:.3f}m "
+            bad_list.append((0, f"궤적 전체가 z ≤ {CART_MIN_Z + Z_ARM_MARGIN:.3f}m "
                                 f"(lift 가 바닥을 못 벗어남)"))
         else:
             k0 = int(cleared[0])
-            dip = np.nonzero(tcp[2, k0:] <= MIN_TCP_Z)[0]
+            dip = np.nonzero(tcp[2, k0:] <= CART_MIN_Z)[0]
             if dip.size:
                 k = k0 + int(dip[0])
-                bad_list.append((k, f"TCP z={tcp[2, k]:+.4f}m ≤ {MIN_TCP_Z:.3f}m (바닥/벨트)"))
-        near = np.nonzero(tcp[0] <= MIN_TCP_X)[0]
+                bad_list.append((k, f"TCP z={tcp[2, k]:+.4f}m ≤ {CART_MIN_Z:.3f}m (바닥/벨트)"))
+        near = np.nonzero(tcp[0] <= CART_MIN_X)[0]
         if near.size:
             k = int(near[0])
-            bad_list.append((k, f"TCP x={tcp[0, k]:+.4f}m ≤ {MIN_TCP_X:.3f}m (기둥/베이스)"))
+            bad_list.append((k, f"TCP x={tcp[0, k]:+.4f}m ≤ {CART_MIN_X:.3f}m (기둥/베이스)"))
         if bad_list:
             k, why = min(bad_list)
             n_viol = int(np.count_nonzero(
-                (tcp[0] <= MIN_TCP_X) | (tcp[2] <= MIN_TCP_Z)))
+                (tcp[0] <= CART_MIN_X) | (tcp[2] <= CART_MIN_Z)))
             head = ("ABORTED (not dispatched)" if CART_BLOCKING
                     else "Cartesian 위반 — **보고만** 하고 dispatch 진행")
             ctx.log.error(

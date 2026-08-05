@@ -19,9 +19,10 @@
 | `dt_model/trainer.py` | `Thr_DT/agent/trainer.py` | 없음 |
 | `dt_model/batch.py` | `Thr_DT/train_dt_offline.py` 의 `dataset_stats`·`make_get_batch` | 함수 2개 발췌 |
 | `tossingbot/{__init__,config,physics}.py` | `Thr_Phy/tossingbot/` | 없음 |
-| `weights/gp8_dt_best.pth` | `THR/weights_gp8/dt_best.pth` | 없음 |
 | `weights/gp8_dt_best_v9.pth` | `THR/weights_gp8_v9/dt_best.pth` | 없음 |
 | `weights/gp8_dt_ft2_real-11.pth` | `THR/weights_gp8_ft2/dt_finetuned_real-11.pth` | 없음 |
+| `weights/gp8_dt_nolag.pth` | `THR/weights_gp8_nolag/dt_best.pth` | 없음 |
+| `weights/gp8_dt_nolag_cart.pth` | `THR/weights_gp8_nolag_cart/dt_best.pth` | 없음 |
 
 **import 변경 전부** (원본은 bare import + `sys.path.insert` 를 쓴다):
 

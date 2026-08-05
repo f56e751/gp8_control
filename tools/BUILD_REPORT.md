@@ -2,7 +2,7 @@
 
 `skills/warm_db.pkl` — RobustThrowSkill의 offline warm-start DB. 순수 오프라인
 수치계산으로 생성 (ROS 노드/로봇 IO 없음). 빌드 스크립트: `tools/build_warm_db.py`,
-원시 로그: `tools/warm_db_build_log.json`.
+원시 로그: `tools/warm_db_build_log.json` (2026-08-05 삭제 — 구 NLP 스택 전용 2.1 MB 로그. 필요하면 git 이력에서 복구).
 
 ## 1. 사용 좌표와 출처 (임의 추정 없음 — 전부 리포 내 설정/캘리브레이션 값)
 

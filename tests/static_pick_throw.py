@@ -19,7 +19,7 @@ IK + NLP 계획 + 접근/하강/던지기(chain 포함) 궤적을 전부 계산�
 
   PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python \\
     -m gp8_control.tests.static_pick_throw \\
-    --points "0.45,0.20,0.062;0.45,-0.10,0.10" --target "1.2,0,0;1.6,0,0"
+    --points "0.45,0.20,0.042;0.45,-0.10,0.08" --target "1.2,0,0;1.6,0,0"
 
 --target 은 1개(전 지점 공통) 또는 지점 수와 같은 개수(지점별)로 준다.
 
@@ -332,7 +332,7 @@ def _parse_points(spec: str, default_z: float) -> list[tuple[float, float, float
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="정적(멈춘 벨트) 연속 pick-and-throw 테스트 (robust_throw)")
-    ap.add_argument("--points", default="0.45,0.20,0.062;0.45,-0.10,0.062",
+    ap.add_argument("--points", default="0.45,0.20,0.042;0.45,-0.10,0.042",
                     help='벨트 위 물체 지점들 "x,y,z;x,y,z;..." [m base] — '
                          "z는 프레스가 내려가는 최종 TCP 높이 (z 생략 시 GRASP_Z)")
     ap.add_argument("--target", default="1.2,0,0",

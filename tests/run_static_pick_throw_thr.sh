@@ -28,20 +28,16 @@ KEEP_DRIVER="${KEEP_DRIVER:-1}"   # 1 = 종료 후에도 driver 유지(재실행
 # (dt 는 학습 시 home 자세 고정, phy 는 릴리즈점을 목표로부터 해석적으로 결정).
 export GP8_THR_P_START_Z="${GP8_THR_P_START_Z:-0.20}"
 #
-# Cartesian 안전 엔벨로프 (dispatch 직전 hard 게이트, skills/robust_throw_skill 공유):
-#   x > 0.20, 0.04 < z < GP8_MAX_TCP_Z
+# Cartesian 안전 엔벨로프 (dispatch 직전 hard 게이트):
+#   x > 0.20, z > 0.04 (z 상한은 검사하지 않음)
 # ⚠ THR 은 2026-07-31 사용자 지시로 NLP 에서 카타시안 제약을 모두 뺐고
 #   (throw_nlp.CART_CONSTRAINTS=False) 시뮬은 위반을 보고만 한다. 시뮬은 그래도
-#   되지만 실기는 기둥/바닥을 실제로 친다 — 그래서 이 게이트는 hard 로 유지한다.
+#   되지만 실기는 기둥/바닥을 실제로 친다 — 그래서 하한 게이트는 hard 로 유지한다.
 #   위반하는 계획은 실행하지 않고 그 지점을 통째로 건너뛴다.
-export GP8_MAX_TCP_Z="${GP8_MAX_TCP_Z:-0.85}"
 # 1 로 두면 NLP 자체의 기둥 회피 제약도 되살린다 (해가 줄지만 게이트 통과율↑).
 export GP8_THR_NLP_CART="${GP8_THR_NLP_CART:-0}"
 #
-# 착탄 게이트 [m] — 예측 착지가 목표에서 이만큼 넘게 벗어나면 그 지점을 거부.
-# 미지정이면 모델별 기본값 (nlp 0.10 / dt 0.40 / phy 0.60 — THR 시뮬 실측
-# 정확도 26·51·85 mm 를 반영한 값). 일괄 오버라이드하려면 여기서 지정.
-# export GP8_THR_LAND_GATE=0.30
+# 착탄 목표 오차는 진단값으로만 출력하며 계획을 거부하지 않는다.
 #
 # release 명령 선행 시간 [s]. 양수 = 그만큼 일찍 명령(밸브 지연 보정), 음수 = 늦게.
 # nlp 은 ±50 ms 릴리즈 윈도우가 있어 지터를 흡수하지만 **dt/phy 는 릴리즈가 한
@@ -130,7 +126,7 @@ echo "target: $TARGET_ARG"
 
 echo "=== [4/4] run static_pick_throw_thr (model=$THR_MODEL) ==="
 echo "P_START_Z  : $GP8_THR_P_START_Z m (던지기 시작 TCP 높이)"
-echo "max-z      : GP8_MAX_TCP_Z=$GP8_MAX_TCP_Z (Cartesian 게이트는 hard 유지)"
+echo "Cartesian  : x>0.20 m, z>0.04 m (z 상한 없음)"
 echo "NLP cart   : GP8_THR_NLP_CART=$GP8_THR_NLP_CART (1=NLP 기둥 회피 제약 부활)"
 echo "release    : GP8_RELEASE_LEAD=$GP8_RELEASE_LEAD s (+일찍 −늦게)"
 [ -n "${GP8_THR_DT_WEIGHTS:-}" ] && echo "DT weights : $GP8_THR_DT_WEIGHTS"

@@ -52,6 +52,22 @@ GP8_Q_MIN = np.deg2rad([-170.0, -65.0, -190.0, -190.0, -135.0, -360.6])
 GP8_Q_MAX = np.deg2rad([170.0, 145.0, 70.0, 190.0, 135.0, 360.6])
 GP8_QD_MAX = np.deg2rad([455.0, 385.0, 520.0, 550.0, 550.0, 1000.0])
 
+# --- 카티시안 작업영역 (2026-08-05 사용자 지정) -----------------------------
+# 궤적의 모든 시점에서 TCP가 x > TCP_X_MIN, z > TCP_Z_MIN 이어야 한다.
+# 로봇 앞쪽에 머물고 바닥을 긁지 않는다는 뜻. **NLP·DT가 같은 값을 쓰도록
+# 여기 한 곳에만 둔다** (throw_nlp은 casadi를 import해 DT 인터프리터에서 못 쓰므로
+# 상수를 복제하면 갈라진다 — 그 실수를 이미 한 번 했다).
+TCP_X_MIN = 0.20
+TCP_Z_MIN = 0.02
+
+
+def tcp_in_workspace(q6_or_pos):
+    """6축 자세(또는 TCP 위치 3-vector)가 작업영역 안인가."""
+    p = np.asarray(q6_or_pos, float)
+    if p.size == 6:
+        p = fk_pos(p)
+    return bool(p[0] > TCP_X_MIN and p[2] > TCP_Z_MIN)
+
 # joint chain: (직전 translation xyz, 회전축) — zero pose에서 상완 수직, 전완 +x 수평
 _CHAIN = [
     ((0.0, 0.0, 0.0), "z"),                                  # S
