@@ -185,6 +185,16 @@ assert WP_VEL_MODE in ("zero", "segment", "trapezoid"), WP_VEL_MODE
 # 적분 규칙은 waypoint 규약과 짝이다 — 공식 두 경로는 식 (5.1) 직사각을 쓴다.
 TRAPEZOID = (WP_VEL_MODE == "trapezoid")
 
+# 동역학 모드 (2026-08-06 사용자 지시: "가속도 한계를 없애고 공식 Gazebo 방식").
+#   'effort_pid'  공식 사슬 재현: PID 토크 → URDF effort 클램프 → 관성 동역학
+#                 (dyn_effort_pid.py, 수치 전부 공식 저장소). **feasible box·
+#                 가속 클램프를 쓰지 않는다** — 가속도는 τ/I 로 창발 (공식 동일).
+#                 상태는 동역학의 실측값, 저장 액션은 명령값 (공식 수집과 동일).
+#   'box'         종전 기구학 + 상자 투영 (3× 가속 한계 명시 강제).
+# 실측 (effort_pid): 명령 −550°/s 가 첫 스텝에 실현, 순간가속 ≥5,600°/s².
+DYN_MODE = os.environ.get("DT_GP8_DYN", "effort_pid")
+assert DYN_MODE in ("effort_pid", "box"), DYN_MODE
+
 
 # ---------------------------------------------------------------------------
 # 실현 가능한 액션 상자 (2026-08-05 사용자 지시: "데모를 애초에 관절 각도·속도·
@@ -490,6 +500,9 @@ class GP8ThrowArm:
     # --------------------------------------------------------------- reset
     def reset(self):
         self.q = np.array(self.cfg.home_pose, dtype=np.float64)
+        if DYN_MODE == "effort_pid":
+            from .dyn_effort_pid import EffortPID
+            self._pid = EffortPID(self.q, Q_LO, Q_HI)
         self.qdot = np.zeros(3)
         self.qdot_seg = np.zeros(3)     # 스텝 구간 평균 속도 (release용)
         self.qdot_cmd_prev = np.zeros(3)  # 가속도 rate limit용 직전 명령속도
@@ -556,6 +569,18 @@ class GP8ThrowArm:
         순간 속도를 쓰면 env가 1.70 m로 예측한 던지기가 시뮬에서 1.04 m로
         떨어지는 계통 편향이 생긴다 (2026-07-30 측정)."""
         c = self.cfg
+        if DYN_MODE == "effort_pid":
+            # 공식 사슬: 식 (5.1) 위치 명령 → JTC 선형램프 설정점 → PID 토크
+            # → effort 클램프 → 관성 동역학 (1 kHz). 상태 = 실측.
+            q_prev = self.q.copy()
+            q_cmd = self.q + qdot_cmd * c.dt
+            self.q, qd_meas = self._pid.track(q_cmd, c.dt)
+            self.qdot = qd_meas.copy()                      # 순간 실측속도
+            self.qdot_seg = (self.q - q_prev) / c.dt        # 구간 평균 (release 규약)
+            self.qdot_node = self.qdot_seg.copy()           # 재생 waypoint 속도
+            self.q_hist.append(self.q.copy())
+            self.w_hist.append(self.qdot_node.copy())
+            return self.tcp()
         h = c.dt / c.substeps
         q_prev = self.q.copy()
         w_prev = self.qdot_node.copy()
@@ -651,25 +676,26 @@ class GP8ThrowArm:
         velocity_vector = np.asarray(velocity_vector, dtype=np.float64)
         velocity_vector = self.proj_on_max_speed(velocity_vector)
         velocity_vector = self.smooth_velocity(velocity_vector)
-        # 속도·가속도·위치(제동 여유 포함) 한계의 교집합으로 **먼저** 투영한다.
-        # 종전처럼 가속도만 사후 클립하고 위치는 적분기에서 잘라내면 기록 액션이
-        # 실현값과 달라진다 (실측 60~64% 스텝에서 불일치).
-        # 기준은 **직전 노드에서 실제로 실현된** ω 다. 명령값(qdot_cmd_prev)을
-        # 쓰면 위치 클립이 걸린 스텝에서 둘이 갈라져, 실행 곡선의 가속도가
-        # 상자를 넘는다 (실측 무작위 60개 중 8개).
-        w_lo, w_hi = feasible_qdot_box(self.q, self.qdot_node,
-                                       self.cfg.dt, cfg=self.cfg)
-        velocity_vector[:3] = np.clip(velocity_vector[:3], w_lo, w_hi)
+        if DYN_MODE == "box":
+            # 속도·가속도·위치(제동 여유) 교집합으로 먼저 투영 — 3× 한계 명시 강제.
+            w_lo, w_hi = feasible_qdot_box(self.q, self.qdot_node,
+                                           self.cfg.dt, cfg=self.cfg)
+            velocity_vector[:3] = np.clip(velocity_vector[:3], w_lo, w_hi)
+        # effort_pid 모드는 투영 없음 — 공식처럼 명령은 그대로, 실현은 동역학이 결정.
         self.qdot_cmd_prev = velocity_vector[:3].copy()
         self.velocity = velocity_vector
         qdot_cmd = velocity_vector[:3]
         gripper = velocity_vector[-1]
 
         tip = self._integrate_control_step(qdot_cmd)
-        # 실제로 실현된 정규화 액션 — 수집기는 **이 값**을 데모로 저장한다.
-        # 상자 투영 덕에 보통 명령과 같지만, 수치적으로도 일치를 보장한다.
-        self.action_exec = np.append(self.qdot_seg / np.asarray(QD_MAX, float),
-                                     gripper)
+        if DYN_MODE == "effort_pid":
+            # 공식 수집은 **명령 액션**을 저장한다 (상태는 실측). 그대로.
+            self.action_exec = np.append(qdot_cmd / np.asarray(QD_MAX, float),
+                                         gripper)
+        else:
+            # box 모드: 실현된 정규화 액션 (상자 투영 덕에 보통 명령과 동일).
+            self.action_exec = np.append(
+                self.qdot_seg / np.asarray(QD_MAX, float), gripper)
         self.curr_time += self.cfg.dt
         self.curr_step += 1
 

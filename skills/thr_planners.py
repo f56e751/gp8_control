@@ -231,10 +231,17 @@ def nlp_traj_fn(target, p_start, v_start=None, ctx=None, logger=None):
             best = (res, tag)
         return True
 
-    # ---- ① warm DB polish 먼저 (THR plan_nlp_throw 와 같은 선택 규칙) ----
+    # ---- ① warm DB polish 먼저 ----
     #      target 최근접 entry 들 중 시작점이 가까운 순으로 상위 2개에 full warm
     #      start (primal+dual 재시동) → cold 수십 초 대신 1~2 초. entry 2개를 보는
     #      이유는 같은 target 의 다른 basin 을 커버하기 위해서다.
+    #      ⚠ (2026-08-06) THR plan_nlp_throw 에 있던 'J ≤ 2×j_min 나쁜 국소해 배제'
+    #      필터는 **삭제했다**. J 는 p_start 가 다르면 2~6배씩 정당하게 벌어지는
+    #      값이라 같은 target 의 서로 다른 시작점 entry 끼리 J 비교는 무의미하고,
+    #      바닥에 붙여 스윙하는 basin 일수록 J 가 낮아 이 필터가 안전한
+    #      정확-일치 entry 를 버리고 grazing entry 를 고르는 사고가 실측됐다
+    #      ((0.5,0.1)→(1.6,0.225): 12개 중 11개 폐기 → 200 mm 밖 entry polish
+    #      → z_min=+0.0199 로 dispatch 게이트 위반 보고).
     db = load_warm_db(logger)
     if db:
         d_tgt = min(float(np.linalg.norm(np.asarray(e["target"])[:2] - p_target[:2]))
@@ -242,10 +249,6 @@ def nlp_traj_fn(target, p_start, v_start=None, ctx=None, logger=None):
         near = [e for e in db
                 if float(np.linalg.norm(np.asarray(e["target"])[:2]
                                         - p_target[:2])) < d_tgt + 1e-6]
-        # 나쁜 국소해 entry 배제 (같은 target 최소 J 의 2배 초과)
-        j_min = min(e.get("J", np.inf) for e in near)
-        if np.isfinite(j_min):
-            near = [e for e in near if e.get("J", np.inf) <= 2.0 * j_min]
         near.sort(key=lambda e: float(np.linalg.norm(
             np.asarray(e["p_start"])[:2] - p_start[:2])))
         for k, ent in enumerate(near[:2]):
@@ -324,7 +327,7 @@ _THR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thr")
 # 파인튜닝판 — 실기 파인튜닝 전의 참고용. 실기 수집 후에는
 # tools/collect_data_real_gp8.py → dt_finetune 산출물로 교체할 것.
 DT_WEIGHTS: str = os.environ.get(
-    "GP8_THR_DT_WEIGHTS", os.path.join(_THR_DIR, "weights", "gp8_dt_official_k0.pth"))
+    "GP8_THR_DT_WEIGHTS", os.path.join(_THR_DIR, "weights", "gp8_dt_dyn_ft_real12.pth"))
 DT_TARGET_RETURN: float = float(os.environ.get("GP8_THR_DT_RETURN", "1.0"))
 
 _DT_LOCK = threading.Lock()

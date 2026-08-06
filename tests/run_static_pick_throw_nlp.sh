@@ -5,9 +5,10 @@
 # 정확도를 목적함수(W_ACC)로 강제하므로 밸브 지터에 가장 강하다.
 # THR 시뮬(보간 ON, 12던지기): ideal 12/12 평균 26 mm / real 12/12 평균 32 mm.
 #
-# ⚠ warm DB 를 쓰지 않는다 — 2026-08-03 공식화 변경(tool 0.240, rt 0.1, W1 5.0,
-#   QDD 5×, 관절한계)으로 기존 skills/warm_db_*.pkl 이 전부 무효다. cold
-#   multistart 라 지점당 수 초~수십 초 걸리지만 전부 로봇이 움직이기 전에 끝난다.
+# warm DB: skills/thr/warm_db_thr.pkl (144 entry, affb25e 재빌드) 이 현재 공식화와
+#   일치해 아래 기본 POINTS/TARGETS 는 **정확 warm hit** 로 지점당 0.4~1초에
+#   계획된다. DB 에 없는 지점/타겟은 cold multistart (수 초~수십 초) — 어느 쪽이든
+#   로봇이 움직이기 전에 끝난다. (구 2026-08-03 "DB 전부 무효" 경고는 재빌드로 해소)
 #
 # 사용:
 #   ./run_static_pick_throw_nlp.sh --thr-scan    # ★ 먼저 이걸로 실현 가능성 확인 (로봇 무명령)
