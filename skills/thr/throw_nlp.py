@@ -44,6 +44,8 @@ GP8 투척 궤적 NLP — CasADi(IPOPT) + clamped cubic B-Spline.
      위치·속도·가속도 전부 hard constraint).
 """
 
+import os
+
 import casadi as cs
 import numpy as np
 from scipy.interpolate import BSpline
@@ -114,6 +116,17 @@ MAX_REFINE = 6                  # adaptive refinement 최대 반복
 # 실측으로 확인했다 (구 원기둥 기준으로 거른 DT 학습데이터가 반평면 게이트에
 # 걸렸다). 아래는 이 모듈 안에서 쓰던 이름을 유지하기 위한 별칭일 뿐이다.
 CART_MIN_X, CART_MIN_Z = TCP_X_MIN, TCP_Z_MIN
+
+# 계획측 여유 [m] — 제약 3b 에서만 CART_MIN_* 에 더해진다 (게이트/DT 필터 기준은
+# 불변). 먼 타깃(1.6 m)은 최적해가 엔벨로프에 **활성으로 붙는데**, IPOPT 는
+# constr_viol_tol(기본 1e-4)까지 위반한 해를 수렴으로 반환하므로 계획 기준 ==
+# 게이트 기준이면 궤적이 게이트 0.1 mm 아래로 떨어진다 (2026-08-06 실측:
+# (0.5,0.1)→(1.6,0.225) z_min=+0.0199 < 0.020 → dispatch 게이트 위반 보고).
+# 3 mm 는 solver tol + collocation 노드 간 딥을 덮고도 남는 값이다.
+# ⚠ warm DB 유효성 키('col')에는 **넣지 않는다** — 마진 도입 전 entry 도 warm
+#   seed 로는 유효하고 (수 mm 위반은 polish 의 restoration 이 복원), 키에 넣으면
+#   기존 DB 가 통째로 무효화돼 rebuild 전까지 전부 cold multistart 로 떨어진다.
+CART_PLAN_MARGIN: float = float(os.environ.get("GP8_THR_NLP_CART_MARGIN", "0.003"))
 
 # (구) 기둥 회피 원기둥 파라미터 — 2026-08-05 부터 **어떤 제약에도 쓰지 않는다**.
 # 기준이 "wrist·로드 50/75%·TCP 4점이 기둥 축 세그먼트(z∈[0,COL_H])에서 COL_R 이상"
@@ -431,8 +444,10 @@ def _assemble_nlp(opti, P_free, t_f, t_star, q0, v0c, vfc, tgt, u_pos_nodes, rt,
             act = 1.0 / (1.0 + cs.exp(40.0 * (float(u_c) - u_re)))
             tcp = fk_col_points_sym(q_c)[-1]       # 4점 중 마지막 = TCP
             slack = (1.0 - act) * 10.0             # act→0 이면 사실상 비활성
-            opti.subject_to(tcp[0] >= CART_MIN_X - slack)
-            opti.subject_to(tcp[2] >= CART_MIN_Z - slack)
+            # 계획 기준 = 게이트 기준 + CART_PLAN_MARGIN — solver tol(1e-4)로
+            # 경계를 파고든 해가 무관용 dispatch 게이트에 걸리지 않게 한다.
+            opti.subject_to(tcp[0] >= CART_MIN_X + CART_PLAN_MARGIN - slack)
+            opti.subject_to(tcp[2] >= CART_MIN_Z + CART_PLAN_MARGIN - slack)
 
     # -- 제약 2: 가속도 한계 — knot 노드 (cubic이라 전 구간 exact) --
     for u_k in np.unique(KNOTS):

@@ -107,9 +107,22 @@ EXTRA_ARGS_STR="--confirm-throw --vel-scale 0.2"
 #
 # ★ 이 가중치들은 URDF 전범위 관절한계 + segment waypoint 규약으로 학습됐다.
 #   아래 두 export 가 학습 조건 재현이다 — 빼면 env 기본값과 어긋난다.
+# 2026-08-06 오후 — B 전환 (사용자 지시: "effort_pid 전면, 논문 충실 최우선").
+# 가속도 한계(3×) 제거, 공식 Gazebo 사슬(PID 토크→effort 클램프→관성 동역학)로
+# env 교체. 기본 가중치 = 그 env 시뮬 1000 학습 + **오늘 실기 15던지기 파인튜닝**.
+#   gp8_dt_dyn_ft_real12.pth  ← 기본. dyn_k0 가 직접 던진 실기 12던지기
+#     (real_throws_2026-08-06.pkl, 착지 1.21~2.42 m)로 공식 레시피 파인튜닝.
+#     논문 절차 ①시뮬→②실기수집→③파인튜닝 완주본 (2026-08-06 오후).
+#   gp8_dt_dyn_k0.pth            시뮬 전용 베이스 (파인튜닝 전).
+#   gp8_dt_official_k0.pth       구 box(3×) 규약 학습분 — 이름과 달리 저자 배포본
+#                                아님(우리 학습). box 규약으로 되돌릴 때만.
+# ⚠ effort_pid 궤적은 실행 가속도가 3× 규약을 수 배 넘는다. 속도(URDF)·Cartesian·
+#   착탄 게이트는 그대로 살아 있고, 서보 추종 격차는 실기 파인튜닝이 흡수하는
+#   것이 논문 노선이다. 첫 실행은 낮은 --vel-scale 로.
+export DT_GP8_DYN="${DT_GP8_DYN:-effort_pid}"
 export DT_GP8_LIMITS="${DT_GP8_LIMITS:-urdf}"
 export DT_GP8_WP_VEL="${DT_GP8_WP_VEL:-segment}"
-export GP8_THR_DT_WEIGHTS="${GP8_THR_DT_WEIGHTS:-$HOME/ros2_ws/src/gp8_control/skills/thr/weights/gp8_dt_official_k0.pth}"
+export GP8_THR_DT_WEIGHTS="${GP8_THR_DT_WEIGHTS:-$HOME/ros2_ws/src/gp8_control/skills/thr/weights/gp8_dt_dyn_ft_real12.pth}"
 # 조건화 목표 리턴 R̂ (성공한 던지기 = 1) [논문 §4.3]
 export GP8_THR_DT_RETURN="${GP8_THR_DT_RETURN:-1.0}"
 

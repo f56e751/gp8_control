@@ -14,7 +14,9 @@ DRIVER_LOG="${GP8_DRIVER_LOG:-/tmp/gp8_collect_driver.log}"
 JTC_ACTION="/joint_trajectory_controller/follow_joint_trajectory"
 
 DEFAULT_GOALS="${GP8_COLLECT_GOALS:-1.1,1.3,1.5,1.7}"
-DEFAULT_REPS="${GP8_COLLECT_REPS:-5}"
+DEFAULT_REPS="${GP8_COLLECT_REPS:-3}"
+# 착지면 높이 [m] — bin 바닥 기준. 맨바닥에 던지면 0 으로 덮어쓸 것.
+DEFAULT_LAND_Z="${GP8_COLLECT_LAND_Z:--0.08}"
 
 die() {
     echo "오류: $*" >&2
@@ -61,6 +63,11 @@ source "$WS_SETUP"
 
 # 기존 ROS Python 경로를 보존해야 venv에서도 rclpy를 가져올 수 있다.
 export PYTHONPATH="$WS/src:${PYTHONPATH:-}"
+# 2026-08-06 B 전환: effort_pid(공식 물리) 학습 조건 재현 — 셋 다 필수.
+# 빠지면 계획 rollout 이 학습 env 와 어긋난다 (특히 LIMITS 기본값은 nlp 협소).
+export DT_GP8_DYN="${DT_GP8_DYN:-effort_pid}"
+export DT_GP8_LIMITS="${DT_GP8_LIMITS:-urdf}"
+export DT_GP8_WP_VEL="${DT_GP8_WP_VEL:-segment}"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -124,6 +131,9 @@ if ! has_option "--goals" "$@"; then
 fi
 if ! has_option "--reps" "$@"; then
     ARGS=(--reps "$DEFAULT_REPS" "${ARGS[@]}")
+fi
+if ! has_option "--land-z" "$@"; then
+    ARGS=(--land-z "$DEFAULT_LAND_Z" "${ARGS[@]}")
 fi
 
 echo "[5/5] 실험 수집기 실행"

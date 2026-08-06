@@ -122,7 +122,7 @@ def main() -> None:
         description="DT 실기 던지기 데이터 수집 (착지 실측 입력)")
     ap.add_argument("--goals", default="0.9,1.1,1.3,1.5,1.7",
                     help="목표 거리 격자 [m] (균등 커버리지가 중요 — 모듈 docstring)")
-    ap.add_argument("--reps", type=int, default=5, help="목표당 던지기 수")
+    ap.add_argument("--reps", type=int, default=1, help="목표당 던지기 수")
     ap.add_argument("--points", default=DEFAULT_POINTS,
                     help='물체 픽 지점 "x,y,z;..." — 기본 12개를 순환하며 사용')
     ap.add_argument("--yaw-deg", type=float, default=0.0,
@@ -131,7 +131,9 @@ def main() -> None:
                     help="착지면 높이 [m] — 바닥이면 0, bin 바닥이면 -0.08")
     ap.add_argument("--weights", default=None, help="DT 체크포인트 (기본 v9)")
     ap.add_argument("--alpha-max", type=float, default=1.5,
-                    help="액션 게인 α~U(1,이 값). 논문은 3.0 이지만 실기 안전상 1.5")
+                    help="액션 게인 α~U(1,이 값). 논문 §5.4 는 3.0 — 실기 안전상 "
+                         "1.5 로 운용 (2026-08-06 사용자 지시). --alpha-max 3.0 "
+                         "으로 언제든 논문값 실행 가능")
     ap.add_argument("--alpha-step", type=float, default=0.9,
                     help="게이트 실패 시 α 를 이 배수로 낮춰 재시도")
     ap.add_argument("--vel-scale", type=float, default=0.2,
