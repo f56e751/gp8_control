@@ -94,7 +94,7 @@ TARGETS=(
 # --vel-scale     : 던지기 외 이동 속도 (계획 아크와 감속 꼬리는 영향 없음)
 # --shuffle-points: 지점 방문 순서 무작위 (TARGETS 순서는 고정)
 # --no-confirm    : 사이클마다 Enter 확인 생략
-EXTRA_ARGS_STR="--confirm-throw --vel-scale 0.2"
+EXTRA_ARGS_STR="--confirm-throw --vel-scale 0.2 --shuffle-points"
 
 
 join_semi() { local IFS=";"; echo "$*"; }
