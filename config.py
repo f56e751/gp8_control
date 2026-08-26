@@ -72,13 +72,13 @@ class Config:
     )
 
     GRASP_INTERCEPT_Y: float = -0.1      # belt-frame Y where the arm waits [m]
-    # Grasp height [m]: belt-surface contact Z. Manually verified pose was
-    # z=0.067 (terminal_debug: EE x=0.508 y=0.000, suction ON); lowered ~5 mm
-    # to 0.062 for firmer contact.
+    # Grasp height [m]: belt-surface contact Z. The old 22 cm FK used 0.062 m;
+    # with the verified 24 cm tool the coordinate is 0.042 m for the identical
+    # physical joint pose (tool +X points along base -Z while grasping).
     # Overrides the often-noisy detected Z; the approach (aim) keeps its
     # relative height above this.
     GRASP_Z: float = field(             # [m] env GP8_GRASP_Z / launch grasp_z:=
-        default_factory=lambda: float(os.environ.get("GP8_GRASP_Z", "0.062"))
+        default_factory=lambda: float(os.environ.get("GP8_GRASP_Z", "0.042"))
     )
     # --- Throw pick: belt-tracking descend (PickWaitMode.TRACK_DESCEND) -------
     # The throw pick no longer waits PARKED at the grasp. It parks at TRACK_Z_START
@@ -98,16 +98,17 @@ class Config:
     # grasp plane. TRACK_Z_SPEED <= 0 DISABLES tracking and restores the old parked
     # WAIT_AT_GRASP pick.
     # Defaults below are the operator's current run configuration
-    # (start 0.12 / end 0.05 / speed 0.3). The earlier HW-tracked set at belt
-    # 0.223 m/s was end 0.03 / speed 0.2 — restore those if the cup starts
+    # (start 0.10 / end 0.03 / speed 0.3), shifted down 0.02 m with the 24 cm
+    # TCP to preserve the old physical poses. The earlier HW-tracked set at belt
+    # 0.223 m/s was end 0.01 / speed 0.2 — restore those if the cup starts
     # missing rather than clearing. Pass "nan" to restore the derive-from-
     # GRASP_Z behaviour (start = GRASP_Z + TRACK_Z_HOVER, end = GRASP_Z).
     # Mirrored in gp8_bringup.launch.py's track_z_* args — keep both in sync.
     TRACK_Z_START: float = field(       # [m] env GP8_TRACK_Z_START ("nan" -> GRASP_Z + TRACK_Z_HOVER)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "0.12"))
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_START", "0.10"))
     )
     TRACK_Z_END: float = field(         # [m] env GP8_TRACK_Z_END ("nan" -> GRASP_Z)
-        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "0.05"))
+        default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_END", "0.03"))
     )
     TRACK_Z_SPEED: float = field(       # [m/s] env GP8_TRACK_Z_SPEED (<=0 disables tracking)
         default_factory=lambda: float(os.environ.get("GP8_TRACK_Z_SPEED", "0.3"))
@@ -130,7 +131,7 @@ class Config:
     TRACK_LEAD_T: float = field(        # [s] env GP8_TRACK_LEAD_T
         default_factory=lambda: float(os.environ.get("GP8_TRACK_LEAD_T", "0.0"))
     )
-    GRASP_Z: float = 0.062
+    GRASP_Z: float = 0.042
     # Baseline wrist (joint 6, rad) for EVERY pick/aim/park pose. The suction
     # cup is axially symmetric, and the throw NN drives joints 1-5 only, so J6
     # is a FREE DOF for pick/throw — but it is NOT free for push, whose paddle

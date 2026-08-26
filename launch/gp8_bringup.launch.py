@@ -144,11 +144,11 @@ def generate_launch_description():
         description="Guaranteed parked suction hold before throw lift [s] (MIN_SUCTION_HOLD).",
     )
     # Absolute base-frame TCP Z where throw/pick parks and primes suction.
-    # `grasp_z:=0.0615` allows millimetre-level contact calibration without a
-    # rebuild; omitted -> shell GP8_GRASP_Z, else Config default 0.062 m.
+    # `grasp_z:=0.0415` allows millimetre-level contact calibration without a
+    # rebuild; omitted -> shell GP8_GRASP_Z, else Config default 0.042 m.
     grasp_z_arg = DeclareLaunchArgument(
         "grasp_z",
-        default_value=EnvironmentVariable("GP8_GRASP_Z", default_value="0.062"),
+        default_value=EnvironmentVariable("GP8_GRASP_Z", default_value="0.042"),
         description="Throw/pick suction wait TCP Z in base frame [m] (GRASP_Z).",
     )
     # Throw pick belt-tracking descend (skills/throw_skill.py): the cup follows the
@@ -157,17 +157,18 @@ def generate_launch_description():
     # (start = grasp_z + 0.05, end = grasp_z); track_z_speed:=0 disables tracking and
     # restores the old parked wait-at-grasp pick.
     # track_z_* defaults MIRROR config.py's TRACK_Z_* — keep both in sync. Current
-    # set is the operator's run configuration (start 0.12 / end 0.05 / speed 0.3);
-    # the earlier HW-tracked set at belt 0.223 m/s was end 0.03 / speed 0.2.
+    # set is the 24 cm TCP equivalent of the operator's run configuration
+    # (start 0.10 / end 0.03 / speed 0.3); the earlier HW-tracked set at belt
+    # 0.223 m/s is end 0.01 / speed 0.2 with the corrected TCP.
     # Pass "nan" to restore the derive-from-grasp_z heights.
     track_z_start_arg = DeclareLaunchArgument(
         "track_z_start",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="0.12"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_START", default_value="0.10"),
         description="Throw pick: TCP Z the descend starts from [m] (nan -> grasp_z + 0.05).",
     )
     track_z_end_arg = DeclareLaunchArgument(
         "track_z_end",
-        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.05"),
+        default_value=EnvironmentVariable("GP8_TRACK_Z_END", default_value="0.03"),
         description="Throw pick: TCP Z the descend ends at [m] (nan -> grasp_z).",
     )
     track_z_speed_arg = DeclareLaunchArgument(

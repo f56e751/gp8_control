@@ -13,7 +13,7 @@ structure (screw axes defined in the space frame):
     J5 -y-axis rotation at (0.38, 0, 0.715)
     J6 -x-axis rotation at (0.38, 0, 0.715)
 
-End-effector home position: (0.680, 0, 0.715) — 그리퍼 로드 22cm 기준.
+End-effector home position: (0.700, 0, 0.715) — 그리퍼 로드 24cm 기준.
 """
 
 from typing import List, Optional, Tuple
@@ -146,10 +146,10 @@ class GP8(BaseRobot):
     def _build_home_ee() -> np.ndarray:
         """Home configuration SE(3) of the end-effector (all joints zero)."""
         M = np.eye(4)
-        # x = 손목(0.38) + d6+그리퍼 로드(0.080+0.220=0.300).
-        # 2026-07-22 그리퍼 22cm 교체 (구 24.5cm: 0.705). throwing.py GP8_DIMS
-        # tool 및 urdf/gp8_mujoco_suction_tool.xacro와 함께 맞출 것.
-        M[0, 3] = 0.680
+        # x = 손목(0.38) + d6+그리퍼 로드(0.080+0.240=0.320).
+        # 2026-08-04 실물 툴 길이 24 cm 운영자 확인. THR GP8_DIMS 및
+        # urdf/gp8_mujoco_suction_tool.xacro와 같은 TCP를 쓴다.
+        M[0, 3] = 0.700
         M[2, 3] = 0.715
         return M
 
