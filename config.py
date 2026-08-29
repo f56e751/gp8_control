@@ -45,6 +45,15 @@ class Config:
     # it can't diverge to the reach boundary. Set near the real pick time.
     MAX_PICK_LEAD: float = 1.2
 
+    # Robot/world backend seam selection: "hw" (default) = real adv4ncr
+    # controller (TrajectoryController) + camera_debug/conveyor topics
+    # (HardwareWorldSource); "mujoco" = the in-process MuJoCo physics twin
+    # (backends/mujoco_sim.py — needs mujoco>=3.1, `uv sync --extra sim`).
+    # Precedence: CLI flag --backend > env GP8_BACKEND > "hw".
+    BACKEND: str = field(
+        default_factory=lambda: _env_default("GP8_BACKEND", "hw")
+    )
+
     # Test override for the push/throw ActionSelector. Empty = normal routing
     # (per-class via SKILL_BY_CLASS: metal -> push, transparent -> throw). Set to a
     # skill name ("throw" or "push")

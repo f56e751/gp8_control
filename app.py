@@ -23,9 +23,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 
+from gp8_control.backends import RobotBackend, WorldSource
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.conveyor import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -80,18 +80,16 @@ class GP8App:
         # here so the viz can keep drawing it while the cycle runs.
         self._active_target: TrackedObject | None = None
 
-        # Latest corrected detection snapshot from the camera_debug node.
-        # See /camera_debug/detections — camera_debug owns the perception
-        # stream + cam→base transform + v*delay back-projection.
-        self._cam_latest: dict | None = None
-
         self._node: Node | None = None
         self._executor: MultiThreadedExecutor | None = None
         self._spin_thread: threading.Thread | None = None
         self._spinner_dead = False
-        self.traj_ctrl: TrajectoryController | None = None
+        # The two backend seams (cfg.BACKEND selects hw vs mujoco in setup()).
+        self.traj_ctrl: RobotBackend | None = None
+        self.world: WorldSource | None = None
         self.moveit_ctrl: MoveItController | None = None
-        self.conveyor: ConveyorSpeedTracker | None = None
+        # ConveyorSpeedTracker-compatible belt state (== self.world.belt).
+        self.conveyor = None
 
         self.M1: np.ndarray | None = None
         self.M2: np.ndarray | None = None
@@ -137,28 +135,31 @@ class GP8App:
             String, "/gp8_manager/tracked_state", 10
         )
 
-        self.traj_ctrl = TrajectoryController(self._node)
+        # Backend seams: the SAME app/skill code drives hardware or the MuJoCo
+        # twin — only the two injected implementations differ (cfg.BACKEND,
+        # env GP8_BACKEND / --backend).
+        if self.cfg.BACKEND == "mujoco":
+            from gp8_control.backends.mujoco_sim import (   # needs mujoco>=3.1
+                MujocoRobotBackend, MujocoWorldSource, SimConfig, SimCore,
+            )
+            core = SimCore(SimConfig(grasp_z=self.cfg.GRASP_Z))
+            core.start()
+            self.traj_ctrl = MujocoRobotBackend(core)
+            self.world = MujocoWorldSource(core)
+        else:
+            self.traj_ctrl = TrajectoryController(self._node)
+            from gp8_control.backends.ros_world import HardwareWorldSource
+            self.world = HardwareWorldSource(self._node, self.cfg)
+        self.conveyor = self.world.belt
         # MoveItController는 현재 어디서도 호출되지 않는다 (초기 자세 이동도
         # trajectory()로 처리). 기본은 생성하지 않아 move_group 의존과 그
-        # __init__의 30초 대기를 없앤다. 옛 동작이 필요하면 GP8_USE_MOVEIT=1.
+        # __init__의 30초 대기를 없앤다. 옛 동작이 필요하면 GP8_USE_MOVEIT=1
+        # (하드웨어 백엔드 전용).
         self.moveit_ctrl = (
             MoveItController(self._node)
-            if os.environ.get("GP8_USE_MOVEIT", "0").lower() in ("1", "true", "yes")
+            if self.cfg.BACKEND == "hw"
+            and os.environ.get("GP8_USE_MOVEIT", "0").lower() in ("1", "true", "yes")
             else None
-        )
-        # camera_debug node owns the perception stream + corrections; we just
-        # subscribe to its corrected detection list.
-        self._node.create_subscription(
-            String, "/camera_debug/detections",
-            self._on_camera_debug_detections, 10,
-        )
-        # Encoder telemetry is the single source of truth for belt speed.
-        self.conveyor = ConveyorSpeedTracker(
-            self._node,
-            self.cfg.CONVEYOR_TOPIC,
-            self.cfg.CONVEYOR_SPEED,
-            self.cfg.CONVEYOR_STALE_SECONDS,
-            distance_topic=self.cfg.CONVEYOR_DISTANCE_TOPIC,
         )
 
         self.traj_ctrl.wait_for_servers()
@@ -588,24 +589,18 @@ class GP8App:
         detection→queue association lives there; the app keeps only the
         frame-gate bookkeeping keyed on whether anything new was added.
         """
+        snap = self.world.latest_snapshot()
         receipt_time = (
-            float(self._cam_latest.get("receipt_time", now))
-            if self._cam_latest is not None else now
+            float(snap.get("receipt_time", now)) if snap is not None else now
         )
         belt_distance_at_detection = self.conveyor.distance_at(receipt_time)
         added = self.detection_intake.ingest(
-            self._cam_latest, self.queue, self._active_target,
+            snap, self.queue, self._active_target,
             self.conveyor.current, self._node.get_logger(),
             belt_distance_m=belt_distance_at_detection,
         )
         if added:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
-
-    def _on_camera_debug_detections(self, msg: String) -> None:
-        try:
-            self._cam_latest = json.loads(msg.data)
-        except (ValueError, TypeError):
-            pass
 
     # ------------------------------------------------------------------
     # Main loop
@@ -691,6 +686,17 @@ def main(argv=None) -> None:
         description="GP8 conveyor pick-and-place orchestrator.",
     )
     parser.add_argument(
+        "--backend",
+        choices=["hw", "mujoco"],
+        default=None,
+        help=(
+            "Robot/world backend: 'hw' (default) drives the real adv4ncr "
+            "controller + camera_debug perception; 'mujoco' runs the in-process "
+            "MuJoCo physics twin (needs mujoco>=3.1: uv sync --extra sim). "
+            "Overrides the GP8_BACKEND env var."
+        ),
+    )
+    parser.add_argument(
         "--skill",
         choices=["throw", "robust_throw", "push"],
         default=None,
@@ -741,6 +747,8 @@ def main(argv=None) -> None:
     args, _ = parser.parse_known_args(argv)
 
     cfg = Config()
+    if args.backend is not None:
+        cfg.BACKEND = args.backend     # CLI flag wins over the env default
     if args.skill is not None:
         cfg.FORCE_SKILL = args.skill   # CLI flag wins over the env default
     if args.track_z_start is not None:

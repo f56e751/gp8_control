@@ -72,6 +72,12 @@ PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python \
 All of these require `debug_robot.launch.py` running first and a clear 1 m
 radius around the arm (throw is a real swing).
 
+The exception is `tests/sim_smoke.py` — an rclpy/torch-free end-to-end check of
+the MuJoCo backends (stepper realtime lock → schema-v2 detections → encoder
+distance → timed weld pick → lift → timed-release throw). It runs anywhere
+numpy/scipy/mujoco import (including Windows):
+`python -m gp8_control.tests.sim_smoke [--viewer]`.
+
 ## Architecture
 
 ### Orchestrator + skills (the central design)
@@ -137,19 +143,55 @@ negative-seconds stamp before its clock syncs, which makes `rclcpp::Time` throw
 and SIGABRT-kills every C++ consumer (move_group, robot_state_publisher) — do
 not remove that re-stamp.
 
-### Control path (`controllers/trajectory_controller.py`)
+### Backend seams (`backends/`) — HW and sim behind two base classes
 
-This branch runs the **adv4ncr 250 Hz stream** driver: `trajectory_controller`
-resamples each trajectory onto a 4 ms grid and publishes joint targets to
-`/JointGroupPositionController/commands` (Float64MultiArray), and drives suction
-via a Simple-Message TCP call (port 50242). There is **no MotoROS2 Point Queue
-Mode** here: the old per-cycle `enter_queue_mode()` re-entry (and the
-persistent-queue workaround built for its ~0.4 s cost) were removed —
-`enter_queue_mode`/`exit_queue_mode`/`pq_*` remain only as one-time, no-op
-lifecycle shims. Skills just dispatch trajectories; they no longer manage queue
-mode per segment. (The prior MotoROS2 queue contract — re-enter before every
-trajectory, first queued point == measured current position for code 204 — lives
-on the pre-migration `main` branch, not here.)
+The app drives the robot and the belt world through two Python seams, selected
+by `Config.BACKEND` (`GP8_BACKEND=hw|mujoco`, CLI `--backend`, launch
+`sim.launch.py`):
+
+* `backends/robot_base.py::RobotBackend` — **the hardware operation logic
+  lives HERE**, shared by both implementations: the 250 Hz stream engine
+  (cubic-Hermite resample clamped to the bracketing-knot envelope, grid-time
+  suction release, `tick_fn` early-stop protocol, wall-clock pacing), suction
+  request coalescing + telemetry, the `send_trajectory_queue*`/`pq_*` surface,
+  `_wait_for_position`. A backend implements only `wait_for_servers`,
+  `_emit_sample` (one 4 ms joint sample), and `_set_suction`.
+* `backends/world_base.py::WorldSource` — `latest_snapshot()` (the raw
+  schema-v2 dict `DetectionIntake` consumes, unchanged) + `.belt` (a
+  `ConveyorSpeedTracker`-compatible object; the app assigns it to
+  `self.conveyor`).
+
+Implementations: hardware = `controllers/trajectory_controller.py`
+(`TrajectoryController(RobotBackend)`) + `backends/ros_world.py`
+(`HardwareWorldSource`); sim = `backends/mujoco_sim.py` (`SimCore` +
+`MujocoRobotBackend` + `MujocoWorldSource`, all rclpy-free). Do NOT re-mock the
+ROS wire for simulation — the class contract is the contract (the old
+wire-mocking `mock/` stack drifted and was deleted for exactly that reason).
+
+### Control path (hardware: `controllers/trajectory_controller.py`)
+
+This branch runs the **adv4ncr 250 Hz stream** driver: the base-class engine
+resamples each trajectory onto a 4 ms grid and `TrajectoryController` publishes
+each sample to `/JointGroupPositionController/commands` (Float64MultiArray),
+driving suction via a Simple-Message TCP call (port 50242) on a dedicated IO
+worker thread. A `jtc` fallback backend (`GP8_ADV4NCR_BACKEND=jtc`, FJT action)
+stays hardware-only inside this file. There is **no MotoROS2 Point Queue Mode**:
+`enter_queue_mode`/`exit_queue_mode`/`pq_*` remain only as no-op lifecycle
+shims (in the base class). Skills just dispatch trajectories. (The prior
+MotoROS2 queue contract lives on the pre-migration `main` branch, not here.)
+
+### MuJoCo twin (`backends/mujoco_sim.py`)
+
+`SimCore` loads the vendored scene (+ a reachable conveyor injected via MjSpec)
+and runs a **wall-clock-servoed stepping thread** (2 ms physics; the arm's
+position actuators ZOH the last streamed 4 ms command exactly like the real
+JGPC). Suction ON welds the nearest on-belt box to link6 — the activation-time
+relative pose must be written into `model.eq_data` (the XML weld's zero relpose
+is baked at compile time); suction OFF releases the weld and the box flies with
+its true dragged velocity. On-belt boxes' Y is kinematically driven to match
+the integrated encoder distance exactly (contact friction would otherwise brake
+them ~15% under the commanded belt speed); X/Z stay dynamic. Perception is
+synthesized schema-v2 through the real `perception/bbox_geometry.py` transform.
 
 ### Throw trajectory (`skills/throw_skill.py` + `trajectory/`)
 

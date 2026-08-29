@@ -20,13 +20,12 @@ the RL training stack.
 | `camera_debug.py` | Perception node (`camera_debug`) — reads full four-corner boxes from the camera PC's HTTP NDJSON stream, transforms every corner to the base frame, applies `v×delay` back-projection, and publishes corrected detections on `/camera_debug/detections`. **Must run for `app.py` to pick.** |
 | `perception/` | Supports `camera_debug`: HTTP stream client (`perception_client`), camera/base extrinsics (`extrinsics`), and the control-side detection intake/dedup (`detection_intake`, consumed by `app.py`). |
 | `conveyor/` | `ConveyorSpeedTracker` — subscribes `/conveyor/speed` (encoder node) and exposes the live belt speed to the app + skills. |
-| `mock/mock_robot.py` | Fake MotoROS2 (incl. Point Queue Mode + real-time playback) for dev/sim without the physical robot. |
-| `mock/mujoco_robot.py` | MuJoCo-backed twin of `mock_robot` (Level B) — same ROS contract, but drives the vendored MuJoCo model and renders the GP8 live. Run under the venv (`-m gp8_control.mock.mujoco_robot`) / `sim_mujoco.launch.py`. |
-| `mock/fake_belt.py` | Fake `camera_debug` for simulation — spawns objects on the belt, publishes `/camera_debug/detections` + `/conveyor/speed`. |
+| `backends/robot_base.py` | `RobotBackend` — 로봇 제어 심(seam). **250 Hz 스트림 엔진(리샘플·클램프·타임드 릴리즈·페이싱)과 석션 코얼레싱이 여기 살고**, HW/sim 이 같은 로직을 공유한다. |
+| `backends/world_base.py` / `backends/ros_world.py` | `WorldSource` — 퍼셉션+벨트 심. HW 구현(`HardwareWorldSource`)은 `/camera_debug/detections` 구독 + `ConveyorSpeedTracker` 를 그대로 감싼다. |
+| `backends/mujoco_sim.py` | MuJoCo 물리 트윈 — `SimCore`(월클럭 서보 스테핑 스레드) + `MujocoRobotBackend`(석션=weld) + `MujocoWorldSource`(schema-v2 합성 감지 + 엔코더 등가 벨트 거리). `GP8_BACKEND=mujoco` 로 앱 프로세스 안에서 실행. |
 | `gui/` | Flask-based web GUI for manual EE jogging and status. |
 | `launch/gp8_bringup.launch.py` | Full bringup — bridge, robot_state_publisher, MoveIt, `gp8_manager`. **Does NOT start `camera_debug`** — run that separately. |
-| `launch/sim_bringup.launch.py` | Software-in-the-loop sim — `mock_robot` + `fake_belt` + RSP + MoveIt + RViz + the app (no hardware). |
-| `launch/sim_mujoco.launch.py` | Level B sim — `mujoco_robot` (MuJoCo twin) + `fake_belt` + MoveIt + the app; watch the GP8 in the MuJoCo window. `headless:=true` / `physics:=true`. |
+| `launch/sim.launch.py` | 인프로세스 MuJoCo 시뮬 — `GP8_BACKEND=mujoco` 로 앱(+`belt_viz`)만 띄운다 (별도 sim 노드 없음). `viewer:=true` 로 MuJoCo 창. |
 | `launch/debug_robot.launch.py` | Minimal bringup (bridge + TF + MoveIt) for interactive scripts. |
 | `belt_viz.py` | TUI rendering the live belt — every tracked object (`●`), the active target (`◉`), and app status — from `/gp8_manager/tracked_state` (published by `app.py`). Works in real or sim. |
 | `terminal_debug.py` | 키보드 기반 EE jog / 회전 / home / 석션 / Queue Mode sweep / FJT mismatch 테스트 도구. |
@@ -245,8 +244,8 @@ ros2 topic hz   /conveyor/speed      # 발행 주기 확인
 ros2 topic pub /conveyor/speed std_msgs/msg/Float64 "{data: 0.12}" -r 10
 ```
 
-> 시뮬(`sim_bringup`)에서는 `fake_belt` 가 `/conveyor/speed` 를 직접 발행하므로
-> 인코더도 위 가짜 pub 도 필요 없습니다.
+> 시뮬(`GP8_BACKEND=mujoco`)에서는 벨트 속도/엔코더 거리가 인프로세스
+> `MujocoWorldSource` 에서 나오므로 인코더도 위 가짜 pub 도 필요 없습니다.
 
 ### `belt_viz` — 벨트 상태 시각화 (실행 중인 gp8_manager 모니터)
 
@@ -261,7 +260,7 @@ ros2 run gp8_control belt_viz
 ```
 
 - **`app.py`(gp8_manager)가 떠 있어야** 보입니다 (그 노드가 토픽을 발행). 실로봇·
-  시뮬(`sim_bringup`) **둘 다** 동작.
+  시뮬(`GP8_BACKEND=mujoco`) **둘 다** 동작.
 - TUI 라 **SSH 로 그대로** 보입니다 (GUI/RViz 불필요).
 
 ### micro-ROS Agent (once per boot)
@@ -367,91 +366,73 @@ PICK_APPROACH_OFFSET = (-0.2, 0, 0) # pick approach (dx, dy, dz) in meters
 | throw NN 추론 결과 확인 | `queue_test_throw` → `t` |
 | pick↔throw 연속 끊김 측정 | `queue_test_throw` → `p` |
 | 전체 pipeline 통합 (실로봇) | `gp8_bringup.launch.py` + `camera_debug` (+ encoder) |
-| 전체 pipeline 시뮬 (무하드웨어) | `sim_bringup.launch.py` + `belt_viz` |
+| 전체 pipeline 시뮬 (무하드웨어) | `sim.launch.py` (`GP8_BACKEND=mujoco`) + `belt_viz` |
 | 벨트 위 물체/타깃/상태 보기 | `belt_viz` (실로봇·시뮬 공통) |
 
-## Simulation (SIL — no hardware)
+## Simulation — in-process MuJoCo twin (no hardware)
 
-Run the **full pipeline** (detection → intake/dedup → selection → push/throw
-routing → skill → motion) with no robot and no camera, by swapping in two fakes:
+시뮬레이터는 더 이상 별도 노드가 아니다. 앱은 로봇/월드를 두 개의 Python
+심(seam) — `RobotBackend` / `WorldSource` (`backends/`) — 뒤에서 구동하고,
+`GP8_BACKEND=mujoco` 는 그 구현체를 하드웨어 대신 **앱 프로세스 안의 MuJoCo
+물리 트윈**으로 바꿔 끼운다. 와이어(토픽/서비스)를 흉내내던 옛 `mock_robot` /
+`fake_belt` / `mujoco_robot` 스택은 삭제됐다 (와이어가 바뀔 때마다 드리프트가
+났기 때문 — 이제 클래스 계약이 진짜 계약이다).
 
-- `mock_robot` — fakes MotoROS2 incl. **Point Queue Mode** (the path the app
-  actually uses), playing queued points back in real time so the app's
-  wall-clock timing (eta, suction lead) stays meaningful.
-- `fake_belt` — fakes `camera_debug`: spawns objects on the belt and publishes
-  `/camera_debug/detections` + `/conveyor/speed`.
+핵심: **250 Hz 스트림 엔진(cubic-Hermite 리샘플 + 노트 엔벨로프 클램프, 그리드
+시간 석션 릴리즈, 월클럭 페이싱)은 `backends/robot_base.py` 의 공용 코드**라서
+시뮬도 실기와 *동일한* 하드웨어 작동 로직을 실행한다. 다른 것은 프리미티브
+둘뿐이다: 샘플 싱크(`Float64MultiArray` publish ↔ MuJoCo ctrl 기록)와 석션
+(TCP 50242 IO ↔ weld 활성화).
 
-```bash
-# one terminal — mock_robot + fake_belt + RSP + MoveIt + RViz + app
-ros2 launch gp8_control sim_bringup.launch.py
-#   tune:  belt_speed:=0.08 spawn_interval:=4.0   |   headless (SSH): rviz:=false
-#   one skill:  GP8_FORCE_SKILL=throw ros2 launch gp8_control sim_bringup.launch.py
-
-# another terminal — belt strip TUI (objects, queue, target, status)
-ros2 run gp8_control belt_viz
-```
-
-Watch the arm intercept belt objects in RViz (3D) and the belt state in
-`belt_viz` (TUI — works over SSH; use `rviz:=false`). The real robot can be
-powered off; `mock_robot` replaces it. **Don't run `gp8_bringup` at the same
-time** — the `/joint_states_urdf` topics would collide.
-
-> **Caveats** — kinematic only (no grasp/throw physics); a "picked" object is
-> not removed from the belt (`fake_belt` keeps flowing it until it passes), so
-> use this to verify **motion path / interception timing**, not grasp success.
-> RViz Fixed Frame defaults to `base_link` — change it if your URDF root differs.
-
-### MuJoCo digital twin (Level B)
-
-Same SIL pipeline, but the kinematic `mock_robot` is swapped for `mujoco_robot`:
-a MuJoCo-backed twin that speaks the **identical** ROS contract (Point Queue
-Mode, FJT, `/joint_states_urdf`, `/write_single_io`, …) and renders the GP8
-executing the app's commands live, on the real robot meshes, over the belt,
-intercepting the objects perception reports. The app is unchanged — it drives
-this exactly as it drives the real robot.
-
-One-time: install MuJoCo into the same uv venv that runs the app (for torch):
+One-time: `mujoco>=3.1` 를 앱 venv 에 설치:
 
 ```bash
-uv pip install --python ~/ros2_ws/src/gp8_control/.venv/bin/python 'mujoco>=3.1'
+cd ~/ros2_ws/src/gp8_control && uv sync --extra sim
 ```
 
 ```bash
-# MuJoCo window + fake_belt + MoveIt + app (no hardware)
-ros2 launch gp8_control sim_mujoco.launch.py
-#   headless (SSH, renders to /mujoco/image):  headless:=true
-#   physics: arm grasps/throws/pushes real boxes (twin owns the belt):  physics:=true
-#   tune belt:  belt_speed:=0.08 spawn_interval:=4.0
-#   one skill:  GP8_FORCE_SKILL=throw ros2 launch gp8_control sim_mujoco.launch.py
+# 앱 + belt_viz (헤드리스; 별도 sim 노드 없음)
+ros2 launch gp8_control sim.launch.py
+#   MuJoCo 창:  viewer:=true          벨트 튠:  belt_speed:=0.08 spawn_interval:=4.0
+#   one skill:  skill:=throw
+
+# 또는 launch 없이 직접 (venv python):
+GP8_BACKEND=mujoco GP8_FORCE_SKILL=throw   PYTHONPATH=$HOME/ros2_ws/src ~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.app
 ```
 
-- **kinematic** (default) — the MuJoCo arm is a perfectly stable mirror of the
-  commanded joint trajectory; belt boxes mirror `/camera_debug/detections`, so
-  what you *see* matches what the app *perceives* and reaches for.
-  `/joint_states_urdf` is numerically identical to `mock_robot`. No contact /
-  grasp: verifies motion path / interception timing, not grasp success.
-- **`physics:=true`** — the **coherent twin + camera bridge**: the twin OWNS the
-  belt. It spawns physics boxes, rides them down a real conveyor surface (added
-  in the GP8's reach via `MjSpec`, since the vendored belt sits in the env's own
-  frame), and **publishes `/camera_debug/detections` + `/conveyor/speed` itself**
-  from the MuJoCo box positions — so it *replaces* `fake_belt` (the launch does
-  not start it in this mode). The app perceives the real boxes, and
-  `/write_single_io` ON welds the nearest box to the gripper: it rides the swing
-  and **flies on release** (throw), while the pusher geom **shoves** boxes (push).
-  So the objects truly react. `/joint_states_urdf` reports the actual tracked
-  qpos. (The fling speed is taken from the *commanded* trajectory via gp8 FK, so
-  the throw is right even though the position servos lag a fast swing.)
-- **`headless:=true`** — no window; frames publish on `/mujoco/image`
-  (`sensor_msgs/Image`), viewable over SSH in `rqt_image_view` / RViz. Needs an
-  offscreen GL backend (`MUJOCO_GL=egl` is set automatically; use `osmesa` on a
-  CPU-only box).
+무엇이 실기와 같은가:
 
-The twin runs under the venv python (system python has no `mujoco`), so launch
-it via `sim_mujoco.launch.py` or
-`~/ros2_ws/src/gp8_control/.venv/bin/python -m gp8_control.mock.mujoco_robot`,
-**not** `ros2 run`. Kinematics agreement (gp8 FK vs this model) is gated by
-`sim/preview_gp8_check.py`. Don't run `gp8_bringup` or `sim_bringup` at the same
-time — `/joint_states_urdf` would collide.
+- **스타트업 경로 전체** — `wait_for_servers` → `robot enable` → 강제 suction
+  OFF → 초기 자세 이동까지 앱 코드가 무변경으로 그대로 탄다.
+- **퍼셉션** — `MujocoWorldSource` 가 물리 박스에서 **schema-v2** 감지
+  (confidence, `cam_bbox`, `base_bbox_grasp/aim` 4코너 포함)를 실제 변환 코드
+  (`perception/bbox_geometry.py` + `extrinsics`)로 합성한다. `DetectionIntake`
+  는 한 줄도 다르지 않다.
+- **벨트/엔코더** — 스테퍼가 적분한 엔코더 등가 거리(`distance_at`)가
+  `ConveyorSpeedTracker` 와 같은 인터페이스로 나온다 (옛 SIL 이 못 먹이던
+  엔코더 거리 추적 경로가 이제 시뮬에서 검증된다). 벨트 위 박스의 Y 는
+  엔코더 적분과 정확히 일치하게 구동된다 (X/Z 는 물리).
+- **석션/던지기** — suction ON 은 grip_site 반경 내 최근접 박스를 MJCF weld 로
+  붙이고 (활성화 시점 상대자세를 `eq_data` 에 기입), OFF 는 weld 를 푼다.
+  weld 가 스윙 내내 박스를 물리로 끌고 가므로 릴리즈 순간 박스의 free-joint
+  속도가 곧 던지기 속도다 — 속도 합성 핵 없이 탄도 비행.
+
+로봇/카메라/브리지/ros2_control 스택은 아무것도 필요 없다. `gp8_bringup` 과
+동시에 띄우지 말 것 (같은 앱이 두 개 돌게 된다).
+
+### Windows/무 ROS 스모크 (`tests/sim_smoke.py`)
+
+백엔드 모듈은 rclpy 를 import 하지 않으므로, ROS 없는 머신(예: Windows)에서도
+심을 직접 구동해 전체 체인(스테퍼 실시간비 → schema-v2 감지 → 엔코더 거리 →
+타임드 앰부시 픽/weld → 리프트 → 타임드 릴리즈 던지기)을 검증할 수 있다:
+
+```bash
+# numpy<2, scipy, mujoco 만 있으면 된다 (torch/rclpy 불필요)
+python -m gp8_control.tests.sim_smoke [--viewer]
+```
+
+단계별 PASS/FAIL 출력, 전부 통과 시 exit 0. 기하 정합(gp8 FK vs MJCF)은
+`sim/preview_gp8_check.py` 로 별도 게이트.
 
 ## Topology
 

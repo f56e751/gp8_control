@@ -31,7 +31,7 @@ line. This quantifies the collision risk the EE-line path removes.
 
 Run against the sim (RViz):
 
-  ros2 launch gp8_control stream_sim.launch.py          # terminal 1
+  ros2 launch gp8_control debug_robot.launch.py         # terminal 1 (HW)
   ros2 run gp8_control line_stream_test --sweep 0.5,1.0,1.5,2.0,2.5   # terminal 2
 
 or with the venv python (NOTE ``:$PYTHONPATH`` — a bare assignment clobbers
@@ -556,7 +556,7 @@ def main() -> None:
     t0 = time.time()
     while test.ctrl.current_joints is None:
         if time.time() - t0 > 10.0:
-            print("no /joint_states after 10 s — launch stream_sim.launch.py "
+            print("no /joint_states after 10 s — launch debug_robot.launch.py "
                   "(sim) or the adv4ncr driver stack (HW) first, and check "
                   "ROS_DOMAIN_ID matches it")
             _teardown()

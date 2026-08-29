@@ -2,7 +2,7 @@
 
 키보드로 엔드이펙터 이동 + 석션 그리퍼 제어.
 이 스크립트를 실행한 터미널 창에서만 키 입력을 받습니다.
-MotoROS2(또는 mock_robot)가 실행 중이어야 합니다.
+MotoROS2(또는 adv4ncr 스택)가 실행 중이어야 합니다.
 
 조작법:
   w/s   : X축 전진/후진 (+/-1cm)
@@ -220,10 +220,10 @@ class RobotDebugger(Node):
         return True
 
     def start_traj_mode(self) -> bool:
-        """MotoROS2 궤적 모드 활성화. mock_robot에는 이 서비스가 없으므로 skip."""
+        """MotoROS2 궤적 모드 활성화. adv4ncr 스택에는 이 서비스가 없으므로 skip."""
         if not self._start_traj_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn(
-                "/start_traj_mode not available — assuming mock_robot; skipping."
+                "/start_traj_mode not available — assuming adv4ncr backend; skipping."
             )
             return True
 
