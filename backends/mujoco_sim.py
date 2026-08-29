@@ -57,8 +57,28 @@ else:
     _MUJOCO_IMPORT_ERROR = None
 
 
-# scene.xml: <pkg>/backends/mujoco_sim.py -> <pkg>/sim/recycling_mujoco/
-_SCENE = Path(__file__).resolve().parents[1] / "sim" / "recycling_mujoco" / "scene.xml"
+# scene.xml: <pkg>/backends/mujoco_sim.py -> <pkg>/sim/recycling_mujoco/.
+# The vendored sim/ tree is deliberately NOT colcon-installed (setup.py), so
+# when this module is imported from the install-tree copy the __file__-relative
+# path misses — fall back to the source tree (or the GP8_SIM_SCENE override).
+def _find_scene() -> Path:
+    rel = ("sim", "recycling_mujoco", "scene.xml")
+    candidates = []
+    env = os.environ.get("GP8_SIM_SCENE")
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path(__file__).resolve().parents[1].joinpath(*rel))
+    candidates.append(Path.home().joinpath("ros2_ws", "src", "gp8_control", *rel))
+    for c in candidates:
+        if c.is_file():
+            return c
+    raise FileNotFoundError(
+        "MuJoCo scene not found; tried:\n  "
+        + "\n  ".join(str(c) for c in candidates)
+        + "\nThe vendored sim/ tree is not colcon-installed — run from the "
+        "source tree (PYTHONPATH=~/ros2_ws/src), set GP8_SIM_SCENE to the "
+        "scene.xml path, and check `git lfs pull` hydrated the meshes."
+    )
 
 # gp8 joint order [S, L, U, R, B, T] == these MuJoCo joints / position actuators
 # (confirmed numerically by sim/preview_gp8_check.py).
@@ -278,18 +298,15 @@ class SimCore:
             raise ImportError(
                 "the MuJoCo sim backend needs the 'mujoco' package "
                 "(uv sync --extra sim): " + repr(_MUJOCO_IMPORT_ERROR))
-        if not _SCENE.is_file():
-            raise FileNotFoundError(
-                f"MuJoCo scene not found: {_SCENE}\n"
-                "Did `git lfs pull` hydrate sim/recycling_mujoco/ meshes?")
+        scene = _find_scene()
         self.cfg = cfg or SimConfig()
 
         # base pose is fixed in the XML (yaskawa_robot @ (-0.05,0,0.6), identity
         # rot); read it from a throwaway load to place the reachable belt.
-        base = mujoco.MjModel.from_xml_path(str(_SCENE)).body(MJ_BASE_BODY).pos
+        base = mujoco.MjModel.from_xml_path(str(scene)).body(MJ_BASE_BODY).pos
         half_len = 0.5 * (self.cfg.spawn_y - self.cfg.despawn_y) + 0.1
         self.model = _build_twin_model(
-            str(_SCENE), base, self.cfg.lane_x, self.cfg.grasp_z, half_len)
+            str(scene), base, self.cfg.lane_x, self.cfg.grasp_z, half_len)
         self.data = mujoco.MjData(self.model)
         self.lock = threading.Lock()
         self._dt = float(self.model.opt.timestep)

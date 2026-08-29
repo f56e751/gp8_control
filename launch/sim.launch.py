@@ -46,6 +46,14 @@ def _resolve_venv_python() -> str:
 
 def generate_launch_description() -> LaunchDescription:
     venv_python = _resolve_venv_python()
+    # The SOURCE tree must win over the colcon-installed copy on PYTHONPATH:
+    # the vendored MJCF (sim/recycling_mujoco/) is deliberately NOT installed
+    # (setup.py), so `gp8_control` resolved from install/ can't find scene.xml.
+    # The repo root is wherever the venv walk found .venv (its parent dir is
+    # ros2_ws/src, the entry PYTHONPATH needs).
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(venv_python)))
+    src_dir = os.path.dirname(repo_root)
+    pythonpath = src_dir + ":" + os.environ.get("PYTHONPATH", "")
 
     skill_arg = DeclareLaunchArgument(
         "skill", default_value=os.environ.get("GP8_FORCE_SKILL", ""),
@@ -68,6 +76,7 @@ def generate_launch_description() -> LaunchDescription:
         cmd=[venv_python, "-m", "gp8_control.app"],
         output="screen",
         additional_env={
+            "PYTHONPATH": pythonpath,
             "GP8_BACKEND": "mujoco",
             "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
             "GP8_SIM_VIEWER": LaunchConfiguration("viewer"),
