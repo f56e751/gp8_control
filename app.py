@@ -670,6 +670,13 @@ class GP8App:
                 self.traj_ctrl.exit_queue_mode()
             except Exception as e:
                 self._node.get_logger().warn(f"exit_queue_mode failed: {e}")
+            try:
+                # Backend teardown: HW drains pending suction IO writes (so a
+                # final suction_off is transmitted); sim stops the stepper and
+                # finalizes an in-progress GP8_SIM_RECORD video.
+                self.traj_ctrl.close()
+            except Exception as e:
+                self._node.get_logger().warn(f"backend close failed: {e}")
             # Stop the background spinner before tearing down the node so spin()
             # returns and its daemon thread exits cleanly.
             if self._executor is not None:
