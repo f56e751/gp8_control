@@ -121,6 +121,11 @@ class SimConfig:
     det_hz: float = 15.0          # synthesized perception frame rate
     viewer: bool = field(default_factory=lambda: os.environ.get(
         "GP8_SIM_VIEWER", "0").lower() in ("1", "true", "yes"))
+    # Headless video capture: set GP8_SIM_RECORD=/path/out.mp4 to have the
+    # stepper render offscreen frames (MUJOCO_GL=egl/osmesa) into an mp4 —
+    # lets a remote/SSH run produce a demo video with no display.
+    record_path: str = field(default_factory=lambda: os.environ.get("GP8_SIM_RECORD", ""))
+    record_fps: float = field(default_factory=lambda: _env_float("GP8_SIM_RECORD_FPS", 24.0))
 
 
 def _build_twin_model(scene_path: str, base_pos, lane_x: float, grasp_z: float,
@@ -143,6 +148,9 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, grasp_z: float,
         size=[0.16, half_len, thick], pos=[0.0, 0.0, 0.0],
         rgba=[0.12, 0.12, 0.14, 1.0], friction=[0.3, 0.02, 0.002],
     )
+    # Allow HD offscreen rendering (the recorder); default framebuffer is 640x480.
+    spec.visual.global_.offwidth = max(int(spec.visual.global_.offwidth), 1280)
+    spec.visual.global_.offheight = max(int(spec.visual.global_.offheight), 720)
     return spec.compile()
 
 
@@ -190,6 +198,67 @@ class SimBeltTracker:
 
     def check_freshness(self) -> None:
         return None   # the stepper feeds continuously; nothing to go stale
+
+
+class _Recorder:
+    """Offscreen mp4 capture driven from the stepper thread (headless demo).
+
+    Lazily creates the ``mujoco.Renderer`` on the FIRST capture so the GL
+    context lives on the stepper thread; a GL failure (no egl/osmesa) disables
+    recording with one message instead of killing the sim.
+    """
+
+    _W, _H = 960, 540
+
+    def __init__(self, core: "SimCore", path: str, fps: float) -> None:
+        self._core = core
+        self._path = path
+        self._period = 1.0 / max(1.0, fps)
+        self._fps = max(1.0, fps)
+        self._next_t = 0.0
+        self._renderer = None
+        self._writer = None
+        self._dead = False
+        self._cam = mujoco.MjvCamera()
+        self._cam.azimuth, self._cam.elevation, self._cam.distance = 135.0, -20.0, 2.8
+        self._cam.lookat[:] = (0.45, 0.10, 0.55)
+        self._frames = 0
+
+    def maybe_capture(self) -> None:
+        if self._dead:
+            return
+        now = time.monotonic()
+        if now < self._next_t:
+            return
+        self._next_t = now + self._period
+        try:
+            if self._renderer is None:
+                import cv2  # opencv-python (base dep) writes the mp4
+                self._cv2 = cv2
+                self._renderer = mujoco.Renderer(
+                    self._core.model, height=self._H, width=self._W)
+                self._writer = cv2.VideoWriter(
+                    self._path, cv2.VideoWriter_fourcc(*"mp4v"),
+                    self._fps, (self._W, self._H))
+            with self._core.lock:
+                self._renderer.update_scene(self._core.data, camera=self._cam)
+            frame = self._renderer.render()          # RGB, outside the lock
+            self._writer.write(frame[:, :, ::-1])    # cv2 wants BGR
+            self._frames += 1
+        except Exception as exc:
+            self._dead = True
+            print(f"[sim-record] disabled ({exc!r}) — set MUJOCO_GL=egl or osmesa "
+                  "for headless rendering", flush=True)
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.release()
+            print(f"[sim-record] wrote {self._frames} frames -> {self._path}", flush=True)
+        if self._renderer is not None:
+            try:
+                self._renderer.close()
+            except Exception:
+                pass
 
 
 class SimCore:
@@ -282,6 +351,10 @@ class SimCore:
         self._first_step = threading.Event()
         self._thread: threading.Thread | None = None
         self._viewer = None
+        self._recorder = (
+            _Recorder(self, self.cfg.record_path, self.cfg.record_fps)
+            if self.cfg.record_path else None
+        )
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -542,8 +615,12 @@ class SimCore:
                 if self._viewer is not None and time.monotonic() - last_sync >= 1.0 / 60.0:
                     self._viewer.sync()
                     last_sync = time.monotonic()
+                if self._recorder is not None:
+                    self._recorder.maybe_capture()
                 time.sleep(self._dt)
         finally:
+            if self._recorder is not None:
+                self._recorder.close()
             if self._viewer is not None:
                 try:
                     self._viewer.close()
