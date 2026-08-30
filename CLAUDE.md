@@ -192,10 +192,16 @@ substep, never across a catch-up batch — so a render stall (`viewer.sync()`)
 can't starve the 250 Hz stream thread or skew the release timing. Unused boxes
 park below the floor with collisions off + gravity compensation (compile-time
 `gravcomp` on the box bodies — runtime-only values are ignored when
-`ngravcomp == 0`). Suction ON welds the nearest on-belt box to link6 — the activation-time
+`ngravcomp == 0`). Suction ON only ARMS the vacuum; it seals on contact
+(`_vacuum_tick`, per substep): with the cup face over a box's top face and within
+`grab_gap`, the box is pressed — its geom thickness follows the cup down to
+`crush_min_frac`, its bottom is clamped to the belt — and the weld to link6
+engages when the cup stops descending, at the crushed pose. The activation-time
 relative pose must be written into `model.eq_data` (the XML weld's zero relpose
 is baked at compile time); suction OFF releases the weld and the box flies with
-its true dragged velocity. On-belt boxes' Y is kinematically driven to match
+its true dragged velocity. Never weld at a distance: a box hanging 56 mm below
+the cup adds ω×r to its release velocity (+0.3 m range) and gets dragged
+through the belt during the press. On-belt boxes' Y is kinematically driven to match
 the integrated encoder distance exactly (contact friction would otherwise brake
 them ~15% under the commanded belt speed); X/Z stay dynamic. Perception is
 synthesized schema-v2 through the real `perception/bbox_geometry.py` transform,

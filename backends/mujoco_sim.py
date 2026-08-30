@@ -297,7 +297,15 @@ class SimConfig:
     classes: tuple = field(default_factory=lambda: tuple(
         c.strip() for c in os.environ.get("GP8_SIM_CLASSES", "transparent,metal").split(",")
         if c.strip()) or ("transparent",))
-    grab_radius: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_RADIUS", 0.10))
+    # Suction seals on CONTACT, like the real cup: the cup face must be over
+    # the box's top face (footprint + grab_xy_margin) and within grab_gap above
+    # it. Pressing further crushes the box (deformable object + cup bellows):
+    # its thickness follows the cup face down to crush_min_frac of the full
+    # height, its bottom stays on the belt, and the weld engages only when the
+    # cup stops descending — so the box never goes through the belt.
+    grab_gap: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_GAP", 0.008))
+    grab_xy_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_XY_MARGIN", 0.01))
+    crush_min_frac: float = field(default_factory=lambda: _env_float("GP8_SIM_CRUSH_MIN", 0.4))
     # Stiffen the vendored position servos (kp=5000/kv=100 lags a fast throw).
     kp: float = field(default_factory=lambda: _env_float("GP8_SIM_KP", 12000.0))
     kv: float = field(default_factory=lambda: _env_float("GP8_SIM_KV", 220.0))
@@ -577,6 +585,7 @@ class SimCore:
         mujoco.mj_forward(self.model, self.data)
         self._base_p = self.data.body(MJ_BASE_BODY).xpos.copy()
         self._base_R = np.eye(3)   # yaskawa_robot has identity orientation
+        self._belt_top_w = float(self._base_p[2]) + self.cfg.grasp_z - BOX_HALF_Z
 
         # --- streamed command timeline (written by _emit_sample at 250 Hz) --
         # Each sample is queued with its ARRIVAL wall time; per substep the
@@ -607,6 +616,10 @@ class SimCore:
         # X/Z stay dynamic (gravity, pushes, contacts).
         self._box_belt_y = [0.0] * len(BOX_JOINTS)
         self._grabbed: int | None = None
+        self._vacuum_on = False            # suction armed (seals on contact)
+        self._pressing: int | None = None  # box under the cup, being crushed
+        self._grip_z_prev: float | None = None
+        self._grip_vz = 0.0                # cup face vertical speed [m/s], world
         self._spawn_count = 0
         self._last_spawn = 0.0
         # Vendored collision masks, restored on spawn (parked boxes get 0/0).
@@ -667,30 +680,66 @@ class SimCore:
         self._pending_ctrl.append((time.monotonic(), "suction", bool(on)))
 
     def _apply_suction(self, on: bool) -> None:
-        """Weld the nearest on-belt box on suction ON; release it on OFF.
+        """Arm the vacuum on suction ON (it seals on contact, see
+        ``_vacuum_tick``); release the weld on OFF. Stepper thread, under lock.
 
         The weld physically drags the box through the swing, so at release its
         free-joint qvel already carries the true throw velocity — it flies
-        ballistically with no synthesized fling. Stepper thread, under lock.
+        ballistically with no synthesized fling.
         """
+        self._vacuum_on = bool(on)
         if on:
-            self._grab_nearest()
+            self._vacuum_tick()
         else:
+            self._pressing = None
             self._release_grabbed()
 
-    def _grab_nearest(self) -> None:
-        if self._grabbed is not None:
-            return
+    def _box_under_cup(self) -> int | None:
+        """The on-belt box whose top face the cup is over and touching/inside."""
         grip = self.data.site(self._grip_id).xpos
-        best, bestd = None, self.cfg.grab_radius
+        m = self.cfg.grab_xy_margin
         for i, jnt in enumerate(self._box_joints):
             if self._box_state[i] != self._ON_BELT:
                 continue
-            d = float(np.linalg.norm(jnt.qpos[0:3] - grip))
-            if d < bestd:
-                best, bestd = i, d
-        if best is None:
-            return   # vacuum sucking air — matches hardware's silent miss
+            body = self.data.body(self._box_body_ids[i])
+            d = body.xmat.reshape(3, 3).T @ (grip - body.xpos)     # cup in box frame
+            if abs(d[0]) > BOX_HALF_X + m or abs(d[1]) > BOX_HALF_Y + m:
+                continue
+            half_z = float(self.model.geom_size[self._box_geom_ids[i]][2])
+            gap = float(grip[2] - (body.xpos[2] + half_z))          # cup face above top
+            if -2.0 * BOX_HALF_Z <= gap <= self.cfg.grab_gap:
+                return i
+        return None
+
+    def _vacuum_tick(self) -> None:
+        """Per substep while the vacuum is armed and nothing is welded yet.
+
+        Contact -> the box is being PRESSED: its thickness follows the cup face
+        down (to crush_min_frac), its bottom is held on the belt, and the cup
+        may sink further into it (bellows). The weld engages the moment the cup
+        stops descending (press over, or a parked cup the box slid under), at
+        the crushed pose — so the carried box's centre sits ~at the cup face
+        rather than hanging below it, and it never penetrates the belt.
+        """
+        if not self._vacuum_on or self._grabbed is not None:
+            return
+        i = self._box_under_cup()
+        self._pressing = i
+        if i is None:
+            return                       # vacuum sucking air — silent miss
+        jnt = self._box_joints[i]
+        gid = self._box_geom_ids[i]
+        cup_z = float(self.data.site(self._grip_id).xpos[2])
+        min_half = BOX_HALF_Z * self.cfg.crush_min_frac
+        half = float(np.clip(0.5 * (cup_z - self._belt_top_w), min_half, BOX_HALF_Z))
+        self.model.geom_size[gid][2] = half
+        jnt.qpos[2] = self._belt_top_w + half          # bottom stays on the belt
+        jnt.qvel[2] = 0.0
+        if self._grip_vz >= -0.01:                      # cup no longer descending
+            self._weld_box(i)
+            self._pressing = None
+
+    def _weld_box(self, best: int) -> None:
         # Write the ACTIVATION-TIME relative pose into eq_data before enabling:
         # the XML weld's zero relpose was resolved at compile time from qpos0,
         # which would snap the box to its spawn pose relative to link6.
@@ -717,6 +766,8 @@ class SimCore:
         self.data.eq_active[self._weld_ids[self._grabbed]] = 0
         self._box_state[self._grabbed] = self._LOOSE
         self._grabbed = None
+        if self._pressing is not None and self._box_state[self._pressing] != self._ON_BELT:
+            self._pressing = None
 
     # ------------------------------------------------------------------
     # belt / object lifecycle (stepper-owned, under self.lock)
@@ -753,6 +804,7 @@ class SimCore:
         jnt.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
         jnt.qvel[:] = 0.0
         gid = self._box_geom_ids[i]
+        self.model.geom_size[gid][2] = BOX_HALF_Z      # un-crush
         self.model.geom_contype[gid] = 0
         self.model.geom_conaffinity[gid] = 0
         self.model.body_gravcomp[self._box_body_ids[i]] = 1.0
@@ -948,6 +1000,11 @@ class SimCore:
                             self._apply_belt_velocity()
                             mujoco.mj_step(self.model, self.data)
                             self._enforce_belt_kinematics(self._dt)
+                            gz = float(self.data.site(self._grip_id).xpos[2])
+                            if self._grip_z_prev is not None:
+                                self._grip_vz = (gz - self._grip_z_prev) / self._dt
+                            self._grip_z_prev = gz
+                            self._vacuum_tick()
                     with self.lock:
                         self._encoder_distance += self.cfg.belt_speed * self._dt * n
                         now = time.time()
