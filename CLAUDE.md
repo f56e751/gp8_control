@@ -198,7 +198,13 @@ is baked at compile time); suction OFF releases the weld and the box flies with
 its true dragged velocity. On-belt boxes' Y is kinematically driven to match
 the integrated encoder distance exactly (contact friction would otherwise brake
 them ~15% under the commanded belt speed); X/Z stay dynamic. Perception is
-synthesized schema-v2 through the real `perception/bbox_geometry.py` transform.
+synthesized schema-v2 through the real `perception/bbox_geometry.py` transform,
+**gated to the real camera's image**: `SimCamera` (pose =
+`extrinsics.T_ROBOT2BASE @ T_BASE2CAM`, pinhole = `config/realsense_camera_info.yaml`)
+re-poses the vendored `d435i` body/`<camera>` and only boxes it can see are
+reported (belt Y ≈ 2.15–2.79 m), so the app's belt dead reckoning carries every
+object from the camera to the pick exactly as on hardware. Boxes spawn just
+past the view's upstream edge (`spawn_y` nan → derived).
 
 ### Throw trajectory (`skills/throw_skill.py` + `trajectory/`)
 

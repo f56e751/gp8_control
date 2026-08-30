@@ -394,7 +394,7 @@ cd ~/ros2_ws/src/gp8_control && uv sync --extra sim
 # 앱 + belt_viz (헤드리스; 별도 sim 노드 없음)
 ros2 launch gp8_control sim.launch.py
 #   MuJoCo 창:  viewer:=true          벨트 튠:  belt_speed:=0.08 spawn_interval:=4.0
-#   스폰 위치:  spawn_y:=0.9  (기본 '' = 실기 카메라 기준점 2.47 m — 픽까지 리드타임 실기와 동일)
+#   스폰 위치:  spawn_y:=0.9  (기본 '' = 실기 카메라 시야 상류 끝 바로 밖 ≈2.92 m — 카메라에 들어오며 첫 감지)
 #   one skill:  skill:=throw
 
 # 또는 launch 없이 직접 (venv python):
@@ -409,13 +409,21 @@ GP8_BACKEND=mujoco GP8_FORCE_SKILL=throw   PYTHONPATH=$HOME/ros2_ws/src ~/ros2_w
   (confidence, `cam_bbox`, `base_bbox_grasp/aim` 4코너 포함)를 실제 변환 코드
   (`perception/bbox_geometry.py` + `extrinsics`)로 합성한다. `DetectionIntake`
   는 한 줄도 다르지 않다.
+- **카메라** — 실기 카메라가 씬에 그대로 선다: 자세는 `extrinsics.T_ROBOT2BASE @
+  T_BASE2CAM`(base 기준 (0.425, 2.47, 0.63) m, 수직 하방), 핀홀은
+  `config/realsense_camera_info.yaml`(1280×720, fovy 58.9°). vendored `d435i`
+  모델과 그 `<camera name="d435i_view">` 가 그 자세로 옮겨지므로 뷰어에서 카메라
+  시점을 고를 수 있다. **감지는 이 카메라 이미지 안에 있는 박스만** 나온다(벨트
+  Y 2.15–2.79 m 구간, ≈5 s); 그 뒤로는 실기처럼 앱의 벨트 데드레코닝으로
+  픽까지 간다. 박스는 시야 상류 끝 바로 밖(≈2.92 m)에서 스폰돼 화면에
+  들어오며 처음 감지된다. `GP8_SIM_CAM_FOV_GATE=0` 이면 예전처럼 벨트 위 전부
+  감지.
 - **벨트/엔코더** — 스테퍼가 적분한 엔코더 등가 거리(`distance_at`)가
   `ConveyorSpeedTracker` 와 같은 인터페이스로 나온다 (옛 SIL 이 못 먹이던
   엔코더 거리 추적 경로가 이제 시뮬에서 검증된다). 벨트 위 박스의 Y 는
-  엔코더 적분과 정확히 일치하게 구동된다 (X/Z 는 물리). 박스는 실기 카메라가
-  물체를 처음 보는 지점(`extrinsics.REFERENCE_Y_BASE` = base Y 2.47 m)에서
-  스폰되고 벨트 면은 그 지점부터 −0.8 m 까지 이어지므로, 감지→인터셉트
-  리드타임(≈2.5 m / 벨트속도)이 실기와 같다 (`GP8_SIM_SPAWN_Y` / `spawn_y:=`).
+  엔코더 적분과 정확히 일치하게 구동된다 (X/Z 는 물리). 벨트 면은 스폰
+  지점(카메라 시야 바로 위, ≈2.92 m)부터 −0.8 m 까지 이어지므로 감지→인터셉트
+  리드타임(≈2.6 m / 벨트속도)이 실기와 같다 (`GP8_SIM_SPAWN_Y` / `spawn_y:=`).
 - **빈(bin)** — 앱의 실제 목표점에 오픈탑 빈이 선다: throw 는
   `THROW_BINS`(JSON, `throw_bins:=`) 가 있으면 그 목록, 없으면
   `THROW_GOAL_X/Y`(기본 1.1, −0.25) 에 림이 `THROW_VIZ_IMPACT_Z` 높이로; push 는

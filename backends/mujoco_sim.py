@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -80,6 +81,81 @@ def _find_scene() -> Path:
         "source tree (PYTHONPATH=~/ros2_ws/src), set GP8_SIM_SCENE to the "
         "scene.xml path, and check `git lfs pull` hydrated the meshes."
     )
+
+def _find_camera_info() -> Path | None:
+    """config/realsense_camera_info.yaml (same source-tree fallbacks as the scene)."""
+    rel = ("config", "realsense_camera_info.yaml")
+    candidates = []
+    env = os.environ.get("GP8_SIM_CAMERA_INFO")
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path(__file__).resolve().parents[1].joinpath(*rel))
+    candidates.append(Path.home().joinpath("ros2_ws", "src", "gp8_control", *rel))
+    return next((c for c in candidates if c.is_file()), None)
+
+
+@dataclass(frozen=True)
+class SimCamera:
+    """The real camera, in the gp8 BASE frame: pose from
+    ``extrinsics.T_ROBOT2BASE @ T_BASE2CAM`` (origin ~(0.425, 2.47, 0.63) m,
+    optical axis straight down) and the pinhole from
+    ``config/realsense_camera_info.yaml``. Used to (a) place the vendored
+    ``d435i`` body + ``<camera>`` in the scene and (b) gate the synthesized
+    detections to what that camera can actually see."""
+    pos: tuple            # optical centre, base frame [m]
+    R: tuple              # 3x3 rows: base <- optical (columns = optical axes in base)
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+
+    @property
+    def fovy_deg(self) -> float:
+        return math.degrees(2.0 * math.atan(0.5 * self.height / self.fy))
+
+    def project(self, p_base) -> tuple | None:
+        """Pixel (u, v) of a base-frame point, or None if behind the camera."""
+        R = np.asarray(self.R); d = R.T @ (np.asarray(p_base, dtype=float) - np.asarray(self.pos))
+        if d[2] <= 1e-6:
+            return None
+        return (self.fx * d[0] / d[2] + self.cx, self.fy * d[1] / d[2] + self.cy)
+
+    def sees(self, p_base) -> bool:
+        uv = self.project(p_base)
+        return uv is not None and 0.0 <= uv[0] < self.width and 0.0 <= uv[1] < self.height
+
+    def view_y_span(self, z_base: float) -> tuple:
+        """Base-frame Y interval visible on the horizontal plane z_base."""
+        R = np.asarray(self.R); ys = []
+        depth = float(self.pos[2]) - z_base
+        for v in (0.0, float(self.height)):
+            # optical-frame ray through pixel row v at the image's x-centre
+            d = np.array([0.0, (v - self.cy) / self.fy, 1.0]) * depth
+            ys.append(float((R @ d)[1] + self.pos[1]))
+        return (min(ys), max(ys))
+
+
+def _default_camera() -> SimCamera:
+    T = extrinsics.T_ROBOT2BASE @ extrinsics.T_BASE2CAM
+    fx, fy, cx, cy, w, h = 638.663, 638.205, 642.904, 361.377, 1280, 720   # yaml mirror
+    info = _find_camera_info()
+    if info is not None:
+        txt = info.read_text()
+        m_w = re.search(r"image_width:\s*(\d+)", txt); m_h = re.search(r"image_height:\s*(\d+)", txt)
+        m_k = re.search(r"camera_matrix:.*?data:\s*\[([^\]]*)\]", txt, re.S)
+        if m_w and m_h and m_k:
+            k = [float(x) for x in m_k.group(1).replace("\n", " ").split(",")]
+            fx, fy, cx, cy = k[0], k[4], k[2], k[5]
+            w, h = int(m_w.group(1)), int(m_h.group(1))
+    return SimCamera(pos=tuple(float(x) for x in T[:3, 3]),
+                     R=tuple(tuple(float(x) for x in row) for row in T[:3, :3]),
+                     fx=fx, fy=fy, cx=cx, cy=cy, width=w, height=h)
+
+
+MJ_CAMERA_BODY = "d435i"        # vendored RealSense model, re-posed onto the real camera
+MJ_CAMERA = "d435i_view"        # its <camera> child (euler pi about x w.r.t. the body)
 
 # gp8 joint order [S, L, U, R, B, T] == these MuJoCo joints / position actuators
 # (confirmed numerically by sim/preview_gp8_check.py).
@@ -201,11 +277,19 @@ class SimConfig:
 
     belt_speed: float = field(default_factory=lambda: _env_float("GP8_SIM_BELT_SPEED", 0.12))
     spawn_interval: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_INTERVAL", 5.0))
-    # Boxes enter the belt where the real camera first sees them: the image
-    # centre sits REFERENCE_Y_BASE (2.47 m) upstream of the robot, so the
-    # detection->intercept lead time matches hardware (~2.5 m / belt_speed).
+    # Boxes enter the belt just UPSTREAM of the real camera's field of view
+    # (nan = derived in SimCore from `camera`: view edge + a box + 5 cm), so
+    # each box is first detected as it enters the image exactly like on
+    # hardware and the detection->intercept lead time matches (~2.8 m /
+    # belt_speed from the 2.47 m camera). GP8_SIM_SPAWN_Y overrides.
     spawn_y: float = field(default_factory=lambda: _env_float(
-        "GP8_SIM_SPAWN_Y", extrinsics.REFERENCE_Y_BASE))
+        "GP8_SIM_SPAWN_Y", float("nan")))
+    # The real camera (pose from extrinsics, pinhole from config yaml).
+    camera: SimCamera = field(default_factory=_default_camera)
+    # Only boxes inside the camera image are reported (GP8_SIM_CAM_FOV_GATE=0
+    # reports every on-belt box, the pre-camera behaviour).
+    cam_fov_gate: bool = field(default_factory=lambda: os.environ.get(
+        "GP8_SIM_CAM_FOV_GATE", "1").lower() not in ("0", "false", "no"))
     despawn_y: float = -0.8       # base-frame Y past which boxes are recycled
     lane_x: float = field(default_factory=lambda: _env_float("GP8_SIM_LANE_X", 0.45))
     grasp_z: float = 0.042        # box CENTRE height in base frame (pass cfg.GRASP_Z)
@@ -261,8 +345,27 @@ def _add_bin(spec, base_pos, b: SimBin) -> None:
                       size=size, pos=pos, rgba=rgba)
 
 
+def _pose_camera(spec, base_pos, cam: SimCamera) -> None:
+    """Move the vendored d435i body so its <camera> child IS the real camera.
+
+    MuJoCo cameras look along their -z with +y up; the optical frame looks
+    along +z with +y down, so R_mj = R_opt @ diag(1, -1, -1). The vendored
+    child camera is rotated pi about x w.r.t. the body (keeps the mesh's
+    lens-forward relation), hence R_body = R_mj @ Rx(pi).
+    """
+    R_opt = np.asarray(cam.R)
+    R_mj = R_opt @ np.diag([1.0, -1.0, -1.0])
+    R_body = R_mj @ np.diag([1.0, -1.0, -1.0])
+    quat = np.empty(4)
+    mujoco.mju_mat2Quat(quat, R_body.reshape(9))
+    body = spec.body(MJ_CAMERA_BODY)
+    body.pos = [float(base_pos[i]) + float(cam.pos[i]) for i in range(3)]
+    body.quat = quat
+    spec.camera(MJ_CAMERA).fovy = cam.fovy_deg
+
+
 def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
-                      grasp_z: float, half_len: float, bins=()):
+                      grasp_z: float, half_len: float, bins=(), camera: SimCamera | None = None):
     """Load the vendored scene and add a reachable conveyor (+ bins) via MjSpec.
 
     The surface top sits one box-half below grasp_z so a box rests with its
@@ -286,6 +389,8 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
     )
     for b in bins:
         _add_bin(spec, base_pos, b)
+    if camera is not None:
+        _pose_camera(spec, base_pos, camera)
     # Parked boxes are held by gravity compensation (see _park_box). The
     # compiler counts bodies with nonzero gravcomp (mjModel.ngravcomp) and the
     # passive-force pass skips the feature entirely when that count is 0, so
@@ -431,6 +536,10 @@ class SimCore:
         # base pose is fixed in the XML (yaskawa_robot @ (-0.05,0,0.6), identity
         # rot); read it from a throwaway load to place the reachable belt.
         base = mujoco.MjModel.from_xml_path(str(scene)).body(MJ_BASE_BODY).pos
+        if math.isnan(self.cfg.spawn_y):
+            # just past the upstream edge of the camera image at box-top height
+            top_z = self.cfg.grasp_z + BOX_HALF_Z
+            self.cfg.spawn_y = self.cfg.camera.view_y_span(top_z)[1] + BOX_HALF_Y + 0.05
         # The surface spans despawn_y..spawn_y (+0.1 m margin each end) and
         # is centred BETWEEN them — not on the base origin, which would leave
         # the 2.47 m camera-reference spawn point hanging past the belt end.
@@ -439,7 +548,7 @@ class SimCore:
         self.bins: tuple = tuple(self.cfg.bins)
         self.model = _build_twin_model(
             str(scene), base, self.cfg.lane_x, center_y, self.cfg.grasp_z, half_len,
-            self.bins)
+            self.bins, self.cfg.camera)
         # Landing telemetry: loose (thrown / pushed) boxes are classified when
         # they come down — inside a bin footprint below its rim, or a miss.
         self.bin_hits: dict[str, int] = {b.name: 0 for b in self.bins}
@@ -746,10 +855,16 @@ class SimCore:
         ws_x_abs = extrinsics.WORKSPACE_X_ABS
 
         dets = []
+        cam = self.cfg.camera if self.cfg.cam_fov_gate else None
         for i, jnt in enumerate(self._box_joints):
             if self._box_state[i] != self._ON_BELT:
                 continue
             b = self._to_base(jnt.qpos[0:3])
+            # The real detector only reports what is inside the image: gate on
+            # the box's top-face centre. Boxes past the view are then tracked
+            # by the app's belt dead reckoning, exactly as on hardware.
+            if cam is not None and not cam.sees((b[0], b[1], b[2] + BOX_HALF_Z)):
+                continue
             # Base -> belt-frame camera coords (the inverse of camera_debug's
             # constant-translation mapping), then run the corners through the
             # SAME bbox_to_base the real pipeline uses (zero latency in sim).

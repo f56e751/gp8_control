@@ -11,7 +11,7 @@ Usage:
   ros2 launch gp8_control sim.launch.py viewer:=true   # MuJoCo viewer window
   ros2 launch gp8_control sim.launch.py skill:=throw   # pin one skill
   ros2 launch gp8_control sim.launch.py spawn_y:=0.9   # shorter belt (default:
-                                                       #  camera ref 2.47 m)
+                                                       #  just past the camera view, ~2.92 m)
 """
 
 import os
@@ -84,9 +84,9 @@ def generate_launch_description() -> LaunchDescription:
     spawn_y_arg = DeclareLaunchArgument(
         "spawn_y", default_value=os.environ.get("GP8_SIM_SPAWN_Y", ""),
         description=(
-            "Base-frame Y where sim boxes enter the belt [m]. '' = the real "
-            "camera reference point (extrinsics.REFERENCE_Y_BASE, 2.47 m), so "
-            "the detection->pick lead time matches hardware."
+            "Base-frame Y where sim boxes enter the belt [m]. '' = just past the "
+            "upstream edge of the real camera's view (~2.92 m; camera at 2.47 m), "
+            "so boxes are first detected entering the image like on hardware."
         ),
     )
 
