@@ -423,6 +423,14 @@ GP8_BACKEND=mujoco GP8_FORCE_SKILL=throw   PYTHONPATH=$HOME/ros2_ws/src ~/ros2_w
   0.80, 0.60). 내폭 `GP8_SIM_BIN_W`(0.40 m). 던지거나 밀린 박스가 내려앉으면
   `[sim] ... landed IN bin 'throw'` / `MISSED (x, y) nearest ...` 로 stdout 에
   찍히고 `SimCore.bin_hits` / `bin_misses` 에 누적된다.
+- **뷰어를 켜도 결과가 같다** — 스테퍼는 lock 을 서브스텝(2 ms) 단위로만 잡고,
+  250 Hz 스트림 샘플은 도착 시각과 함께 lock 없는 큐에 들어가 스테퍼가 물리
+  시각에 맞춰 재생(ZOH)한다. `viewer.sync()` 가 렌더에 수십 ms 붙잡혀 물리가
+  몰아서 따라잡아도 팔은 명령 이력을 그대로 밟고, 석션 토글은 최대 1 ms 만
+  기다린다. (예전엔 배치 단위 lock 이 스트림 스레드를 50 ms 씩 막아 스윙 중
+  팔이 멈칫했고, 이 때문에 뷰어 조건에서만 던지기가 짧게 떨어졌다.) 미사용
+  박스는 충돌 off + 중력 보상으로 바닥 아래 각자 자리에 파킹된다 (한 점에 겹쳐
+  두면 솔버가 바닥 위로 밀어내 베이스 옆에 쌓였다).
 - **석션/던지기** — suction ON 은 grip_site 반경 내 최근접 박스를 MJCF weld 로
   붙이고 (활성화 시점 상대자세를 `eq_data` 에 기입), OFF 는 weld 를 푼다.
   weld 가 스윙 내내 박스를 물리로 끌고 가므로 릴리즈 순간 박스의 free-joint

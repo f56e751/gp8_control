@@ -185,7 +185,14 @@ MotoROS2 queue contract lives on the pre-migration `main` branch, not here.)
 `SimCore` loads the vendored scene (+ a reachable conveyor injected via MjSpec)
 and runs a **wall-clock-servoed stepping thread** (2 ms physics; the arm's
 position actuators ZOH the last streamed 4 ms command exactly like the real
-JGPC). Suction ON welds the nearest on-belt box to link6 — the activation-time
+JGPC). Stream samples and suction toggles are NOT applied on arrival: they go
+into one lock-free time-stamped queue (`_pending_ctrl`) that the stepper
+replays per substep on the physics clock, and `SimCore.lock` is held per
+substep, never across a catch-up batch — so a render stall (`viewer.sync()`)
+can't starve the 250 Hz stream thread or skew the release timing. Unused boxes
+park below the floor with collisions off + gravity compensation (compile-time
+`gravcomp` on the box bodies — runtime-only values are ignored when
+`ngravcomp == 0`). Suction ON welds the nearest on-belt box to link6 — the activation-time
 relative pose must be written into `model.eq_data` (the XML weld's zero relpose
 is baked at compile time); suction OFF releases the weld and the box flies with
 its true dragged velocity. On-belt boxes' Y is kinematically driven to match

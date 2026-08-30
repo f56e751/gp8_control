@@ -97,7 +97,13 @@ BOX_GEOMS = ["red_box_geom"] + [f"red_box_geom_{i}" for i in range(2, 13)]
 BOX_WELDS = ["suction_weld_red_box"] + [f"suction_weld_red_box_{i}" for i in range(2, 13)]
 # red_box_geom half-extents (size in combined_test.xml): x, y (footprint), z (height)
 BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z = 0.05, 0.075, 0.015
-_PARK = np.array([0.0, 0.0, -2.0])   # stash unused boxes below the floor
+# Parked (unused) boxes sit below the ground plane, each at its own spot, with
+# collisions OFF and gravity compensated. (Stacking all 12 free bodies on ONE
+# point under an infinite plane made the solver eject them up through the
+# floor into a pile beside the robot base — ~70 permanent contacts that
+# doubled mj_step and starved the command stream when the viewer was on.)
+def _park_pos(i: int) -> np.ndarray:
+    return np.array([-2.0 - 0.3 * (i % 4), -2.0 - 0.3 * (i // 4), -1.0])
 _HOME = [0.0, 0.0, 0.0, 0.0, -math.pi / 2, 0.0]   # B down — matches app startup
 
 # Per-class box tint so throw (transparent) vs push (metal) reads at a glance.
@@ -280,6 +286,13 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
     )
     for b in bins:
         _add_bin(spec, base_pos, b)
+    # Parked boxes are held by gravity compensation (see _park_box). The
+    # compiler counts bodies with nonzero gravcomp (mjModel.ngravcomp) and the
+    # passive-force pass skips the feature entirely when that count is 0, so
+    # the flag must be non-zero at COMPILE time; _activate_box zeroes it on
+    # spawn and _park_box restores it.
+    for name in BOX_BODIES:
+        spec.body(name).gravcomp = 1.0
     # Allow HD offscreen rendering (the recorder); default framebuffer is 640x480.
     spec.visual.global_.offwidth = max(int(spec.visual.global_.offwidth), 1280)
     spec.visual.global_.offheight = max(int(spec.visual.global_.offheight), 720)
@@ -396,11 +409,13 @@ class _Recorder:
 class SimCore:
     """Owns MjModel/MjData + the wall-clock-servoed stepping thread.
 
-    Concurrency: `lock` guards ALL MjData/MjModel mutation. The stream engine's
-    ``_emit_sample`` only writes the 6-float ``_ctrl_target`` under it
-    (microseconds); the stepper holds it per substep batch. Joint snapshots are
-    handed to the bound backend as fresh list objects (GIL-atomic swap, same
-    pattern as the ROS joint_states callback).
+    Concurrency: `lock` guards ALL MjData/MjModel mutation and is held per
+    2 ms SUBSTEP (never across a catch-up batch), so ``set_suction`` waits at
+    most one ``mj_step``. The stream engine's ``_emit_sample`` never takes it:
+    samples go into a lock-free time-stamped queue that the stepper replays
+    (see ``_pending_ctrl``). Joint snapshots are handed to the bound backend
+    as fresh list objects (GIL-atomic swap, same pattern as the ROS
+    joint_states callback).
     """
 
     _FREE, _ON_BELT, _GRABBED, _LOOSE = "free", "on_belt", "grabbed", "loose"
@@ -454,8 +469,19 @@ class SimCore:
         self._base_p = self.data.body(MJ_BASE_BODY).xpos.copy()
         self._base_R = np.eye(3)   # yaskawa_robot has identity orientation
 
-        # --- streamed command target (written by _emit_sample at 250 Hz) -----
-        self._ctrl_target = np.array(_HOME, dtype=float)
+        # --- streamed command timeline (written by _emit_sample at 250 Hz) --
+        # Each sample is queued with its ARRIVAL wall time; per substep the
+        # stepper applies the latest sample whose arrival time <= that
+        # substep's wall time — the real JGPC's 4 ms zero-order hold, replayed
+        # on the physics clock. When the stepper stalls (viewer sync, GC) and
+        # catches up in a burst, the arm therefore traces the exact command
+        # history instead of jumping to the newest sample. Lock-free: deque
+        # append/popleft are GIL-atomic; _ctrl_target is swapped whole.
+        # Suction toggles ride the SAME timeline (kind "suction"), so a release
+        # fired while the stepper is stalled lands at its true place in the
+        # command history rather than being applied early to a lagging arm.
+        self._pending_ctrl: deque = deque(maxlen=4000)   # (t, kind, payload); ~16 s
+        self._ctrl_target = np.array(_HOME, dtype=float)   # currently applied
 
         # --- object pool -----------------------------------------------------
         self._box_joints = [self.data.joint(n) for n in BOX_JOINTS]
@@ -474,10 +500,11 @@ class SimCore:
         self._grabbed: int | None = None
         self._spawn_count = 0
         self._last_spawn = 0.0
-        for jnt in self._box_joints:   # park the pool below the floor
-            jnt.qpos[0:3] = _PARK
-            jnt.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
-            jnt.qvel[:] = 0.0
+        # Vendored collision masks, restored on spawn (parked boxes get 0/0).
+        self._box_contype = [int(self.model.geom_contype[g]) for g in self._box_geom_ids]
+        self._box_conaff = [int(self.model.geom_conaffinity[g]) for g in self._box_geom_ids]
+        for i in range(len(BOX_JOINTS)):
+            self._park_box(i)
 
         # --- world-source outputs -------------------------------------------
         self.belt = SimBeltTracker(self.cfg.belt_speed)
@@ -522,21 +549,25 @@ class SimCore:
     # RobotBackend hooks (called from the app/skill thread)
     # ------------------------------------------------------------------
     def set_ctrl_target(self, positions) -> None:
-        with self.lock:
-            self._ctrl_target[:] = [float(x) for x in positions]
+        """Queue one 4 ms command sample (stream thread). Never blocks."""
+        self._pending_ctrl.append((time.monotonic(), "ctrl", np.array(positions, dtype=float)))
 
     def set_suction(self, on: bool) -> None:
+        """Queue a suction toggle (skill/IO thread). Applied by the stepper at
+        its wall-time slot in the command timeline — see ``_apply_suction``."""
+        self._pending_ctrl.append((time.monotonic(), "suction", bool(on)))
+
+    def _apply_suction(self, on: bool) -> None:
         """Weld the nearest on-belt box on suction ON; release it on OFF.
 
         The weld physically drags the box through the swing, so at release its
         free-joint qvel already carries the true throw velocity — it flies
-        ballistically with no synthesized fling.
+        ballistically with no synthesized fling. Stepper thread, under lock.
         """
-        with self.lock:
-            if on:
-                self._grab_nearest()
-            else:
-                self._release_grabbed()
+        if on:
+            self._grab_nearest()
+        else:
+            self._release_grabbed()
 
     def _grab_nearest(self) -> None:
         if self._grabbed is not None:
@@ -594,6 +625,7 @@ class SimCore:
         cls = self.cfg.classes[self._spawn_count % len(self.cfg.classes)]
         jitter = 0.06 * ((self._spawn_count % 3) - 1)   # -0.06, 0, +0.06
         world = self._to_world([self.cfg.lane_x + jitter, self.cfg.spawn_y, self.cfg.grasp_z])
+        self._activate_box(idx)
         jnt = self._box_joints[idx]
         jnt.qpos[0:3] = world
         jnt.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
@@ -604,6 +636,26 @@ class SimCore:
         self.model.geom_rgba[self._box_geom_ids[idx]] = _CLASS_RGBA.get(cls, _DEFAULT_RGBA)
         self._spawn_count += 1
         self._box_serial[idx] = self._spawn_count
+
+    def _park_box(self, i: int) -> None:
+        """Retire box i: collisions off, gravity compensated, stashed below the floor."""
+        jnt = self._box_joints[i]
+        jnt.qpos[0:3] = _park_pos(i)
+        jnt.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+        jnt.qvel[:] = 0.0
+        gid = self._box_geom_ids[i]
+        self.model.geom_contype[gid] = 0
+        self.model.geom_conaffinity[gid] = 0
+        self.model.body_gravcomp[self._box_body_ids[i]] = 1.0
+        self._box_state[i] = self._FREE
+        self._box_class[i] = ""
+
+    def _activate_box(self, i: int) -> None:
+        """Re-enable a parked box's collisions/gravity before placing it."""
+        gid = self._box_geom_ids[i]
+        self.model.geom_contype[gid] = self._box_contype[i]
+        self.model.geom_conaffinity[gid] = self._box_conaff[i]
+        self.model.body_gravcomp[self._box_body_ids[i]] = 0.0
 
     def _apply_belt_velocity(self) -> None:
         """Pre-step: assert on-belt boxes' world-Y velocity (solver hint so
@@ -676,10 +728,7 @@ class SimCore:
             if gone:
                 if loose:
                     self._log_landing(i, base)
-                jnt.qpos[0:3] = _PARK
-                jnt.qvel[:] = 0.0
-                self._box_state[i] = self._FREE
-                self._box_class[i] = ""
+                self._park_box(i)
             elif self._box_state[i] == self._ON_BELT and world[2] < off_belt:
                 self._box_state[i] = self._LOOSE   # pushed / knocked off the belt
 
@@ -763,12 +812,28 @@ class SimCore:
                 lag = (time.monotonic() - t0) - self.data.time
                 n = int(np.clip(round(lag / self._dt), 0, 50))
                 if n > 0:
-                    with self.lock:
-                        for _ in range(n):
+                    pend = self._pending_ctrl
+                    for _ in range(n):
+                        # ZOH replay: the command in force at this substep's
+                        # wall time (sim time is servoed to wall time from t0).
+                        t_sub = t0 + self.data.time
+                        suction_events = []
+                        while pend and pend[0][0] <= t_sub:
+                            _, kind, payload = pend.popleft()
+                            if kind == "ctrl":
+                                self._ctrl_target = payload
+                            else:
+                                suction_events.append(payload)
+                        # Lock per substep (NOT per batch): other lock users
+                        # (snapshot readers, tests) wait at most one mj_step.
+                        with self.lock:
+                            for on in suction_events:
+                                self._apply_suction(on)
                             self.data.ctrl[self._act_ids] = self._ctrl_target
                             self._apply_belt_velocity()
                             mujoco.mj_step(self.model, self.data)
                             self._enforce_belt_kinematics(self._dt)
+                    with self.lock:
                         self._encoder_distance += self.cfg.belt_speed * self._dt * n
                         now = time.time()
                         if now - self._last_spawn >= self.cfg.spawn_interval:
