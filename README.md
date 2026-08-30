@@ -394,6 +394,7 @@ cd ~/ros2_ws/src/gp8_control && uv sync --extra sim
 # 앱 + belt_viz (헤드리스; 별도 sim 노드 없음)
 ros2 launch gp8_control sim.launch.py
 #   MuJoCo 창:  viewer:=true          벨트 튠:  belt_speed:=0.08 spawn_interval:=4.0
+#   스폰 위치:  spawn_y:=0.9  (기본 '' = 실기 카메라 기준점 2.47 m — 픽까지 리드타임 실기와 동일)
 #   one skill:  skill:=throw
 
 # 또는 launch 없이 직접 (venv python):
@@ -411,7 +412,17 @@ GP8_BACKEND=mujoco GP8_FORCE_SKILL=throw   PYTHONPATH=$HOME/ros2_ws/src ~/ros2_w
 - **벨트/엔코더** — 스테퍼가 적분한 엔코더 등가 거리(`distance_at`)가
   `ConveyorSpeedTracker` 와 같은 인터페이스로 나온다 (옛 SIL 이 못 먹이던
   엔코더 거리 추적 경로가 이제 시뮬에서 검증된다). 벨트 위 박스의 Y 는
-  엔코더 적분과 정확히 일치하게 구동된다 (X/Z 는 물리).
+  엔코더 적분과 정확히 일치하게 구동된다 (X/Z 는 물리). 박스는 실기 카메라가
+  물체를 처음 보는 지점(`extrinsics.REFERENCE_Y_BASE` = base Y 2.47 m)에서
+  스폰되고 벨트 면은 그 지점부터 −0.8 m 까지 이어지므로, 감지→인터셉트
+  리드타임(≈2.5 m / 벨트속도)이 실기와 같다 (`GP8_SIM_SPAWN_Y` / `spawn_y:=`).
+- **빈(bin)** — 앱의 실제 목표점에 오픈탑 빈이 선다: throw 는
+  `THROW_BINS`(JSON, `throw_bins:=`) 가 있으면 그 목록, 없으면
+  `THROW_GOAL_X/Y`(기본 1.1, −0.25) 에 림이 `THROW_VIZ_IMPACT_Z` 높이로; push 는
+  `PUSH_BIN_TARGET_MAP` 중 `SKILL_BY_CLASS` 가 push 로 보내는 클래스(metal →
+  0.80, 0.60). 내폭 `GP8_SIM_BIN_W`(0.40 m). 던지거나 밀린 박스가 내려앉으면
+  `[sim] ... landed IN bin 'throw'` / `MISSED (x, y) nearest ...` 로 stdout 에
+  찍히고 `SimCore.bin_hits` / `bin_misses` 에 누적된다.
 - **석션/던지기** — suction ON 은 grip_site 반경 내 최근접 박스를 MJCF weld 로
   붙이고 (활성화 시점 상대자세를 `eq_data` 에 기입), OFF 는 weld 를 푼다.
   weld 가 스윙 내내 박스를 물리로 끌고 가므로 릴리즈 순간 박스의 free-joint

@@ -10,6 +10,8 @@ Usage:
   ros2 launch gp8_control sim.launch.py                # headless twin
   ros2 launch gp8_control sim.launch.py viewer:=true   # MuJoCo viewer window
   ros2 launch gp8_control sim.launch.py skill:=throw   # pin one skill
+  ros2 launch gp8_control sim.launch.py spawn_y:=0.9   # shorter belt (default:
+                                                       #  camera ref 2.47 m)
 """
 
 import os
@@ -71,6 +73,22 @@ def generate_launch_description() -> LaunchDescription:
         "spawn_interval", default_value=os.environ.get("GP8_SIM_SPAWN_INTERVAL", "5.0"),
         description="Sim box spawn interval [s].",
     )
+    throw_bins_arg = DeclareLaunchArgument(
+        "throw_bins", default_value=os.environ.get("GP8_THROW_BINS", ""),
+        description=(
+            "Optional JSON throw-bin list (same format as gp8_bringup): "
+            "[{\"name\":\"left\",\"x\":1.2,\"y\":0.3,\"z\":0.08,\"radius\":0.1}]. "
+            "The twin places a bin at each entry; '' = one bin at throw_goal_x/y."
+        ),
+    )
+    spawn_y_arg = DeclareLaunchArgument(
+        "spawn_y", default_value=os.environ.get("GP8_SIM_SPAWN_Y", ""),
+        description=(
+            "Base-frame Y where sim boxes enter the belt [m]. '' = the real "
+            "camera reference point (extrinsics.REFERENCE_Y_BASE, 2.47 m), so "
+            "the detection->pick lead time matches hardware."
+        ),
+    )
 
     gp8_app = ExecuteProcess(
         cmd=[venv_python, "-m", "gp8_control.app"],
@@ -82,6 +100,8 @@ def generate_launch_description() -> LaunchDescription:
             "GP8_SIM_VIEWER": LaunchConfiguration("viewer"),
             "GP8_SIM_BELT_SPEED": LaunchConfiguration("belt_speed"),
             "GP8_SIM_SPAWN_INTERVAL": LaunchConfiguration("spawn_interval"),
+            "GP8_SIM_SPAWN_Y": LaunchConfiguration("spawn_y"),
+            "GP8_THROW_BINS": LaunchConfiguration("throw_bins"),
         },
     )
 
@@ -93,6 +113,6 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     return LaunchDescription([
-        skill_arg, viewer_arg, belt_speed_arg, spawn_interval_arg,
-        gp8_app, belt_viz,
+        skill_arg, viewer_arg, belt_speed_arg, spawn_interval_arg, spawn_y_arg,
+        throw_bins_arg, gp8_app, belt_viz,
     ])

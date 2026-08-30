@@ -32,6 +32,7 @@ Headless by default; set ``GP8_SIM_VIEWER=1`` for a passive viewer window.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
@@ -113,6 +114,74 @@ BELT_BODY = "gp8_belt"
 BELT_GEOM = "gp8_belt_surface"
 
 
+@dataclass(frozen=True)
+class SimBin:
+    """An open-top bin placed in the twin, in the gp8 BASE frame.
+
+    ``x, y`` is the bin centre (== the app's throw goal / push bin target),
+    ``rim_z`` the height of the opening; the bin's floor sits on the sim
+    ground so its walls run from the ground up to the rim.
+    """
+    name: str
+    kind: str          # "throw" | "push" (tint + telemetry label only)
+    x: float
+    y: float
+    rim_z: float = 0.0
+    half_w: float = 0.20   # inner half-width [m]
+
+
+# Mirror of the app defaults (Config.THROW_GOAL_X/Y, THROW_VIZ_IMPACT_Z and
+# push_skill.PUSH_BIN_TARGET_MAP["metal"]) for environments where the app
+# config can't be imported (no ROS: Windows smoke). bins_from_config() is
+# the real source; keep these in sync if those defaults move.
+_FALLBACK_BINS = (
+    SimBin("throw", "throw", 1.1, -0.25, 0.0),
+    SimBin("push_metal", "push", 0.80, 0.60, 0.0),
+)
+
+
+def bins_from_config(cfg=None) -> tuple:
+    """Bins matching the REAL setup, derived from the app's own targets:
+
+      * throw — ``Config.THROW_BINS`` (JSON list, same format the launch
+        ``throw_bins:=`` takes) if set, else the single ``THROW_GOAL_X/Y``
+        goal with its rim on the ``THROW_VIZ_IMPACT_Z`` landing plane;
+      * push  — ``push_skill.PUSH_BIN_TARGET_MAP`` for every class that
+        ``Config.SKILL_BY_CLASS`` routes to push.
+
+    ``cfg`` is an app ``Config`` (pass the live one so env/launch overrides
+    apply); ``None`` builds a default ``Config``. Falls back to
+    :data:`_FALLBACK_BINS` when the app config is not importable.
+    """
+    try:
+        if cfg is None:
+            from gp8_control.config import Config
+            cfg = Config()
+        from gp8_control.skills.push_skill import PUSH_BIN_TARGET_MAP
+    except Exception as exc:   # ImportError (no rclpy) or a config failure
+        print(f"[sim] app config unavailable ({exc!r}); using fallback bins",
+              flush=True)
+        return _FALLBACK_BINS
+    half_w = 0.5 * _env_float("GP8_SIM_BIN_W", 0.40)
+    bins: list[SimBin] = []
+    raw = (getattr(cfg, "THROW_BINS", "") or "").strip()
+    if raw:
+        for i, b in enumerate(json.loads(raw)):
+            bins.append(SimBin(str(b.get("name", f"throw{i}")), "throw",
+                               float(b["x"]), float(b["y"]),
+                               float(b.get("z", cfg.THROW_VIZ_IMPACT_Z)), half_w))
+    else:
+        bins.append(SimBin("throw", "throw", float(cfg.THROW_GOAL_X),
+                           float(cfg.THROW_GOAL_Y),
+                           float(cfg.THROW_VIZ_IMPACT_Z), half_w))
+    for cls, skill in dict(cfg.SKILL_BY_CLASS).items():
+        xyz = PUSH_BIN_TARGET_MAP.get(cls)
+        if skill == "push" and xyz is not None:
+            bins.append(SimBin(f"push_{cls}", "push", float(xyz[0]),
+                               float(xyz[1]), float(xyz[2]), half_w))
+    return tuple(bins)
+
+
 def _env_float(key: str, default: float) -> float:
     try:
         return float(os.environ.get(key, default))
@@ -126,7 +195,11 @@ class SimConfig:
 
     belt_speed: float = field(default_factory=lambda: _env_float("GP8_SIM_BELT_SPEED", 0.12))
     spawn_interval: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_INTERVAL", 5.0))
-    spawn_y: float = 0.9          # base-frame Y where boxes enter the belt
+    # Boxes enter the belt where the real camera first sees them: the image
+    # centre sits REFERENCE_Y_BASE (2.47 m) upstream of the robot, so the
+    # detection->intercept lead time matches hardware (~2.5 m / belt_speed).
+    spawn_y: float = field(default_factory=lambda: _env_float(
+        "GP8_SIM_SPAWN_Y", extrinsics.REFERENCE_Y_BASE))
     despawn_y: float = -0.8       # base-frame Y past which boxes are recycled
     lane_x: float = field(default_factory=lambda: _env_float("GP8_SIM_LANE_X", 0.45))
     grasp_z: float = 0.042        # box CENTRE height in base frame (pass cfg.GRASP_Z)
@@ -146,14 +219,51 @@ class SimConfig:
     # lets a remote/SSH run produce a demo video with no display.
     record_path: str = field(default_factory=lambda: os.environ.get("GP8_SIM_RECORD", ""))
     record_fps: float = field(default_factory=lambda: _env_float("GP8_SIM_RECORD_FPS", 24.0))
+    # Bins at the app's real throw goal / push targets (see bins_from_config;
+    # the app passes its live Config). () = no bins. Width: GP8_SIM_BIN_W.
+    bins: tuple = field(default_factory=bins_from_config)
 
 
-def _build_twin_model(scene_path: str, base_pos, lane_x: float, grasp_z: float,
-                      half_len: float):
-    """Load the vendored scene and add a reachable conveyor via MjSpec.
+_BIN_RGBA = {
+    "throw": (0.30, 0.65, 1.00, 0.30),
+    "push": (0.62, 0.62, 0.68, 0.30),
+}
+_BIN_WALL_T = 0.01          # wall / floor-plate thickness [m]
+_BIN_FLOOR_Z = 0.005        # bin floor-plate centre above the sim ground [m]
+
+
+def _add_bin(spec, base_pos, b: SimBin) -> None:
+    """Open-top bin: floor plate on the ground + 4 walls up to the rim."""
+    bx, by, bz = float(base_pos[0]), float(base_pos[1]), float(base_pos[2])
+    rim = bz + b.rim_z                   # world z of the opening
+    if rim <= 2 * _BIN_FLOOR_Z + 0.02:
+        raise ValueError(f"sim bin {b.name!r}: rim_z {b.rim_z} is below the ground")
+    body = spec.worldbody.add_body(name=f"sim_bin_{b.name}", pos=[bx + b.x, by + b.y, 0.0])
+    rgba = list(_BIN_RGBA.get(b.kind, (0.8, 0.8, 0.2, 0.3)))
+    hw, t = b.half_w, _BIN_WALL_T
+    body.add_geom(name=f"sim_bin_{b.name}_floor", type=mujoco.mjtGeom.mjGEOM_BOX,
+                  size=[hw + t, hw + t, _BIN_FLOOR_Z], pos=[0.0, 0.0, _BIN_FLOOR_Z],
+                  rgba=rgba)
+    hh = 0.5 * rim
+    for tag, pos, size in (
+        ("xp", [hw + t / 2, 0.0, hh], [t / 2, hw + t, hh]),
+        ("xn", [-hw - t / 2, 0.0, hh], [t / 2, hw + t, hh]),
+        ("yp", [0.0, hw + t / 2, hh], [hw + t, t / 2, hh]),
+        ("yn", [0.0, -hw - t / 2, hh], [hw + t, t / 2, hh]),
+    ):
+        body.add_geom(name=f"sim_bin_{b.name}_{tag}", type=mujoco.mjtGeom.mjGEOM_BOX,
+                      size=size, pos=pos, rgba=rgba)
+
+
+def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
+                      grasp_z: float, half_len: float, bins=()):
+    """Load the vendored scene and add a reachable conveyor (+ bins) via MjSpec.
 
     The surface top sits one box-half below grasp_z so a box rests with its
     centre at grasp_z (== where the app's grasp pose and our detections put it).
+    The surface runs along base Y centred at ``center_y`` with half-length
+    ``half_len`` (both in the base frame). ``bins`` are :class:`SimBin`
+    targets placed at their base-frame XY.
     Returns a compiled MjModel. Glue: never edits the vendored XML on disk.
     """
     spec = mujoco.MjSpec.from_file(scene_path)
@@ -161,13 +271,15 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, grasp_z: float,
     top = bz + grasp_z - BOX_HALF_Z            # belt surface top (world z)
     thick = 0.02
     belt = spec.worldbody.add_body(
-        name=BELT_BODY, pos=[bx + lane_x, by, top - thick],
+        name=BELT_BODY, pos=[bx + lane_x, by + center_y, top - thick],
     )
     belt.add_geom(
         name=BELT_GEOM, type=mujoco.mjtGeom.mjGEOM_BOX,
         size=[0.16, half_len, thick], pos=[0.0, 0.0, 0.0],
         rgba=[0.12, 0.12, 0.14, 1.0], friction=[0.3, 0.02, 0.002],
     )
+    for b in bins:
+        _add_bin(spec, base_pos, b)
     # Allow HD offscreen rendering (the recorder); default framebuffer is 640x480.
     spec.visual.global_.offwidth = max(int(spec.visual.global_.offwidth), 1280)
     spec.visual.global_.offheight = max(int(spec.visual.global_.offheight), 720)
@@ -304,9 +416,19 @@ class SimCore:
         # base pose is fixed in the XML (yaskawa_robot @ (-0.05,0,0.6), identity
         # rot); read it from a throwaway load to place the reachable belt.
         base = mujoco.MjModel.from_xml_path(str(scene)).body(MJ_BASE_BODY).pos
+        # The surface spans despawn_y..spawn_y (+0.1 m margin each end) and
+        # is centred BETWEEN them — not on the base origin, which would leave
+        # the 2.47 m camera-reference spawn point hanging past the belt end.
+        center_y = 0.5 * (self.cfg.spawn_y + self.cfg.despawn_y)
         half_len = 0.5 * (self.cfg.spawn_y - self.cfg.despawn_y) + 0.1
+        self.bins: tuple = tuple(self.cfg.bins)
         self.model = _build_twin_model(
-            str(scene), base, self.cfg.lane_x, self.cfg.grasp_z, half_len)
+            str(scene), base, self.cfg.lane_x, center_y, self.cfg.grasp_z, half_len,
+            self.bins)
+        # Landing telemetry: loose (thrown / pushed) boxes are classified when
+        # they come down — inside a bin footprint below its rim, or a miss.
+        self.bin_hits: dict[str, int] = {b.name: 0 for b in self.bins}
+        self.bin_misses = 0
         self.data = mujoco.MjData(self.model)
         self.lock = threading.Lock()
         self._dt = float(self.model.opt.timestep)
@@ -342,6 +464,7 @@ class SimCore:
         self._weld_ids = [int(self.model.equality(n).id) for n in BOX_WELDS]
         self._box_state = [self._FREE] * len(BOX_JOINTS)
         self._box_class = [""] * len(BOX_JOINTS)
+        self._box_serial = [0] * len(BOX_JOINTS)   # spawn number, for the landing log
         # Kinematic along-belt coordinate per ON_BELT box (world Y): contact
         # friction during a step brakes a purely velocity-asserted box (~0.10
         # realized vs 0.12 commanded), which would desync the boxes from the
@@ -480,6 +603,7 @@ class SimCore:
         self._box_belt_y[idx] = float(world[1])
         self.model.geom_rgba[self._box_geom_ids[idx]] = _CLASS_RGBA.get(cls, _DEFAULT_RGBA)
         self._spawn_count += 1
+        self._box_serial[idx] = self._spawn_count
 
     def _apply_belt_velocity(self) -> None:
         """Pre-step: assert on-belt boxes' world-Y velocity (solver hint so
@@ -507,16 +631,51 @@ class SimCore:
                 jnt.qpos[1] = self._box_belt_y[i]
                 jnt.qvel[1] = -self.cfg.belt_speed
 
+    def _bin_at(self, base_xyz) -> SimBin | None:
+        """The bin whose footprint contains base_xyz below its rim, if any."""
+        for b in self.bins:
+            if (abs(base_xyz[0] - b.x) <= b.half_w and abs(base_xyz[1] - b.y) <= b.half_w
+                    and base_xyz[2] < b.rim_z):
+                return b
+        return None
+
+    def _log_landing(self, i: int, base) -> None:
+        tag = f"{self._box_class[i] or 'box'} #{self._box_serial[i]}"
+        hit = self._bin_at(base)
+        if hit is not None:
+            self.bin_hits[hit.name] += 1
+            print(f"[sim] {tag} landed IN bin '{hit.name}' "
+                  f"({base[0]:+.2f}, {base[1]:+.2f})  hits={self.bin_hits}", flush=True)
+            return
+        self.bin_misses += 1
+        near = ""
+        if self.bins:
+            b = min(self.bins, key=lambda b: math.hypot(base[0] - b.x, base[1] - b.y))
+            near = f"  nearest '{b.name}' d={math.hypot(base[0] - b.x, base[1] - b.y):.2f}m"
+        print(f"[sim] {tag} MISSED ({base[0]:+.2f}, {base[1]:+.2f}){near}  "
+              f"misses={self.bin_misses}", flush=True)
+
     def _recycle_boxes(self) -> None:
-        """Retire boxes off the belt end / on the floor; flag ones knocked off."""
+        """Retire boxes off the belt end / on the floor; flag ones knocked off.
+
+        Loose boxes (thrown / pushed) are recycled once they come down — on
+        the floor (miss) or at the bottom of a bin (hit) — and logged.
+        """
         off_belt = self._base_p[2] + self.cfg.grasp_z - 0.05
         fallen = self._base_p[2] - 0.4   # ~floor level, world z
+        bin_bottom = 2 * _BIN_FLOOR_Z + BOX_HALF_Z + 0.03   # resting on a bin floor
         for i, jnt in enumerate(self._box_joints):
             if self._box_state[i] in (self._FREE, self._GRABBED):
                 continue
             world = jnt.qpos[0:3]
             base = self._to_base(world)
-            if base[1] < self.cfg.despawn_y or world[2] < fallen or abs(base[0]) > 1.6:
+            loose = self._box_state[i] == self._LOOSE
+            in_bin = loose and self._bin_at(base) is not None
+            gone = (base[1] < self.cfg.despawn_y or abs(base[0]) > 1.6
+                    or (world[2] < bin_bottom if in_bin else world[2] < fallen))
+            if gone:
+                if loose:
+                    self._log_landing(i, base)
                 jnt.qpos[0:3] = _PARK
                 jnt.qvel[:] = 0.0
                 self._box_state[i] = self._FREE

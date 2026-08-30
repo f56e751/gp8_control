@@ -141,8 +141,13 @@ class GP8App:
         if self.cfg.BACKEND == "mujoco":
             from gp8_control.backends.mujoco_sim import (   # needs mujoco>=3.1
                 MujocoRobotBackend, MujocoWorldSource, SimConfig, SimCore,
+                bins_from_config,
             )
-            core = SimCore(SimConfig(grasp_z=self.cfg.GRASP_Z))
+            # Bins at THIS config's throw goal / push targets (env + launch
+            # overrides included), so sim landings are judged where the real
+            # bins stand.
+            core = SimCore(SimConfig(grasp_z=self.cfg.GRASP_Z,
+                                     bins=bins_from_config(self.cfg)))
             core.start()
             self.traj_ctrl = MujocoRobotBackend(core)
             self.world = MujocoWorldSource(core)
