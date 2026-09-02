@@ -21,6 +21,7 @@ setup(
         f"{package_name}.tracking",
         f"{package_name}.planning",
         f"{package_name}.skills",
+        f"{package_name}.rl",
         f"{package_name}.tests",
     ],
     package_dir={
@@ -37,6 +38,7 @@ setup(
         f"{package_name}.tracking": "tracking",
         f"{package_name}.planning": "planning",
         f"{package_name}.skills": "skills",
+        f"{package_name}.rl": "rl",
         f"{package_name}.tests": "tests",
     },
     data_files=[

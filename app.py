@@ -283,6 +283,7 @@ class GP8App:
             # the selector's skills map) so the intercept solver can use its timeline.
             skill_obj_for=lambda obj: self.selector.skills[self.selector.skill_for(obj)],
             idle_joint=idle_joint,
+            ok=rclpy.ok,
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)

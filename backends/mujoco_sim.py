@@ -221,6 +221,29 @@ _FALLBACK_BINS = (
     SimBin("push_metal", "push", 0.80, 0.60, 0.0),
 )
 
+CLASS_BIN_BY_OBJECT_CLASS = {
+    "transparent": "throw",
+    "metal": "push_metal",
+}
+
+
+def class_bin_name_for(class_name: str) -> str | None:
+    """Correct sorting bin for an object class in the v1 RL objective."""
+    return CLASS_BIN_BY_OBJECT_CLASS.get(str(class_name))
+
+
+def resolved_object_reward(
+    *,
+    manipulated: bool,
+    actual_bin_name: str | None,
+    class_bin_name: str | None,
+    collateral: bool,
+) -> float:
+    """Sparse resolved-object reward, matching the old env's outcome shape."""
+    if manipulated:
+        return 1.0 if actual_bin_name is not None and actual_bin_name == class_bin_name else -0.3
+    return -0.3 if collateral else 0.0
+
 
 def bins_from_config(cfg=None) -> tuple:
     """Bins matching the REAL setup, derived from the app's own targets:
@@ -609,6 +632,10 @@ class SimCore:
         self._box_state = [self._FREE] * len(BOX_JOINTS)
         self._box_class = [""] * len(BOX_JOINTS)
         self._box_serial = [0] * len(BOX_JOINTS)   # spawn number, for the landing log
+        self._box_manipulated = [False] * len(BOX_JOINTS)
+        self._box_manipulated_skill: list[str | None] = [None] * len(BOX_JOINTS)
+        self._box_class_bin_name: list[str | None] = [None] * len(BOX_JOINTS)
+        self._reward_events: list[dict] = []
         # Kinematic along-belt coordinate per ON_BELT box (world Y): contact
         # friction during a step brakes a purely velocity-asserted box (~0.10
         # realized vs 0.12 commanded), which would desync the boxes from the
@@ -666,6 +693,44 @@ class SimCore:
 
     def bind_backend(self, backend: "MujocoRobotBackend") -> None:
         self._backend = backend
+
+    def mark_manipulated(
+        self,
+        sim_object_id: int | None,
+        skill_name: str,
+        class_bin_name: str | None,
+    ) -> bool:
+        """Mark the sim box corresponding to a committed control target."""
+        if sim_object_id is None:
+            return False
+        with self.lock:
+            for i, serial in enumerate(self._box_serial):
+                if int(serial) != int(sim_object_id):
+                    continue
+                if self._box_state[i] == self._FREE:
+                    return False
+                self._box_manipulated[i] = True
+                self._box_manipulated_skill[i] = str(skill_name)
+                self._box_class_bin_name[i] = class_bin_name
+                return True
+        return False
+
+    def is_object_live(self, sim_object_id: int | None) -> bool:
+        """Whether a sim object id still refers to an active physical box."""
+        if sim_object_id is None:
+            return False
+        with self.lock:
+            for i, serial in enumerate(self._box_serial):
+                if int(serial) == int(sim_object_id):
+                    return self._box_state[i] != self._FREE
+        return False
+
+    def pop_reward_events(self) -> list[dict]:
+        """Return and clear resolved-object reward events."""
+        with self.lock:
+            events = list(self._reward_events)
+            self._reward_events.clear()
+        return events
 
     # ------------------------------------------------------------------
     # RobotBackend hooks (called from the app/skill thread)
@@ -796,6 +861,9 @@ class SimCore:
         self.model.geom_rgba[self._box_geom_ids[idx]] = _CLASS_RGBA.get(cls, _DEFAULT_RGBA)
         self._spawn_count += 1
         self._box_serial[idx] = self._spawn_count
+        self._box_manipulated[idx] = False
+        self._box_manipulated_skill[idx] = None
+        self._box_class_bin_name[idx] = None
 
     def _park_box(self, i: int) -> None:
         """Retire box i: collisions off, gravity compensated, stashed below the floor."""
@@ -810,6 +878,9 @@ class SimCore:
         self.model.body_gravcomp[self._box_body_ids[i]] = 1.0
         self._box_state[i] = self._FREE
         self._box_class[i] = ""
+        self._box_manipulated[i] = False
+        self._box_manipulated_skill[i] = None
+        self._box_class_bin_name[i] = None
 
     def _activate_box(self, i: int) -> None:
         """Re-enable a parked box's collisions/gravity before placing it."""
@@ -852,14 +923,14 @@ class SimCore:
                 return b
         return None
 
-    def _log_landing(self, i: int, base) -> None:
+    def _log_landing(self, i: int, base) -> str | None:
         tag = f"{self._box_class[i] or 'box'} #{self._box_serial[i]}"
         hit = self._bin_at(base)
         if hit is not None:
             self.bin_hits[hit.name] += 1
             print(f"[sim] {tag} landed IN bin '{hit.name}' "
                   f"({base[0]:+.2f}, {base[1]:+.2f})  hits={self.bin_hits}", flush=True)
-            return
+            return hit.name
         self.bin_misses += 1
         near = ""
         if self.bins:
@@ -867,6 +938,34 @@ class SimCore:
             near = f"  nearest '{b.name}' d={math.hypot(base[0] - b.x, base[1] - b.y):.2f}m"
         print(f"[sim] {tag} MISSED ({base[0]:+.2f}, {base[1]:+.2f}){near}  "
               f"misses={self.bin_misses}", flush=True)
+        return None
+
+    def _emit_reward_event(self, i: int, base, actual_bin_name: str | None,
+                           collateral: bool) -> None:
+        class_name = self._box_class[i]
+        manipulated = bool(self._box_manipulated[i])
+        class_bin_name = (
+            self._box_class_bin_name[i]
+            if self._box_class_bin_name[i] is not None
+            else class_bin_name_for(class_name)
+        )
+        reward = resolved_object_reward(
+            manipulated=manipulated,
+            actual_bin_name=actual_bin_name,
+            class_bin_name=class_bin_name,
+            collateral=collateral,
+        )
+        self._reward_events.append({
+            "sim_object_id": int(self._box_serial[i]),
+            "class_name": class_name,
+            "manipulated": manipulated,
+            "manipulated_skill": self._box_manipulated_skill[i],
+            "class_bin_name": class_bin_name,
+            "actual_bin_name": actual_bin_name,
+            "reward": reward,
+            "base_xyz": [float(base[0]), float(base[1]), float(base[2])],
+            "collateral": bool(collateral),
+        })
 
     def _recycle_boxes(self) -> None:
         """Retire boxes off the belt end / on the floor; flag ones knocked off.
@@ -887,8 +986,11 @@ class SimCore:
             gone = (base[1] < self.cfg.despawn_y or abs(base[0]) > 1.6
                     or (world[2] < bin_bottom if in_bin else world[2] < fallen))
             if gone:
+                actual_bin_name = None
                 if loose:
-                    self._log_landing(i, base)
+                    actual_bin_name = self._log_landing(i, base)
+                collateral = loose and not self._box_manipulated[i]
+                self._emit_reward_event(i, base, actual_bin_name, collateral)
                 self._park_box(i)
             elif self._box_state[i] == self._ON_BELT and world[2] < off_belt:
                 self._box_state[i] = self._LOOSE   # pushed / knocked off the belt
@@ -935,6 +1037,7 @@ class SimCore:
             dets.append({
                 "class": self._box_class[i],
                 "confidence": 0.9,
+                "sim_object_id": int(self._box_serial[i]),
                 "cam": [float(cx), float(cy), 0.0],
                 "cam_bbox": cam_bbox.tolist(),
                 "base_grasp": [x_base, y_base, ref_z + offset_grasp],

@@ -211,6 +211,7 @@ class DetectionIntake:
                 cam_bbox=d.get("cam_bbox"),
                 base_bbox_grasp=d.get("base_bbox_grasp"),
                 base_bbox_aim=d.get("base_bbox_aim"),
+                sim_object_id=d.get("sim_object_id"),
             ))
 
         def _reanchor(match: TrackedObject, dd: dict) -> None:
@@ -227,6 +228,8 @@ class DetectionIntake:
             match.cam_bbox = _freeze_bbox(dd["cam_bbox"])
             match.base_bbox_grasp = _freeze_bbox(dd["base_bbox_grasp"])
             match.base_bbox_aim = _freeze_bbox(dd["base_bbox_aim"])
+            if dd.get("sim_object_id") is not None:
+                match.sim_object_id = int(dd["sim_object_id"])
             match.bbox_encoder_distance_m = belt_distance_m
             match.bbox_detect_time = detect_time
             match.conf = dd["conf"]
@@ -282,6 +285,10 @@ class DetectionIntake:
                 bbox_encoder_distance_m=belt_distance_m,
                 bbox_detect_time=detect_time,
                 conf=dd["conf"],
+                sim_object_id=(
+                    None if dd.get("sim_object_id") is None
+                    else int(dd["sim_object_id"])
+                ),
             )
             # Seed the class vote with the spawn frame's confidence so a confident
             # spawn class isn't flipped by one stray frame, but a low-confidence one

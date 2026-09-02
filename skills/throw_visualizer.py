@@ -12,9 +12,14 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
-from geometry_msgs.msg import Point
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from visualization_msgs.msg import Marker, MarkerArray
+try:
+    from geometry_msgs.msg import Point
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    from visualization_msgs.msg import Marker, MarkerArray
+except ImportError:
+    Point = None
+    DurabilityPolicy = QoSProfile = ReliabilityPolicy = None
+    Marker = MarkerArray = None
 
 
 GRAVITY = 9.81
@@ -105,10 +110,16 @@ class ThrowVisualizer:
         self._goal_radius = float(goal_radius)
         if self._goal_radius <= 0.0:
             raise ValueError("throw goal radius must be positive")
-        qos = QoSProfile(depth=1)
-        qos.reliability = ReliabilityPolicy.RELIABLE
-        qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        self._publisher = node.create_publisher(MarkerArray, self.TOPIC, qos)
+        self._publisher = None
+        if (
+            MarkerArray is not None
+            and QoSProfile is not None
+            and hasattr(node, "create_publisher")
+        ):
+            qos = QoSProfile(depth=1)
+            qos.reliability = ReliabilityPolicy.RELIABLE
+            qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+            self._publisher = node.create_publisher(MarkerArray, self.TOPIC, qos)
 
     def set_goal(self, goal_xy, goal_radius: float) -> None:
         """Set this throw cycle's selected bin for preview and evaluation."""
@@ -120,11 +131,15 @@ class ThrowVisualizer:
 
     @staticmethod
     def _point(xyz) -> Point:
+        if Point is None:
+            raise RuntimeError("ROS marker messages are unavailable")
         point = Point()
         point.x, point.y, point.z = map(float, xyz)
         return point
 
     def _marker(self, marker_id: int, namespace: str, marker_type: int) -> Marker:
+        if Marker is None:
+            raise RuntimeError("ROS marker messages are unavailable")
         marker = Marker()
         marker.header.frame_id = "base_link"
         marker.header.stamp = self._node.get_clock().now().to_msg()
@@ -241,6 +256,9 @@ class ThrowVisualizer:
                 release_lead=float(release_lead),
                 recommended_release_lead=recommended_lead,
             )
+
+            if self._publisher is None or Marker is None or MarkerArray is None:
+                return evaluation
 
             delete_all = Marker()
             delete_all.action = Marker.DELETEALL

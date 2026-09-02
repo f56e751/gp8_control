@@ -51,6 +51,10 @@ class TrackedObject:
     # Stable id assigned at creation and KEPT across re-anchors, so logs can
     # follow this track and spot duplicates. Diagnostic only (not used for logic).
     track_id: int = field(default_factory=lambda: next(_track_id_counter))
+    # Optional simulator identity. Real camera detections do not provide this;
+    # the MuJoCo world source does, so RL reward bookkeeping can attribute a
+    # tracked object back to the physical sim box that later resolves.
+    sim_object_id: int | None = None
     # Confidence-weighted class-vote tally {class_name: cumulative_weight}. The
     # class is NOT latched at spawn — the first frame is often the noisy entry-edge
     # frame, so a PET whose spawn misfired as "metal" would otherwise be routed to

@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
-import rclpy
+try:
+    import rclpy
+except ImportError:  # Allows the MuJoCo/RL path to reuse skills without ROS.
+    rclpy = None
 
 from gp8_control.trajectory.trajectory_primitive import (
     trajectory,
@@ -113,10 +116,19 @@ class SkillContext:
     # motion) keeps the return folded into each skill's single chained trajectory,
     # so no extra dispatch (which would chop the swing).
     idle_joint: np.ndarray
+    ok: Callable[[], bool] | None = None
+    chain_target_override: Callable[
+        [np.ndarray, float], "Optional[tuple[np.ndarray, TrackedObject]]"
+    ] | None = None
 
     @property
     def log(self):
         return self.node.get_logger()
+
+    def is_ok(self) -> bool:
+        if self.ok is not None:
+            return bool(self.ok())
+        return True if rclpy is None else bool(rclpy.ok())
 
     # ------------------------------------------------------------------
     # Shared motion / timing primitives
@@ -364,7 +376,7 @@ class SkillContext:
         arrive on the belt during the wait are invisible to app.py until the
         current cycle's throw completes (~10 s later), often too late to catch.
         """
-        while rclpy.ok() and time.time() < deadline:
+        while self.is_ok() and time.time() < deadline:
             self.publish_state()
             now = time.time()
             self.intake(now)
@@ -579,6 +591,8 @@ class SkillContext:
         closer pose, so the handoff stays stateless (no committed/prepositioned/skip_move).
         Candidates the skill's ``placement_veto`` refuses are skipped, mirroring the
         selection walk — the chain never parks at a backswing that won't be swung."""
+        if self.chain_target_override is not None:
+            return self.chain_target_override(from_joint, action_time)
         now = time.time()
         v = self.conveyor.current if self.conveyor is not None else 0.0
         # No queue.update() here — earliest_reachable_intercept computes each object's
