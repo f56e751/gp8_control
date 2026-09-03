@@ -18,7 +18,8 @@ except ImportError:
         spaces = None
 
 from gp8_control.config import Config
-from gp8_control.rl.sim_runner import ACTION_THROW, SKILL_NAMES, SimRlRunner
+from gp8_control.rl.common import ACTION_THROW, SKILL_NAMES, observation_width
+from gp8_control.rl.sim_runner import SimRlRunner
 
 
 class GP8RecyclingEnv(gym.Env if gym is not None else object):
@@ -42,12 +43,10 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
         self.cfg = cfg
         self._runner: SimRlRunner | None = None
         self._step_count = 0
-        per_object_width = 9 if self.include_eta else 7
-        obs_width = self.max_objects * per_object_width + 6 + 3 + 3
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(obs_width,),
+            shape=(observation_width(self.max_objects, self.include_eta),),
             dtype=np.float32,
         )
         self.action_space = spaces.MultiDiscrete([self.max_objects + 1, len(SKILL_NAMES)])

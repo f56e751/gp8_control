@@ -62,6 +62,7 @@ setup(
     entry_points={
         "console_scripts": [
             "gp8_app = gp8_control.app:main",
+            "gp8_real_rl = gp8_control.rl.real_runner:main",
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",
             "terminal_debug = gp8_control.terminal_debug:main",

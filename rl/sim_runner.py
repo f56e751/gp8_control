@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import time
-from typing import Optional
 
 import numpy as np
 
@@ -22,6 +20,16 @@ from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.planning import PickThrowPlanner
 from gp8_control.planning.action_selector import ActionSelector
 from gp8_control.robots.gp8 import GP8
+from gp8_control.rl.common import (
+    ACTION_PUSH,
+    ACTION_THROW,
+    SKILL_NAMES,
+    HighLevelAction,
+    build_observation,
+    bbox_size,
+    class_id,
+    skip_action,
+)
 from gp8_control.skills.base import SkillResult
 from gp8_control.skills import PickRequest, PushSkill, SkillContext, ThrowSkill
 from gp8_control.skills.push_skill import (
@@ -34,19 +42,6 @@ from gp8_control.skills.push_skill import (
 from gp8_control.tracking import FrameGate, TrackedObject, TrackedObjectQueue
 from gp8_control.trajectory.predictor import TrajectoryPredictor
 from gp8_control.trajectory.trajectory_primitive import trajectory
-
-
-ACTION_THROW = 0
-ACTION_PUSH = 1
-SKILL_NAMES = ("throw", "push")
-
-
-@dataclass(frozen=True)
-class HighLevelAction:
-    """One-step-ahead action stored by object identity, not transient slot order."""
-
-    target: Optional[TrackedObject]
-    skill_name: str
 
 
 class _Logger:
@@ -331,55 +326,25 @@ class SimRlRunner:
             skill_index = SKILL_NAMES.index(skill_name)
             if mask[slot, skill_index]:
                 return np.array([slot, skill_index], dtype=int)
-        return np.array([self.max_objects, ACTION_THROW], dtype=int)
+        return skip_action(self.max_objects)
 
     def observation(self, include_eta: bool | None = None) -> np.ndarray:
         include_eta = self.include_eta if include_eta is None else bool(include_eta)
         now = time.time()
         current_joint = self.current_joints()
-        joints = (
-            np.zeros(6, dtype=np.float32)
-            if current_joint is None
-            else np.asarray(current_joint, dtype=np.float32)[:6]
+        return build_observation(
+            objects=self.ordered_objects(),
+            max_objects=self.max_objects,
+            include_eta=include_eta,
+            joints=current_joint,
+            ee_xyz=self.ee_xyz(current_joint),
+            pending_indices=self._pending_indices(),
+            belt_speed=self.conveyor.current,
+            y_now_for=lambda target: self.ctx.object_y_now(
+                target, now, self.conveyor.current
+            ),
+            etas_for=lambda target: self._etas_for(target, current_joint, now),
         )
-        ee_xyz = self.ee_xyz(joints)
-        features: list[float] = []
-        for target in self.ordered_objects():
-            y_now = self.ctx.object_y_now(target, now, self.conveyor.current)
-            bbox_w, bbox_h = self._bbox_size(target, now)
-            row = [
-                float(target.T_grasp_base[0, 3]),
-                float(y_now),
-                float(target.T_grasp_base[2, 3]),
-                float(self._class_id(target.class_name)),
-                float(target.conf),
-                float(bbox_w),
-                float(bbox_h),
-            ]
-            if include_eta:
-                row.extend(self._etas_for(target, current_joint, now))
-            features.extend(row)
-        per_object_width = 9 if include_eta else 7
-        missing = self.max_objects - len(self.ordered_objects())
-        if missing > 0:
-            empty_row = [-1.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0]
-            if include_eta:
-                empty_row.extend([-1.0, -1.0])
-            features.extend(empty_row * missing)
-
-        pending_slot, pending_skill = self._pending_indices()
-        globals_ = [
-            *joints.tolist(),
-            *ee_xyz.tolist(),
-            float(pending_slot),
-            float(pending_skill),
-            float(self.conveyor.current),
-        ]
-        obs = np.asarray(features + globals_, dtype=np.float32)
-        expected = self.max_objects * per_object_width + 6 + 3 + 3
-        if obs.size != expected:
-            raise RuntimeError(f"observation width mismatch {obs.size} != {expected}")
-        return obs
 
     def current_joints(self) -> np.ndarray | None:
         if self.traj_ctrl.current_joints is None:
@@ -686,18 +651,9 @@ class SimRlRunner:
         ]
 
     def _bbox_size(self, target: TrackedObject, now: float) -> tuple[float, float]:
-        bbox = target.base_bbox_grasp
-        if not bbox:
-            return 0.0, 0.0
-        points = np.asarray(bbox, dtype=float)
-        if points.ndim != 2 or points.shape[1] < 2:
-            return 0.0, 0.0
-        return (
-            float(np.max(points[:, 0]) - np.min(points[:, 0])),
-            float(np.max(points[:, 1]) - np.min(points[:, 1])),
-        )
+        del now
+        return bbox_size(target)
 
     @staticmethod
     def _class_id(class_name: str) -> int:
-        mapping = {"metal": 0, "transparent": 1, "cardboard": 2}
-        return mapping.get(str(class_name), -1)
+        return class_id(class_name)

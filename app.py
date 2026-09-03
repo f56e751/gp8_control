@@ -102,6 +102,7 @@ class GP8App:
         self.throw_skill: ThrowSkill | None = None
         self.push_skill: PushSkill | None = None
         self.selector: ActionSelector | None = None
+        self.rl_shadow = None
 
         # Coarse drop: only when an object's extrapolated y has fallen below the
         # WORST-CASE downstream reach edge (-MAX_REACH, the centerline lane). The
@@ -330,6 +331,13 @@ class GP8App:
             by_class=self.cfg.SKILL_BY_CLASS,
             force=force,
         )
+        from gp8_control.rl.real_shadow import RealShadowRl
+        self.rl_shadow = RealShadowRl.from_env(self)
+        if self.rl_shadow is not None:
+            self._node.get_logger().info(
+                "RL shadow logging enabled; policy actions are read-only; "
+                f"log={self.rl_shadow.log_path}"
+            )
 
     def _enable_robot(self) -> None:
         """Ready the robot for motion (one-time; a no-op on the adv4ncr stream backend)."""
@@ -638,6 +646,14 @@ class GP8App:
             time.sleep(self.cfg.TIME_STEP)
             return
 
+        rl_shadow_record = None
+        if self.rl_shadow is not None:
+            try:
+                rl_shadow_record = self.rl_shadow.snapshot()
+                rl_shadow_record["epoch"] = int(epoch)
+            except Exception as e:
+                self._node.get_logger().warn(f"RL shadow snapshot failed: {e}")
+
         request = self._select_ambush_target(now, current_joint)
         if request is not None:
             # Decide push vs throw (rule-based today; RL later) and run it.
@@ -649,11 +665,33 @@ class GP8App:
                 f"Route id={request.target.track_id} {request.target.class_name} "
                 f"(conf {request.target.conf:.2f}) -> {skill.name}"
             )
+            if self.rl_shadow is not None:
+                try:
+                    if rl_shadow_record is None:
+                        rl_shadow_record = {"epoch": int(epoch), "ts": time.time()}
+                    self.rl_shadow.attach_app_selection(
+                        rl_shadow_record,
+                        selected_request=request,
+                        selected_skill=skill,
+                    )
+                    self.rl_shadow.write_record(rl_shadow_record)
+                except Exception as e:
+                    self._node.get_logger().warn(
+                        f"RL shadow selected-action log failed: {e}"
+                    )
             # Tag this cycle's queued commands with the skill (push/throw) for the
             # diagnostic motion CSV (no-op unless GP8_MOTION_LOG_DIR is set).
             self.traj_ctrl.set_motion_op(skill.name)
             skill.execute(request)
         else:
+            if self.rl_shadow is not None and rl_shadow_record is not None:
+                try:
+                    self.rl_shadow.attach_app_selection(rl_shadow_record)
+                    self.rl_shadow.write_record(rl_shadow_record)
+                except Exception as e:
+                    self._node.get_logger().warn(
+                        f"RL shadow idle-action log failed: {e}"
+                    )
             # Queue non-empty but nothing selectable (e.g. every object vetoed):
             # without this the epoch loop would re-run the intercept solver at
             # ~kHz until the vetoed objects reach the drop line.
@@ -683,6 +721,11 @@ class GP8App:
                 self.traj_ctrl.close()
             except Exception as e:
                 self._node.get_logger().warn(f"backend close failed: {e}")
+            try:
+                if self.rl_shadow is not None:
+                    self.rl_shadow.close()
+            except Exception as e:
+                self._node.get_logger().warn(f"RL shadow close failed: {e}")
             # Stop the background spinner before tearing down the node so spin()
             # returns and its daemon thread exits cleanly.
             if self._executor is not None:
