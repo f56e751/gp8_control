@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -18,6 +17,7 @@ from gp8_control.trajectory.trajectory_primitive import (
     decimate_for_queue,
     opt_time,
 )
+from gp8_control.utils.clock import Clock, WALL_CLOCK
 
 if TYPE_CHECKING:
     from rclpy.node import Node
@@ -120,6 +120,7 @@ class SkillContext:
     chain_target_override: Callable[
         [np.ndarray, float], "Optional[tuple[np.ndarray, TrackedObject]]"
     ] | None = None
+    clock: Clock = WALL_CLOCK
 
     @property
     def log(self):
@@ -153,7 +154,7 @@ class SkillContext:
         symptom. ``age`` is how long the object has been dead-reckoned since its last
         detection (large for 2nd+ objects that coasted through the previous cycle).
         Called by each skill right before it commits (throw lift / push stroke)."""
-        now = time.time()
+        now = self.clock.time()
         v = self.conveyor.current if self.conveyor is not None else 0.0
         obj_y = self.object_y_now(target, now, v)
         delta = obj_y - intercept_y
@@ -363,9 +364,9 @@ class SkillContext:
         # DIAGNOSTIC: wall-clock positioning duration (this call blocks for the
         # whole move). Push's wait_for_arrival re-checks arrival AFTER this, so a
         # long positioning here is what makes the stroke land behind the object.
-        _t_pos0 = time.time()
+        _t_pos0 = self.clock.time()
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
-        self.log.info(f"[positioning] move_through_via {time.time() - _t_pos0:.2f}s")
+        self.log.info(f"[positioning] move_through_via {self.clock.time() - _t_pos0:.2f}s")
 
     def sleep_until(self, deadline: float) -> None:
         """Block until ``deadline`` (wall clock), staying responsive to shutdown.
@@ -376,9 +377,9 @@ class SkillContext:
         arrive on the belt during the wait are invisible to app.py until the
         current cycle's throw completes (~10 s later), often too late to catch.
         """
-        while self.is_ok() and time.time() < deadline:
+        while self.is_ok() and self.clock.time() < deadline:
             self.publish_state()
-            now = time.time()
+            now = self.clock.time()
             self.intake(now)
             if self.queue is not None:
                 self.queue.update(
@@ -395,7 +396,15 @@ class SkillContext:
             # negative -> time.sleep() would raise "sleep length must be
             # non-negative" and kill the epoch mid-wait (arm parked, no
             # suction/throw). max(0.0, ...) lets the while-guard exit instead.
-            time.sleep(max(0.0, min(0.05, deadline - time.time())))
+            poll_interval = 0.05
+            fast_poll = getattr(self.traj_ctrl, "fast_wait_poll_interval", None)
+            if callable(fast_poll):
+                poll_interval = float(fast_poll() or poll_interval)
+            dt = max(0.0, min(poll_interval, deadline - self.clock.time()))
+            fast_wait = getattr(self.traj_ctrl, "fast_wait", None)
+            if callable(fast_wait) and fast_wait(dt):
+                continue
+            self.clock.sleep(dt)
 
     def wait_for_arrival_and_suction(
         self, target: "TrackedObject", intercept_y: float
@@ -408,7 +417,7 @@ class SkillContext:
         eta is computed once here from remaining distance / belt speed sampled
         now (no per-tick recompute). Assumes a roughly steady belt.
         """
-        now = time.time()
+        now = self.clock.time()
         v = self.conveyor.current
         obj_y = self.object_y_now(target, now, v)
         eta = (obj_y - intercept_y) / (v + 1e-6)
@@ -437,7 +446,7 @@ class SkillContext:
         eta is computed once here from remaining distance / belt speed sampled
         now (no per-tick recompute). Assumes a roughly steady belt.
         """
-        now = time.time()
+        now = self.clock.time()
         v = self.conveyor.current
         obj_y = self.object_y_now(target, now, v)
         eta = (obj_y - intercept_y) / (v + 1e-6)
@@ -493,7 +502,7 @@ class SkillContext:
         vacuum in air for ~SUCTION_LEAD before the descend starts (a stationary
         suction-on gap). That caller fires suction as the descend begins instead.
         """
-        now = time.time()
+        now = self.clock.time()
         v = self.conveyor.current
         obj_y = self.object_y_now(target, now, v)
         eta = max(0.0, min((obj_y - intercept_y) / (v + 1e-6), self.cfg.AMBUSH_MAX_WAIT))
@@ -512,9 +521,9 @@ class SkillContext:
             current_joint, zero, grasp_joint, zero,
             self.M1, self.M2, hertz=self.cfg.TRAJ_HZ,
         )
-        _t_pos0 = time.time()
+        _t_pos0 = self.clock.time()
         self.traj_ctrl.send_trajectory_queue(traj, vel, ts, final_joint=grasp_joint)
-        _pos_dur = time.time() - _t_pos0
+        _pos_dur = self.clock.time() - _t_pos0
         # DIAGNOSTIC: did positioning finish before the object reaches the intercept?
         # If it exceeds eta, the object arrives before the cup parks and the pick
         # lands behind it (the throughput-limited case).
@@ -540,7 +549,7 @@ class SkillContext:
         #    gap). That caller instead fires suction AS the descend begins.
         self.set_status("WAITING", getattr(target, "class_name", ""))
         if prime_suction:
-            t_suction = max(time.time(), t_arrival - self.cfg.SUCTION_LEAD)
+            t_suction = max(self.clock.time(), t_arrival - self.cfg.SUCTION_LEAD)
             self.sleep_until(t_suction)
             self.traj_ctrl.suction_on()
             # DIAGNOSTIC: object's calculated position vs the EE's actual position at
@@ -593,7 +602,7 @@ class SkillContext:
         selection walk — the chain never parks at a backswing that won't be swung."""
         if self.chain_target_override is not None:
             return self.chain_target_override(from_joint, action_time)
-        now = time.time()
+        now = self.clock.time()
         v = self.conveyor.current if self.conveyor is not None else 0.0
         # No queue.update() here — earliest_reachable_intercept computes each object's
         # position from object_y_now itself, and mutating the queue mid-chain (pruning)

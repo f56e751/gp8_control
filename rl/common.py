@@ -13,6 +13,9 @@ from gp8_control.tracking import TrackedObject
 ACTION_THROW = 0
 ACTION_PUSH = 1
 SKILL_NAMES = ("throw", "push")
+BBOX_OBSERVATION_SIZE = "size"
+BBOX_OBSERVATION_CORNERS = "corners"
+BBOX_OBSERVATION_MODES = (BBOX_OBSERVATION_SIZE, BBOX_OBSERVATION_CORNERS)
 
 CLASS_IDS = {
     "metal": 0,
@@ -46,16 +49,60 @@ def bbox_size(target: TrackedObject) -> tuple[float, float]:
     )
 
 
-def empty_object_row(include_eta: bool) -> list[float]:
-    row = [-1.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0]
+def normalize_bbox_observation(mode: str | None) -> str:
+    value = (mode or BBOX_OBSERVATION_SIZE).strip().lower()
+    if value not in BBOX_OBSERVATION_MODES:
+        raise ValueError(
+            f"bbox_observation must be one of {BBOX_OBSERVATION_MODES}, got {mode!r}"
+        )
+    return value
+
+
+def bbox_corners(target: TrackedObject) -> list[float]:
+    bbox = target.base_bbox_grasp
+    if not bbox:
+        return [0.0] * 8
+    points = np.asarray(bbox, dtype=float)
+    if points.shape != (4, 3) and points.shape != (4, 2):
+        return [0.0] * 8
+    return points[:, :2].astype(float).reshape(-1).tolist()
+
+
+def bbox_features(target: TrackedObject, bbox_observation: str) -> list[float]:
+    mode = normalize_bbox_observation(bbox_observation)
+    if mode == BBOX_OBSERVATION_CORNERS:
+        return bbox_corners(target)
+    bbox_w, bbox_h = bbox_size(target)
+    return [bbox_w, bbox_h]
+
+
+def empty_object_row(
+    include_eta: bool,
+    bbox_observation: str = BBOX_OBSERVATION_SIZE,
+) -> list[float]:
+    bbox_width = (
+        8
+        if normalize_bbox_observation(bbox_observation) == BBOX_OBSERVATION_CORNERS
+        else 2
+    )
+    row = [-1.0, -1.0, 0.0, -1.0, 0.0] + [0.0] * bbox_width
     if include_eta:
         row.extend([-1.0, -1.0])
     return row
 
 
-def observation_width(max_objects: int, include_eta: bool) -> int:
-    per_object_width = 9 if include_eta else 7
-    return int(max_objects) * per_object_width + 6 + 3 + 3
+def observation_width(
+    max_objects: int,
+    include_eta: bool,
+    bbox_observation: str = BBOX_OBSERVATION_SIZE,
+) -> int:
+    bbox_width = (
+        8
+        if normalize_bbox_observation(bbox_observation) == BBOX_OBSERVATION_CORNERS
+        else 2
+    )
+    per_object_width = 5 + bbox_width + (2 if include_eta else 0)
+    return int(max_objects) * per_object_width + 6 + 3 + 4
 
 
 def build_observation(
@@ -68,9 +115,12 @@ def build_observation(
     pending_indices: tuple[int, int],
     belt_speed: float,
     y_now_for,
+    remaining_time_frac: float = 1.0,
     etas_for=None,
+    bbox_observation: str = BBOX_OBSERVATION_SIZE,
 ) -> np.ndarray:
     """Encode the project-standard Gym-style observation vector."""
+    bbox_observation = normalize_bbox_observation(bbox_observation)
     joint_arr = (
         np.zeros(6, dtype=np.float32)
         if joints is None
@@ -83,15 +133,13 @@ def build_observation(
     features: list[float] = []
     limited = list(objects)[: int(max_objects)]
     for target in limited:
-        bbox_w, bbox_h = bbox_size(target)
         row = [
             float(target.T_grasp_base[0, 3]),
             float(y_now_for(target)),
             float(target.T_grasp_base[2, 3]),
             float(class_id(target.class_name)),
             float(target.conf),
-            float(bbox_w),
-            float(bbox_h),
+            *bbox_features(target, bbox_observation),
         ]
         if include_eta:
             row.extend(etas_for(target) if etas_for is not None else [-1.0, -1.0])
@@ -99,18 +147,20 @@ def build_observation(
 
     missing = int(max_objects) - len(limited)
     if missing > 0:
-        features.extend(empty_object_row(include_eta) * missing)
+        features.extend(empty_object_row(include_eta, bbox_observation) * missing)
 
     pending_slot, pending_skill = pending_indices
+    remaining = float(np.clip(float(remaining_time_frac), 0.0, 1.0))
     globals_ = [
         *joint_arr.tolist(),
         *ee_arr.tolist(),
         float(pending_slot),
         float(pending_skill),
         float(belt_speed),
+        remaining,
     ]
     obs = np.asarray(features + globals_, dtype=np.float32)
-    expected = observation_width(max_objects, include_eta)
+    expected = observation_width(max_objects, include_eta, bbox_observation)
     if obs.size != expected:
         raise RuntimeError(f"observation width mismatch {obs.size} != {expected}")
     return obs

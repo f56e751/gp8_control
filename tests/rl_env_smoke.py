@@ -15,7 +15,7 @@ def main(argv=None) -> int:
     env = GP8RecyclingEnv(max_objects=3, include_eta=False, max_steps=3)
     try:
         obs, info = env.reset(options={"startup_timeout": 4.0})
-        expected_obs = 3 * 7 + 6 + 3 + 3
+        expected_obs = 3 * 7 + 6 + 3 + 4
         checks = [
             ("obs shape", obs.shape == (expected_obs,)),
             ("mask shape", info["action_mask"].shape == (4, 2)),

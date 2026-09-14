@@ -210,10 +210,10 @@ class Config:
     # opening radius); these values affect planning direction/evaluation only,
     # never the robot's safety limits.
     THROW_GOAL_X: float = field(
-        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_X", "1.1"))
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_X", "0.85"))
     )
     THROW_GOAL_Y: float = field(
-        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_Y", "-0.25"))
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_Y", "0.0"))
     )
     THROW_GOAL_RADIUS: float = field(
         default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_RADIUS", "0.10"))

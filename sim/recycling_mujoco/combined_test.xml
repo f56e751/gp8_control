@@ -99,8 +99,8 @@
 
   <worldbody>
     <body name="belt" pos="-0.3 0.0 -0.07" euler="0 0 -1.57079632679">
-      <geom type="mesh" mesh="base_link1" />
-      <geom type="mesh" mesh="table_link" />
+      <geom type="mesh" mesh="base_link1" contype="0" conaffinity="0" />
+      <geom type="mesh" mesh="table_link" contype="0" conaffinity="0" />
       <!-- <geom type="mesh" mesh="wing_1" />
       <geom type="mesh" mesh="wing_2" />
       <geom type="mesh" mesh="cover_1" />
@@ -109,7 +109,6 @@
         <inertial pos="-0.3 0.25 0.0005" quat="0 0.707107 0 0.707107" mass="1.20269" diaginertia="0.04236 0.027888 0.014472" />
         <joint name="slider_joint" pos="0 0 0" axis="1 0 0" type="slide" range="0 5000" actuatorfrcrange="-5000 5000" />
         <!-- <geom name="belt_geom" type="mesh" friction="5 10 0.1" rgba="0.2 0.2 0.2 1" mesh="belt_link" /> -->
-        <geom name="belt_carrier_geom" type="box" pos="-494.6 0.665 0.615" size="500.0 0.215 0.035" friction="5 10 0.1" rgba="0.2 0.2 0.2 1" />
       </body>
     </body>
     <body name="yaskawa_robot" pos="-0.05 0.0 0.6">
@@ -299,18 +298,6 @@
   </worldbody>
 
   <contact>
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_2" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_3" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_4" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_5" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_6" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_7" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_8" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_9" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_10" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_11" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
-    <pair geom1="belt_carrier_geom" geom2="red_box_geom_12" friction="0.7 0.3 0.05" solref="0.002 1" solimp="0.99 0.999 0.001" />
     <pair
       geom1="red_box_geom"
         geom2="pusher_collision"

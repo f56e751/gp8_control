@@ -1,7 +1,8 @@
-"""Gymnasium wrapper for the real-time GP8 MuJoCo RL runner."""
+"""Gymnasium wrapper for the GP8 MuJoCo RL runner."""
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -18,12 +19,17 @@ except ImportError:
         spaces = None
 
 from gp8_control.config import Config
-from gp8_control.rl.common import ACTION_THROW, SKILL_NAMES, observation_width
+from gp8_control.rl.common import (
+    ACTION_THROW,
+    SKILL_NAMES,
+    normalize_bbox_observation,
+    observation_width,
+)
 from gp8_control.rl.sim_runner import SimRlRunner
 
 
 class GP8RecyclingEnv(gym.Env if gym is not None else object):
-    """Real-time high-level RL env using one-step-ahead actions."""
+    """High-level RL env using one-step-ahead actions."""
 
     metadata = {"render_modes": []}
 
@@ -33,20 +39,37 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
         max_objects: int = 6,
         include_eta: bool = False,
         max_steps: int = 200,
+        max_episode_seconds: float | None = 240.0,
         cfg: Config | None = None,
+        realtime: bool | None = None,
+        bbox_observation: str | None = None,
     ) -> None:
         if spaces is None:
             raise ImportError("GP8RecyclingEnv requires gymnasium or gym.")
         self.max_objects = int(max_objects)
         self.include_eta = bool(include_eta)
         self.max_steps = int(max_steps)
+        self.max_episode_seconds = (
+            None if max_episode_seconds is None else float(max_episode_seconds)
+        )
         self.cfg = cfg
+        self.realtime = realtime
+        self.bbox_observation = normalize_bbox_observation(
+            bbox_observation or os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
+        )
         self._runner: SimRlRunner | None = None
         self._step_count = 0
+        self._episode_start_time = 0.0
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(observation_width(self.max_objects, self.include_eta),),
+            shape=(
+                observation_width(
+                    self.max_objects,
+                    self.include_eta,
+                    self.bbox_observation,
+                ),
+            ),
             dtype=np.float32,
         )
         self.action_space = spaces.MultiDiscrete([self.max_objects + 1, len(SKILL_NAMES)])
@@ -67,11 +90,17 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
             cfg=self.cfg,
             max_objects=self.max_objects,
             include_eta=self.include_eta,
+            bbox_observation=self.bbox_observation,
+            sim_seed=seed,
+            realtime=self.realtime,
         )
         self._runner.start()
         self._step_count = 0
         self._wait_for_first_objects(float((options or {}).get("startup_timeout", 8.0)))
-        obs = self._runner.observation()
+        self._episode_start_time = self._runner.clock.time()
+        obs = self._runner.observation(
+            remaining_time_frac=self._remaining_time_frac()
+        )
         info = self._info(selected_action=None, selected_skill=None)
         return obs, info
 
@@ -86,14 +115,31 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
             if valid and object_slot < self.max_objects
             else None
         )
+        deadline = self._episode_deadline()
         reward, exec_info = self._runner.step(next_action)
         self._step_count += 1
         terminated = False
-        truncated = self._step_count >= self.max_steps
-        obs = self._runner.observation()
+        episode_sim_time = self._episode_sim_time()
+        step_limit_hit = self.max_steps > 0 and self._step_count >= self.max_steps
+        time_limit_hit = (
+            self.max_episode_seconds is not None
+            and episode_sim_time >= self.max_episode_seconds
+        )
+        truncated = bool(step_limit_hit or time_limit_hit)
+        obs = self._runner.observation(
+            remaining_time_frac=self._remaining_time_frac()
+        )
         info = self._info(selected_action=object_slot, selected_skill=skill_index)
         info.update(exec_info)
+        reward, late_reward = self._drop_late_reward_events(
+            float(reward),
+            info.get("reward_events", []),
+            deadline,
+        )
         info["action_valid"] = valid
+        info["truncated_by_steps"] = bool(step_limit_hit)
+        info["truncated_by_time"] = bool(time_limit_hit)
+        info["late_reward_dropped"] = float(late_reward)
         if not valid:
             info["invalid_action_treated_as"] = "skip"
         return obs, float(reward), terminated, truncated, info
@@ -121,19 +167,56 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
                 None if selected_skill is None else SKILL_NAMES[int(selected_skill)]
             ),
             "step_count": self._step_count,
+            "episode_sim_time": self._episode_sim_time(),
+            "max_episode_seconds": self.max_episode_seconds,
             "pending_action": self._runner._pending_indices(),
         }
 
+    def _episode_sim_time(self) -> float:
+        if self._runner is None:
+            return 0.0
+        return max(0.0, float(self._runner.clock.time()) - self._episode_start_time)
+
+    def _episode_deadline(self) -> float | None:
+        if self.max_episode_seconds is None:
+            return None
+        return self._episode_start_time + float(self.max_episode_seconds)
+
+    def _remaining_time_frac(self) -> float:
+        if self.max_episode_seconds is None or self.max_episode_seconds <= 0.0:
+            return 1.0
+        remaining = float(self.max_episode_seconds) - self._episode_sim_time()
+        return float(np.clip(remaining / float(self.max_episode_seconds), 0.0, 1.0))
+
+    @staticmethod
+    def _drop_late_reward_events(
+        reward: float,
+        reward_events: list[dict],
+        deadline: float | None,
+    ) -> tuple[float, float]:
+        if deadline is None:
+            return float(reward), 0.0
+        late = 0.0
+        for event in reward_events:
+            event_time = event.get("sim_time")
+            if event_time is None:
+                continue
+            if float(event_time) > deadline:
+                late += float(event.get("reward", 0.0))
+                event["late_for_episode"] = True
+            else:
+                event["late_for_episode"] = False
+        return float(reward) - late, late
+
     def _wait_for_first_objects(self, timeout_sec: float) -> None:
         assert self._runner is not None
-        import time
 
-        deadline = time.time() + max(0.0, timeout_sec)
-        while time.time() < deadline:
+        deadline = self._runner.clock.time() + max(0.0, timeout_sec)
+        while self._runner.clock.time() < deadline:
             self._runner.ingest()
             if self._runner.ordered_objects():
                 return
-            time.sleep(0.05)
+            self._runner.clock.sleep(0.05)
 
 
 def main() -> int:

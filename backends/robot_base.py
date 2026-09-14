@@ -48,11 +48,12 @@ call. This class only provides the mechanism; it bakes in no timing of its own.
 from __future__ import annotations
 
 import threading
-import time
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
 import numpy as np
+
+from gp8_control.utils.clock import Clock, WALL_CLOCK
 
 STREAM_HZ = 250.0
 STREAM_DT = 1.0 / STREAM_HZ   # 4 ms
@@ -79,7 +80,8 @@ class RobotBackend(ABC):
     the three abstract methods. Everything else is provided here.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
+        self.clock = clock or WALL_CLOCK
         # --- live state (the subclass keeps these fresh) ---------------------
         #: Latest measured joint positions [rad], GP8 order [S,L,U,R,B,T];
         #: ``None`` until the first sample arrives.
@@ -185,24 +187,24 @@ class RobotBackend(ABC):
             samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
 
         st = {"fired": False, "primed_next": False}
-        start = time.monotonic()      # pacing clock (monotonic)
-        wall_start = time.time()      # telemetry clock (wall) — last_throw must stay wall-clock (#3)
+        start = self.clock.monotonic()      # pacing clock (monotonic)
+        wall_start = self.clock.time()      # telemetry clock for this backend timeline
         for k in range(samples.shape[0]):
             if not self._ok():
                 break
             self._emit_sample(samples[k])
 
             if (t_release is not None and not st["fired"] and grid[k] >= t_release):
-                t_io = time.time()
+                t_io = self.clock.time()
                 self.suction_off()
                 st["fired"] = True
                 self.last_throw = {
                     "throw_start": wall_start, "release_wall": self.last_suction_off_t,
-                    "io_ms": (time.time() - t_io) * 1000.0,
+                    "io_ms": (self.clock.time() - t_io) * 1000.0,
                     "release_index": int(release_index), "n_waypoints": int(n_steps),
                 }
             elif (st["fired"] and suction_on_at is not None and not st["primed_next"]
-                  and time.time() >= suction_on_at):
+                  and self.clock.time() >= suction_on_at):
                 self.suction_on()
                 st["primed_next"] = True
             if tick_fn is not None:
@@ -216,26 +218,26 @@ class RobotBackend(ABC):
                     break
 
             # pace to the next 4 ms tick (drop no samples; sleep the remainder)
-            dt_sleep = (start + (k + 1) * STREAM_DT) - time.monotonic()
+            dt_sleep = (start + (k + 1) * STREAM_DT) - self.clock.monotonic()
             if dt_sleep > 0:
-                time.sleep(dt_sleep)
+                self.clock.sleep(dt_sleep)
         return st
 
     def _stream_hold(self, hold_joint, deadline_wall: float, tick_fn=None) -> None:
         """Keep emitting ``hold_joint`` at ~250 Hz until wall-clock ``deadline_wall``
         (feeds the servo during an ambush hold). tick_fn runs each cycle (e.g. prime suction)."""
         pose = [float(x) for x in hold_joint]
-        nxt = time.monotonic()
-        while time.time() < deadline_wall and self._ok():
+        nxt = self.clock.monotonic()
+        while self.clock.time() < deadline_wall and self._ok():
             self._emit_sample(pose)
             if tick_fn is not None:
                 tick_fn()
             nxt += STREAM_DT
-            dt_sleep = nxt - time.monotonic()
+            dt_sleep = nxt - self.clock.monotonic()
             if dt_sleep > 0:
-                time.sleep(dt_sleep)
+                self.clock.sleep(dt_sleep)
             else:
-                nxt = time.monotonic()
+                nxt = self.clock.monotonic()
 
     # ------------------------------------------------------------------
     # send_trajectory family (stream semantics; the hardware subclass
@@ -286,12 +288,12 @@ class RobotBackend(ABC):
         fired = {"v": False}
 
         def _tick() -> None:
-            if not fired["v"] and time.time() >= suction_on_at:
+            if not fired["v"] and self.clock.time() >= suction_on_at:
                 self.suction_on()
                 fired["v"] = True
 
         self._stream_trajectory(traj, vel, timestep, final_joint, tick_fn=_tick)
-        if not fired["v"] and time.time() >= suction_on_at:
+        if not fired["v"] and self.clock.time() >= suction_on_at:
             self.suction_on()
             fired["v"] = True
         return fired["v"]
@@ -361,18 +363,18 @@ class RobotBackend(ABC):
         """Block until the arm is within ``tolerance`` (max-abs) of ``target_joint``.
         (Private name kept — push_skill2 / push_skill_floor_gated call it.)"""
         target = [float(x) for x in target_joint]
-        t_end = time.time() + timeout_sec
-        while time.time() < t_end and self._ok():
+        t_end = self.clock.time() + timeout_sec
+        while self.clock.time() < t_end and self._ok():
             if self.current_joints is not None and _max_abs_diff(self.current_joints, target) <= tolerance:
                 return True
-            time.sleep(0.005)
+            self.clock.sleep(0.005)
         return False
 
     def _wait_trajectory_end(self, total_duration: float, t_start: float | None = None) -> None:
-        t0 = t_start if t_start is not None else time.time()
-        remaining = total_duration - (time.time() - t0)
+        t0 = t_start if t_start is not None else self.clock.time()
+        remaining = total_duration - (self.clock.time() - t0)
         if remaining > 0:
-            time.sleep(remaining)
+            self.clock.sleep(remaining)
 
     # ------------------------------------------------------------------
     # Suction — CONCRETE: coalescing + the telemetry every skill's
@@ -380,7 +382,7 @@ class RobotBackend(ABC):
     # ------------------------------------------------------------------
     def suction_on(self) -> None:
         """Request suction ON once; duplicate requested states are coalesced."""
-        requested_at = time.time()
+        requested_at = self.clock.time()
         with self._io_state_lock:
             if self._io_requested_value == 0:
                 return
@@ -396,7 +398,7 @@ class RobotBackend(ABC):
 
     def suction_off(self) -> None:
         """Request suction OFF once; duplicate requested states are coalesced."""
-        requested_at = time.time()
+        requested_at = self.clock.time()
         with self._io_state_lock:
             if self._io_requested_value == 1:
                 return

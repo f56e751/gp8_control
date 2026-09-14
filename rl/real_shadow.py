@@ -15,6 +15,7 @@ from gp8_control.rl.common import (
     SKILL_NAMES,
     action_summary,
     build_observation,
+    normalize_bbox_observation,
     skip_action,
 )
 
@@ -33,11 +34,15 @@ class RealShadowRl:
         *,
         max_objects: int = 6,
         include_eta: bool = False,
+        bbox_observation: str | None = None,
         log_path: str | None = None,
     ) -> None:
         self.app = app
         self.max_objects = int(max_objects)
         self.include_eta = bool(include_eta)
+        self.bbox_observation = normalize_bbox_observation(
+            bbox_observation or os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
+        )
         self._log_path = Path(log_path).expanduser() if log_path else None
         self._log_file = None
         if self._log_path is not None:
@@ -55,10 +60,12 @@ class RealShadowRl:
             "true",
             "yes",
         )
+        bbox_observation = os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
         return cls(
             app,
             max_objects=max_objects,
             include_eta=include_eta,
+            bbox_observation=bbox_observation,
             log_path=os.environ.get("GP8_RL_SHADOW_LOG") or "rl_shadow.jsonl",
         )
 
@@ -106,6 +113,7 @@ class RealShadowRl:
                 target, now, self.app.conveyor.current
             ),
             etas_for=lambda target: self._etas_for(target, joints, now),
+            bbox_observation=self.bbox_observation,
         )
 
     def action_mask(self) -> np.ndarray:

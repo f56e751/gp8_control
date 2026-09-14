@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import time
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -31,7 +30,10 @@ if TYPE_CHECKING:
 # class is in this map, T_aim2 is OVERRIDDEN with these coordinates so the
 # NN throw aims at a fixed bin location instead of secondary/T_aim hover.
 # Empty default — fill in with measured bin coords (e.g., from terminal_debug).
-THROW_BIN_TARGET_MAP: dict[str, tuple] = {}
+THROW_BIN_TARGET_MAP: dict[str, tuple] = {
+    "transparent": (0.85, 0.00, 0.0),
+    "metal":       (0.85, 0.60, 0.0),
+}
 
 
 class PickWaitMode(Enum):
@@ -413,13 +415,33 @@ class ThrowSkill(ManipulationSkill):
         # Lift + throw.
         ctx.set_status("THROWING", target.class_name)
 
-        if selected_bin is None:
-            goal_x = float(ctx.cfg.THROW_GOAL_X)
-            goal_y = float(ctx.cfg.THROW_GOAL_Y)
-            goal_radius = float(ctx.cfg.THROW_GOAL_RADIUS)
+        T_aim2 = None
+        if selected_bin is not None:
+            bin_name, bin_xyz, goal_radius = selected_bin
+            T_aim2 = np.eye(4)
+            T_aim2[:3, :3] = T_aim[:3, :3]
+            T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+            goal_x, goal_y = map(float, bin_xyz[:2])
+            ctx.log.info(
+                f"Throw target: selected bin {bin_name} "
+                f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
+            )
         else:
-            _, selected_xyz, goal_radius = selected_bin
-            goal_x, goal_y = map(float, selected_xyz[:2])
+            bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+            if bin_xyz is not None:
+                T_aim2 = np.eye(4)
+                T_aim2[:3, :3] = T_aim[:3, :3]
+                T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
+                goal_x, goal_y = map(float, bin_xyz[:2])
+                goal_radius = float(ctx.cfg.THROW_GOAL_RADIUS)
+                ctx.log.info(
+                    f"Throw target for {target.class_name}: fixed bin "
+                    f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
+                )
+            else:
+                goal_x = float(ctx.cfg.THROW_GOAL_X)
+                goal_y = float(ctx.cfg.THROW_GOAL_Y)
+                goal_radius = float(ctx.cfg.THROW_GOAL_RADIUS)
         model_distance = float(np.hypot(goal_x, goal_y))
         self._visualizer.set_goal((goal_x, goal_y), goal_radius)
 
@@ -457,31 +479,12 @@ class ThrowSkill(ManipulationSkill):
                     f"x={secondary.T_aim_base[0, 3]:+.3f}"
                 )
 
-        # A selected runtime bin behaves exactly like the existing fixed bin;
-        # without throw_bins, preserve the legacy per-class/fallback flow.
-        if selected_bin is not None:
-            bin_name, bin_xyz, _ = selected_bin
-            T_aim2 = np.eye(4)
-            T_aim2[:3, :3] = T_aim[:3, :3]
-            T_aim2[:3, 3] = bin_xyz
-            ctx.log.info(
-                f"Throw target: selected bin {bin_name} "
-                f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
+        # Without a fixed/selected class bin, preserve the legacy fallback that
+        # aims the throw arc at the next queued object when possible.
+        if T_aim2 is None:
+            T_aim2 = self.plan_throw_landing(
+                T_grasp, theta, T_aim, ctx.clock.time(), secondary,
             )
-        else:
-            bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
-            if bin_xyz is not None:
-                T_aim2 = np.eye(4)
-                T_aim2[:3, :3] = T_aim[:3, :3]
-                T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
-                ctx.log.info(
-                    f"Throw target for {target.class_name}: fixed bin "
-                    f"({bin_xyz[0]:+.3f}, {bin_xyz[1]:+.3f}, {bin_xyz[2]:+.3f}) m"
-                )
-            else:
-                T_aim2 = self.plan_throw_landing(
-                    T_grasp, theta, T_aim, time.time(), secondary,
-                )
 
         aim_joint2 = ctx.robot.inverse_kinematics(T_aim2)
         if aim_joint2 is None:
@@ -779,6 +782,7 @@ class ThrowSkill(ManipulationSkill):
         self._last_throw_meta = {
             "T": params.T, "eta": params.eta,
             "release_idx": release_idx, "n_steps": n_steps,
+            "full_traj_s": float(timestep_throw[-1]) if len(timestep_throw) else 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -810,6 +814,7 @@ class ThrowSkill(ManipulationSkill):
             "on_to_throwstart_s": _d(t0, son),
             "throwstart_to_release_s": _d(trel, t0),
             "throw_T_s": round(meta.get("T", 0.0), 3),
+            "full_traj_s": round(meta.get("full_traj_s", 0.0), 3),
             "eta": round(meta.get("eta", 0.0), 3),
             "release_idx": meta.get("release_idx", ""),
             "n_steps": meta.get("n_steps", ""),

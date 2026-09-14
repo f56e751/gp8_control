@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,7 @@ from gp8_control.rl.common import (
     HighLevelAction,
     action_summary,
     build_observation,
+    normalize_bbox_observation,
     skip_action,
 )
 from gp8_control.skills import PickRequest
@@ -47,12 +49,16 @@ class RealRlRunner:
         *,
         max_objects: int = 6,
         include_eta: bool = False,
+        bbox_observation: str | None = None,
         log_path: str | None = None,
         app: "GP8App | None" = None,
     ) -> None:
         self.cfg = cfg or getattr(app, "cfg", None) or Config()
         self.max_objects = int(max_objects)
         self.include_eta = bool(include_eta)
+        self.bbox_observation = normalize_bbox_observation(
+            bbox_observation or os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
+        )
         if app is None:
             from gp8_control.app import GP8App
 
@@ -260,6 +266,7 @@ class RealRlRunner:
                 target, now, self.app.conveyor.current
             ),
             etas_for=lambda target: self._etas_for(target, current_joint, now),
+            bbox_observation=self.bbox_observation,
         )
 
     def write_step_log(
@@ -519,12 +526,18 @@ def main(argv=None) -> int:
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--max-objects", type=int, default=6)
     parser.add_argument("--include-eta", action="store_true")
+    parser.add_argument(
+        "--bbox-observation",
+        choices=("size", "corners"),
+        default=os.environ.get("GP8_RL_BBOX_OBSERVATION", "size"),
+    )
     parser.add_argument("--log", default="")
     args = parser.parse_args(argv)
 
     runner = RealRlRunner(
         max_objects=args.max_objects,
         include_eta=args.include_eta,
+        bbox_observation=args.bbox_observation,
         log_path=args.log or None,
     )
     try:

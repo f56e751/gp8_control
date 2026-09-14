@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-import time
+import os
 
 import numpy as np
 
@@ -28,6 +28,7 @@ from gp8_control.rl.common import (
     build_observation,
     bbox_size,
     class_id,
+    normalize_bbox_observation,
     skip_action,
 )
 from gp8_control.skills.base import SkillResult
@@ -39,30 +40,63 @@ from gp8_control.skills.push_skill import (
     PUSH_FT_MAX,
     PUSH_FT_MIN,
 )
+from gp8_control.skills.throw_skill import THROW_BIN_TARGET_MAP
 from gp8_control.tracking import FrameGate, TrackedObject, TrackedObjectQueue
 from gp8_control.trajectory.predictor import TrajectoryPredictor
 from gp8_control.trajectory.trajectory_primitive import trajectory
+from gp8_control.utils.clock import Clock, WALL_CLOCK
 
 
 class _Logger:
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = bool(enabled)
+
     def info(self, msg: str) -> None:
+        if not self.enabled:
+            return
         print(f"[rl-sim] {msg}", flush=True)
 
     def warn(self, msg: str) -> None:
+        if not self.enabled:
+            return
         print(f"[rl-sim][warn] {msg}", flush=True)
 
     warning = warn
 
     def error(self, msg: str) -> None:
+        if not self.enabled:
+            return
         print(f"[rl-sim][error] {msg}", flush=True)
 
 
 class _NodeShim:
-    def __init__(self) -> None:
-        self._logger = _Logger()
+    def __init__(self, *, log_enabled: bool = True) -> None:
+        self._logger = _Logger(log_enabled)
 
     def get_logger(self) -> _Logger:
         return self._logger
+
+
+class _SimClock:
+    """Clock that advances a SimCore instead of sleeping on wall time."""
+
+    def __init__(self, core: SimCore) -> None:
+        self.core = core
+
+    def time(self) -> float:
+        return self.core.sim_time()
+
+    def monotonic(self) -> float:
+        return self.core.sim_time()
+
+    def sleep(self, seconds: float) -> None:
+        duration = max(0.0, float(seconds))
+        if duration <= 0.0:
+            return
+        if self.core._running:
+            self.core.advance_seconds(duration)
+        else:
+            WALL_CLOCK.sleep(duration)
 
 
 def _make_transform(rotation: np.ndarray, translation) -> np.ndarray:
@@ -86,21 +120,34 @@ class SimRlRunner:
         *,
         max_objects: int = 6,
         include_eta: bool = False,
+        bbox_observation: str = "size",
+        sim_seed: int | None = None,
+        realtime: bool | None = None,
     ) -> None:
         self.cfg = cfg or Config()
         self.cfg.BACKEND = "mujoco"
         self.max_objects = int(max_objects)
         self.include_eta = bool(include_eta)
-        self.node = _NodeShim()
+        self.bbox_observation = normalize_bbox_observation(bbox_observation)
+        log_enabled = os.environ.get("GP8_RL_SIM_LOG", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        self.node = _NodeShim(log_enabled=log_enabled)
         self.robot = GP8()
-        self.core = SimCore(
-            sim_cfg
-            or SimConfig(
+        if sim_cfg is None:
+            sim_cfg = SimConfig(
                 grasp_z=self.cfg.GRASP_Z,
                 bins=bins_from_config(self.cfg),
             )
-        )
-        self.traj_ctrl = MujocoRobotBackend(self.core)
+            if sim_seed is not None:
+                sim_cfg.seed = int(sim_seed)
+        if realtime is not None:
+            sim_cfg.realtime = bool(realtime)
+        self.core = SimCore(sim_cfg)
+        self.clock: Clock = WALL_CLOCK if sim_cfg.realtime else _SimClock(self.core)
+        self.traj_ctrl = MujocoRobotBackend(self.core, clock=self.clock)
         self.world = MujocoWorldSource(self.core)
         self.conveyor = self.world.belt
         self.queue = TrackedObjectQueue(
@@ -133,7 +180,7 @@ class SimRlRunner:
         self._status = "IDLE"
         self._status_detail = ""
         self._chain_action: HighLevelAction | None = None
-        self._episode_start = time.time()
+        self._episode_start = self.clock.time()
         self._pending_action: HighLevelAction | None = None
         self._build_skills()
 
@@ -164,6 +211,7 @@ class SimRlRunner:
             idle_joint=idle_joint,
             ok=lambda: self._running,
             chain_target_override=self._chain_target_override,
+            clock=self.clock,
         )
         self.skills = {
             "throw": ThrowSkill(self.ctx),
@@ -213,7 +261,7 @@ class SimRlRunner:
         )
 
     def ingest(self, now: float | None = None) -> None:
-        now = time.time() if now is None else float(now)
+        now = self.clock.time() if now is None else float(now)
         snapshot = self.world.latest_snapshot()
         receipt_time = float(snapshot.get("receipt_time", now)) if snapshot else now
         belt_distance = self.conveyor.distance_at(receipt_time)
@@ -243,7 +291,7 @@ class SimRlRunner:
         return HighLevelAction(objects[int(object_slot)], skill_name)
 
     def step(self, action: HighLevelAction | None) -> tuple[float, dict]:
-        now = time.time()
+        now = self.clock.time()
         self.ingest(now)
         pending = self._pending_action
         self._chain_action = action
@@ -259,7 +307,7 @@ class SimRlRunner:
             if pending is not None and pending.target is not None and not self._action_is_live(pending):
                 info["dropped_stale_pending"] = True
                 self._pending_action = None
-                time.sleep(self.cfg.TIME_STEP)
+                self.clock.sleep(self.cfg.TIME_STEP)
             elif pending is not None and pending.target is not None:
                 result = self._execute_action(pending)
                 info.update(
@@ -272,7 +320,7 @@ class SimRlRunner:
                 if not result.success:
                     reward -= 0.3
             else:
-                time.sleep(self.cfg.TIME_STEP)
+                self.clock.sleep(self.cfg.TIME_STEP)
         finally:
             self._chain_action = None
 
@@ -285,7 +333,7 @@ class SimRlRunner:
         return float(reward), info
 
     def action_mask(self) -> np.ndarray:
-        now = time.time()
+        now = self.clock.time()
         current_joint = self.current_joints()
         mask = np.zeros((self.max_objects + 1, len(SKILL_NAMES)), dtype=np.uint8)
         mask[self.max_objects, :] = 1
@@ -328,9 +376,14 @@ class SimRlRunner:
                 return np.array([slot, skill_index], dtype=int)
         return skip_action(self.max_objects)
 
-    def observation(self, include_eta: bool | None = None) -> np.ndarray:
+    def observation(
+        self,
+        include_eta: bool | None = None,
+        *,
+        remaining_time_frac: float = 1.0,
+    ) -> np.ndarray:
         include_eta = self.include_eta if include_eta is None else bool(include_eta)
-        now = time.time()
+        now = self.clock.time()
         current_joint = self.current_joints()
         return build_observation(
             objects=self.ordered_objects(),
@@ -340,10 +393,12 @@ class SimRlRunner:
             ee_xyz=self.ee_xyz(current_joint),
             pending_indices=self._pending_indices(),
             belt_speed=self.conveyor.current,
+            remaining_time_frac=remaining_time_frac,
             y_now_for=lambda target: self.ctx.object_y_now(
                 target, now, self.conveyor.current
             ),
             etas_for=lambda target: self._etas_for(target, current_joint, now),
+            bbox_observation=self.bbox_observation,
         )
 
     def current_joints(self) -> np.ndarray | None:
@@ -371,7 +426,7 @@ class SimRlRunner:
             target,
             current_joint,
             self.conveyor.current,
-            time.time(),
+            self.clock.time(),
             skill=skill,
         )
         if intercept is None:
@@ -464,13 +519,21 @@ class SimRlRunner:
         return 0.0
 
     def _estimate_throw_chain_delay(self, target: TrackedObject, intercept) -> float:
-        goal_x = float(self.cfg.THROW_GOAL_X)
-        goal_y = float(self.cfg.THROW_GOAL_Y)
+        bin_xyz = THROW_BIN_TARGET_MAP.get(target.class_name)
+        if bin_xyz is None:
+            goal_x = float(self.cfg.THROW_GOAL_X)
+            goal_y = float(self.cfg.THROW_GOAL_Y)
+            T_aim2 = intercept.T_aim
+        else:
+            goal_x, goal_y = map(float, bin_xyz[:2])
+            T_aim2 = np.eye(4)
+            T_aim2[:3, :3] = intercept.T_aim[:3, :3]
+            T_aim2[:3, 3] = np.asarray(bin_xyz, dtype=float)
         theta = float(math.atan2(goal_y, goal_x))
         model_distance = float(math.hypot(goal_x, goal_y))
         params = self.planner.compute_throw_params(
             intercept.T_grasp,
-            intercept.T_aim,
+            T_aim2,
             theta,
             target_distance=model_distance,
         )
@@ -530,7 +593,7 @@ class SimRlRunner:
             action.target,
             action.skill_name,
             np.asarray(from_joint, dtype=float),
-            time.time(),
+            self.clock.time(),
             pre_delay=float(action_time),
         )
         if not feasible:
@@ -540,7 +603,7 @@ class SimRlRunner:
             action.target,
             np.asarray(from_joint, dtype=float),
             self.conveyor.current,
-            time.time(),
+            self.clock.time(),
             pre_delay=float(action_time),
             skill=skill,
         )
@@ -557,9 +620,9 @@ class SimRlRunner:
         return self.skills[self._skill_name_for_object(obj)]
 
     def _move_to_initial_pose(self) -> None:
-        deadline = time.time() + 10.0
-        while self.current_joints() is None and time.time() < deadline:
-            time.sleep(0.05)
+        deadline = self.clock.time() + 10.0
+        while self.current_joints() is None and self.clock.time() < deadline:
+            self.clock.sleep(0.05)
         current = self.current_joints()
         if current is None:
             raise RuntimeError("robot joints unavailable after sim start")

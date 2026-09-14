@@ -194,6 +194,14 @@ _DEFAULT_RGBA = (0.85, 0.20, 0.20, 1.00)
 # yaskawa_robot body pose at build time.
 BELT_BODY = "gp8_belt"
 BELT_GEOM = "gp8_belt_surface"
+BELT_JOINT = "gp8_belt_slide"
+BELT_ACT = "gp8_belt_act"
+_PHYSICAL_BELT_BASE_X = 0.415
+_PHYSICAL_BELT_CENTER_Y = 497.0
+_PHYSICAL_BELT_HALF_X = 0.215
+_PHYSICAL_BELT_HALF_Y = 500.0
+_PHYSICAL_BELT_HALF_Z = 0.035
+_BELT_CONTACT_OLD = "old"
 
 
 @dataclass(frozen=True)
@@ -217,8 +225,8 @@ class SimBin:
 # config can't be imported (no ROS: Windows smoke). bins_from_config() is
 # the real source; keep these in sync if those defaults move.
 _FALLBACK_BINS = (
-    SimBin("throw", "throw", 1.1, -0.25, 0.0),
-    SimBin("push_metal", "push", 0.80, 0.60, 0.0),
+    SimBin("throw", "throw", 0.85, 0.00, 0.0),
+    SimBin("push_metal", "push", 0.85, 0.60, 0.0),
 )
 
 CLASS_BIN_BY_OBJECT_CLASS = {
@@ -294,12 +302,69 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _env_bool(key: str, default: bool = False) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
+
+def _env_int_or_none(key: str) -> int | None:
+    val = os.environ.get(key)
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+
+def _env_float_range(key: str, default: tuple[float, float]) -> tuple[float, float]:
+    raw = os.environ.get(key)
+    if not raw:
+        return default
+    parts = [p.strip() for p in raw.split(",", 1)]
+    if len(parts) != 2:
+        return default
+    try:
+        lo, hi = float(parts[0]), float(parts[1])
+    except ValueError:
+        return default
+    return (lo, hi) if lo <= hi else default
+
+
 @dataclass
 class SimConfig:
     """Belt/world parameters (env-overridable via GP8_SIM_*)."""
 
     belt_speed: float = field(default_factory=lambda: _env_float("GP8_SIM_BELT_SPEED", 0.12))
     spawn_interval: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_INTERVAL", 5.0))
+    physical_belt: bool = field(default_factory=lambda: _env_bool("GP8_SIM_PHYSICAL_BELT", False))
+    belt_actuator_speed_scale: float = field(
+        default_factory=lambda: _env_float("GP8_SIM_BELT_ACTUATOR_SPEED_SCALE", 1.0))
+    belt_contact_params: str = field(
+        default_factory=lambda: os.environ.get("GP8_SIM_BELT_CONTACT_PARAMS", "current").strip().lower())
+    realtime: bool = field(default_factory=lambda: _env_bool("GP8_SIM_REALTIME", True))
+    randomize: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOMIZE", False))
+    seed: int | None = field(default_factory=lambda: _env_int_or_none("GP8_SIM_SEED"))
+    belt_speed_range: tuple[float, float] = field(
+        default_factory=lambda: _env_float_range("GP8_SIM_BELT_SPEED_RANGE", (0.05, 0.20)))
+    spawn_rate_hz_range: tuple[float, float] = field(
+        default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_RATE_HZ_RANGE", (0.5, 1.0)))
+    spawn_x_range: tuple[float, float] = field(
+        default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_X_RANGE", (0.30, 0.58)))
+    random_class: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_CLASS", True))
+    random_size: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_SIZE", True))
+    random_yaw: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_YAW", True))
+    object_half_x_range: tuple[float, float] = field(
+        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_X_RANGE", (0.0375, 0.075)))
+    object_half_y_range: tuple[float, float] = field(
+        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_Y_RANGE", (0.05, 0.15)))
+    object_half_z: float = field(default_factory=lambda: _env_float("GP8_SIM_OBJECT_HALF_Z", BOX_HALF_Z))
+    object_mass: float = field(default_factory=lambda: _env_float("GP8_SIM_OBJECT_MASS", 0.2))
+    spawn_clearance_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_CLEARANCE_MARGIN", 0.03))
+    spawn_max_tries: int = field(default_factory=lambda: int(_env_float("GP8_SIM_SPAWN_MAX_TRIES", 10)))
+    bbox_mode: str = field(default_factory=lambda: os.environ.get("GP8_SIM_BBOX_MODE", "oriented").strip().lower())
     # Boxes enter the belt just UPSTREAM of the real camera's field of view
     # (nan = derived in SimCore from `camera`: view edge + a box + 5 cm), so
     # each box is first detected as it enters the image exactly like on
@@ -340,6 +405,7 @@ class SimConfig:
     # lets a remote/SSH run produce a demo video with no display.
     record_path: str = field(default_factory=lambda: os.environ.get("GP8_SIM_RECORD", ""))
     record_fps: float = field(default_factory=lambda: _env_float("GP8_SIM_RECORD_FPS", 24.0))
+    landing_log: bool = field(default_factory=lambda: _env_bool("GP8_SIM_LANDING_LOG", True))
     # Bins at the app's real throw goal / push targets (see bins_from_config;
     # the app passes its live Config). () = no bins. Width: GP8_SIM_BIN_W.
     bins: tuple = field(default_factory=bins_from_config)
@@ -376,6 +442,17 @@ def _add_bin(spec, base_pos, b: SimBin) -> None:
                       size=size, pos=pos, rgba=rgba)
 
 
+def _add_old_belt_box_contact_pairs(spec) -> None:
+    for box_geom in BOX_GEOMS:
+        spec.add_pair(
+            geomname1=BELT_GEOM,
+            geomname2=box_geom,
+            friction=[0.7, 0.3, 0.05, 0.0001, 0.0001],
+            solref=[0.002, 1.0],
+            solimp=[0.99, 0.999, 0.001, 0.5, 2.0],
+        )
+
+
 def _pose_camera(spec, base_pos, cam: SimCamera) -> None:
     """Move the vendored d435i body so its <camera> child IS the real camera.
 
@@ -396,7 +473,9 @@ def _pose_camera(spec, base_pos, cam: SimCamera) -> None:
 
 
 def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
-                      grasp_z: float, half_len: float, bins=(), camera: SimCamera | None = None):
+                      grasp_z: float, half_len: float, bins=(), camera: SimCamera | None = None,
+                      physical_belt: bool = False, object_half_z: float = BOX_HALF_Z,
+                      belt_contact_params: str = "current"):
     """Load the vendored scene and add a reachable conveyor (+ bins) via MjSpec.
 
     The surface top sits one box-half below grasp_z so a box rests with its
@@ -408,16 +487,45 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
     """
     spec = mujoco.MjSpec.from_file(scene_path)
     bx, by, bz = float(base_pos[0]), float(base_pos[1]), float(base_pos[2])
-    top = bz + grasp_z - BOX_HALF_Z            # belt surface top (world z)
-    thick = 0.02
+    top = bz + grasp_z - float(object_half_z)  # belt surface top (world z)
+    thick = _PHYSICAL_BELT_HALF_Z if physical_belt else 0.02
+    belt_x = _PHYSICAL_BELT_BASE_X if physical_belt else lane_x
+    belt_y = _PHYSICAL_BELT_CENTER_Y if physical_belt else center_y
     belt = spec.worldbody.add_body(
-        name=BELT_BODY, pos=[bx + lane_x, by + center_y, top - thick],
+        name=BELT_BODY, pos=[bx + belt_x, by + belt_y, top - thick],
     )
+    if physical_belt:
+        belt.explicitinertial = True
+        belt.mass = 1.20269
+        belt.inertia = [0.04236, 0.027888, 0.014472]
+        belt.add_joint(
+            name=BELT_JOINT,
+            type=mujoco.mjtJoint.mjJNT_SLIDE,
+            axis=[0.0, -1.0, 0.0],
+            range=[-1000.0, 1000.0],
+            actfrcrange=[-5000.0, 5000.0],
+        )
     belt.add_geom(
         name=BELT_GEOM, type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=[0.16, half_len, thick], pos=[0.0, 0.0, 0.0],
+        size=[
+            _PHYSICAL_BELT_HALF_X if physical_belt else 0.16,
+            _PHYSICAL_BELT_HALF_Y if physical_belt else half_len,
+            thick,
+        ],
+        pos=[0.0, 0.0, 0.0],
         rgba=[0.12, 0.12, 0.14, 1.0], friction=[0.3, 0.02, 0.002],
     )
+    if physical_belt:
+        act = spec.add_actuator(
+            name=BELT_ACT,
+            trntype=mujoco.mjtTrn.mjTRN_JOINT,
+            target=BELT_JOINT,
+            ctrlrange=[0.0, 10.0],
+            forcerange=[-5000.0, 5000.0],
+        )
+        act.set_to_velocity(80000.0)
+        if str(belt_contact_params).lower() == _BELT_CONTACT_OLD:
+            _add_old_belt_box_contact_pairs(spec)
     for b in bins:
         _add_bin(spec, base_pos, b)
     if camera is not None:
@@ -443,13 +551,18 @@ class SimBeltTracker:
     ``last + speed*dt`` so a pause never freezes tracked objects.
     """
 
-    def __init__(self, speed: float) -> None:
+    def __init__(self, speed: float, now_fn=None) -> None:
         self._speed = float(speed)
+        self._now_fn = now_fn or time.time
         self._samples: deque = deque(maxlen=400)
-        self._samples.append((time.time(), 0.0))
+        self._samples.append((self._now_fn(), 0.0))
 
     # -- fed by the stepper -------------------------------------------------
     def _push(self, wall_t: float, distance_m: float) -> None:
+        self._samples.append((float(wall_t), float(distance_m)))
+
+    def reset(self, wall_t: float = 0.0, distance_m: float = 0.0) -> None:
+        self._samples.clear()
         self._samples.append((float(wall_t), float(distance_m)))
 
     # -- ConveyorSpeedTracker surface ---------------------------------------
@@ -459,7 +572,7 @@ class SimBeltTracker:
 
     @property
     def distance_m(self) -> float | None:
-        return self.distance_at(time.time())
+        return self.distance_at(self._now_fn())
 
     def distance_at(self, wall_time: float) -> float | None:
         samples = list(self._samples)
@@ -506,9 +619,15 @@ class _Recorder:
         self._frames = 0
 
     def maybe_capture(self) -> None:
+        self._capture(lock_scene=True)
+
+    def maybe_capture_locked(self) -> None:
+        self._capture(lock_scene=False)
+
+    def _capture(self, *, lock_scene: bool) -> None:
         if self._dead:
             return
-        now = time.monotonic()
+        now = self._core.sim_time() if not self._core.cfg.realtime else time.monotonic()
         if now < self._next_t:
             return
         self._next_t = now + self._period
@@ -521,7 +640,10 @@ class _Recorder:
                 self._writer = cv2.VideoWriter(
                     self._path, cv2.VideoWriter_fourcc(*"mp4v"),
                     self._fps, (self._W, self._H))
-            with self._core.lock:
+            if lock_scene:
+                with self._core.lock:
+                    self._renderer.update_scene(self._core.data, camera=self._cam)
+            else:
                 self._renderer.update_scene(self._core.data, camera=self._cam)
             frame = self._renderer.render()          # RGB, outside the lock
             self._writer.write(frame[:, :, ::-1])    # cv2 wants BGR
@@ -540,6 +662,11 @@ class _Recorder:
                 self._renderer.close()
             except Exception:
                 pass
+
+    def next_time(self) -> float:
+        if self._dead:
+            return float("inf")
+        return float(self._next_t)
 
 
 class SimCore:
@@ -563,6 +690,16 @@ class SimCore:
                 "(uv sync --extra sim): " + repr(_MUJOCO_IMPORT_ERROR))
         scene = _find_scene()
         self.cfg = cfg or SimConfig()
+        self._rng = np.random.default_rng(self.cfg.seed)
+        self._random_spawn_rate_hz = 0.0
+        self._next_random_spawn_time = float("inf")
+        if self.cfg.randomize:
+            self.cfg.belt_speed = float(self._rng.uniform(*self.cfg.belt_speed_range))
+            self._random_spawn_rate_hz = float(self._rng.uniform(*self.cfg.spawn_rate_hz_range))
+            if self._random_spawn_rate_hz > 0.0:
+                self._next_random_spawn_time = float(
+                    self._rng.exponential(1.0 / self._random_spawn_rate_hz)
+                )
 
         # base pose is fixed in the XML (yaskawa_robot @ (-0.05,0,0.6), identity
         # rot); read it from a throwaway load to place the reachable belt.
@@ -579,7 +716,8 @@ class SimCore:
         self.bins: tuple = tuple(self.cfg.bins)
         self.model = _build_twin_model(
             str(scene), base, self.cfg.lane_x, center_y, self.cfg.grasp_z, half_len,
-            self.bins, self.cfg.camera)
+            self.bins, self.cfg.camera, self.cfg.physical_belt, self.cfg.object_half_z,
+            self.cfg.belt_contact_params)
         # Landing telemetry: loose (thrown / pushed) boxes are classified when
         # they come down — inside a bin footprint below its rim, or a miss.
         self.bin_hits: dict[str, int] = {b.name: 0 for b in self.bins}
@@ -589,6 +727,12 @@ class SimCore:
         self._dt = float(self.model.opt.timestep)
 
         self._act_ids = [int(self.model.actuator(n).id) for n in MJ_ACTS]
+        self._belt_act_id = (
+            int(self.model.actuator(BELT_ACT).id) if self.cfg.physical_belt else None
+        )
+        self._belt_joint = (
+            self.data.joint(BELT_JOINT) if self.cfg.physical_belt else None
+        )
         # Stiffen the position servos so the arm tracks the streamed 4 ms
         # commands closely — otherwise it arrives at the grasp pose late and the
         # timing-sensitive ambush grasp misses. (position actuator:
@@ -608,7 +752,7 @@ class SimCore:
         mujoco.mj_forward(self.model, self.data)
         self._base_p = self.data.body(MJ_BASE_BODY).xpos.copy()
         self._base_R = np.eye(3)   # yaskawa_robot has identity orientation
-        self._belt_top_w = float(self._base_p[2]) + self.cfg.grasp_z - BOX_HALF_Z
+        self._belt_top_w = float(self._base_p[2]) + self.cfg.grasp_z - float(self.cfg.object_half_z)
 
         # --- streamed command timeline (written by _emit_sample at 250 Hz) --
         # Each sample is queued with its ARRIVAL wall time; per substep the
@@ -636,6 +780,10 @@ class SimCore:
         self._box_manipulated_skill: list[str | None] = [None] * len(BOX_JOINTS)
         self._box_class_bin_name: list[str | None] = [None] * len(BOX_JOINTS)
         self._reward_events: list[dict] = []
+        self._box_half_size = [
+            np.array([BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z], dtype=float)
+            for _ in BOX_JOINTS
+        ]
         # Kinematic along-belt coordinate per ON_BELT box (world Y): contact
         # friction during a step brakes a purely velocity-asserted box (~0.10
         # realized vs 0.12 commanded), which would desync the boxes from the
@@ -656,7 +804,12 @@ class SimCore:
             self._park_box(i)
 
         # --- world-source outputs -------------------------------------------
-        self.belt = SimBeltTracker(self.cfg.belt_speed)
+        self.belt = SimBeltTracker(
+            self.cfg.belt_speed,
+            now_fn=(self.sim_time if not self.cfg.realtime else time.time),
+        )
+        if not self.cfg.realtime:
+            self.belt.reset(0.0, 0.0)
         self.latest_snapshot: dict | None = None   # atomic ref swap by stepper
         self._encoder_distance = 0.0
         self._last_det_pub = 0.0
@@ -679,6 +832,10 @@ class SimCore:
         if self._running:
             return
         self._running = True
+        if not self.cfg.realtime:
+            self._last_spawn = float(self.data.time)
+            self.advance_steps(1)
+            return
         self._thread = threading.Thread(
             target=self._stepper, name="gp8_sim_stepper", daemon=True)
         self._thread.start()
@@ -687,9 +844,64 @@ class SimCore:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=timeout_sec)
+            self._thread = None
+        elif self._recorder is not None:
+            self._recorder.close()
+            self._recorder = None
 
     def wait_ready(self, timeout_sec: float = 10.0) -> bool:
         return self._first_step.wait(timeout=timeout_sec)
+
+    def sim_time(self) -> float:
+        return float(self.data.time)
+
+    def _next_physical_step_target(self, deadline: float) -> float:
+        target = float(deadline)
+        if self.cfg.physical_belt:
+            det_period = 1.0 / max(1.0, self.cfg.det_hz)
+            if self._last_det_pub > 0.0:
+                target = min(target, self._last_det_pub + det_period)
+            if not self.cfg.randomize and self.cfg.spawn_interval > 0.0:
+                target = min(target, self._last_spawn + self.cfg.spawn_interval)
+        if self._recorder is not None:
+            target = min(target, self._recorder.next_time())
+        return max(self.sim_time() + self._dt, target)
+
+    def advance_until(self, deadline: float) -> None:
+        deadline = float(deadline)
+        while self._running and self.sim_time() < deadline:
+            target = self._next_physical_step_target(deadline)
+            remaining = max(0.0, target - self.sim_time())
+            n = max(1, int(math.ceil(remaining / self._dt)))
+            self.advance_steps(min(n, 50 if self.cfg.physical_belt else 250))
+
+    def advance_seconds(self, duration: float) -> None:
+        duration = max(0.0, float(duration))
+        if duration <= 0.0:
+            return
+        self.advance_until(self.sim_time() + duration)
+
+    def advance_steps(self, n: int = 1) -> None:
+        n = max(0, int(n))
+        if n <= 0:
+            return
+        det_period = 1.0 / max(1.0, self.cfg.det_hz)
+        pend = self._pending_ctrl
+        for _ in range(n):
+            suction_events = []
+            with self.lock:
+                t_sub = float(self.data.time)
+                while pend and pend[0][0] <= t_sub:
+                    _, kind, payload = pend.popleft()
+                    if kind == "ctrl":
+                        self._ctrl_target = payload
+                    else:
+                        suction_events.append(payload)
+                for on in suction_events:
+                    self._apply_suction(on)
+                self._step_once_locked()
+        self._post_step_batch(n, float(self.data.time), det_period)
+        self._first_step.set()
 
     def bind_backend(self, backend: "MujocoRobotBackend") -> None:
         self._backend = backend
@@ -737,12 +949,14 @@ class SimCore:
     # ------------------------------------------------------------------
     def set_ctrl_target(self, positions) -> None:
         """Queue one 4 ms command sample (stream thread). Never blocks."""
-        self._pending_ctrl.append((time.monotonic(), "ctrl", np.array(positions, dtype=float)))
+        stamp = self.sim_time() if not self.cfg.realtime else time.monotonic()
+        self._pending_ctrl.append((stamp, "ctrl", np.array(positions, dtype=float)))
 
     def set_suction(self, on: bool) -> None:
         """Queue a suction toggle (skill/IO thread). Applied by the stepper at
         its wall-time slot in the command timeline — see ``_apply_suction``."""
-        self._pending_ctrl.append((time.monotonic(), "suction", bool(on)))
+        stamp = self.sim_time() if not self.cfg.realtime else time.monotonic()
+        self._pending_ctrl.append((stamp, "suction", bool(on)))
 
     def _apply_suction(self, on: bool) -> None:
         """Arm the vacuum on suction ON (it seals on contact, see
@@ -768,11 +982,12 @@ class SimCore:
                 continue
             body = self.data.body(self._box_body_ids[i])
             d = body.xmat.reshape(3, 3).T @ (grip - body.xpos)     # cup in box frame
-            if abs(d[0]) > BOX_HALF_X + m or abs(d[1]) > BOX_HALF_Y + m:
+            hx, hy, hz = [float(v) for v in self._box_half_size[i]]
+            if abs(d[0]) > hx + m or abs(d[1]) > hy + m:
                 continue
             half_z = float(self.model.geom_size[self._box_geom_ids[i]][2])
             gap = float(grip[2] - (body.xpos[2] + half_z))          # cup face above top
-            if -2.0 * BOX_HALF_Z <= gap <= self.cfg.grab_gap:
+            if -2.0 * hz <= gap <= self.cfg.grab_gap:
                 return i
         return None
 
@@ -795,8 +1010,9 @@ class SimCore:
         jnt = self._box_joints[i]
         gid = self._box_geom_ids[i]
         cup_z = float(self.data.site(self._grip_id).xpos[2])
-        min_half = BOX_HALF_Z * self.cfg.crush_min_frac
-        half = float(np.clip(0.5 * (cup_z - self._belt_top_w), min_half, BOX_HALF_Z))
+        orig_half_z = float(self._box_half_size[i][2])
+        min_half = orig_half_z * self.cfg.crush_min_frac
+        half = float(np.clip(0.5 * (cup_z - self._belt_top_w), min_half, orig_half_z))
         self.model.geom_size[gid][2] = half
         jnt.qpos[2] = self._belt_top_w + half          # bottom stays on the belt
         jnt.qvel[2] = 0.0
@@ -843,17 +1059,107 @@ class SimCore:
     def _to_world(self, base_xyz) -> np.ndarray:
         return self._base_p + self._base_R @ np.asarray(base_xyz)
 
+    @staticmethod
+    def _yaw_quat(theta: float) -> tuple[float, float, float, float]:
+        return (math.cos(0.5 * theta), 0.0, 0.0, math.sin(0.5 * theta))
+
+    @staticmethod
+    def _yaw_from_xmat(xmat) -> float:
+        mat = np.asarray(xmat, dtype=float).reshape(3, 3)
+        return float(math.atan2(mat[1, 0], mat[0, 0]))
+
+    @staticmethod
+    def _boxes_overlap_2d(c1, h1, th1: float, c2, h2, th2: float) -> bool:
+        d = np.asarray(c2, dtype=float)[:2] - np.asarray(c1, dtype=float)[:2]
+        u1 = np.array([math.cos(th1), math.sin(th1)])
+        v1 = np.array([-math.sin(th1), math.cos(th1)])
+        u2 = np.array([math.cos(th2), math.sin(th2)])
+        v2 = np.array([-math.sin(th2), math.cos(th2)])
+        for axis in (u1, v1, u2, v2):
+            r1 = float(h1[0]) * abs(float(u1 @ axis)) + float(h1[1]) * abs(float(v1 @ axis))
+            r2 = float(h2[0]) * abs(float(u2 @ axis)) + float(h2[1]) * abs(float(v2 @ axis))
+            if abs(float(d @ axis)) > r1 + r2:
+                return False
+        return True
+
+    def _spawn_pose_is_clear(self, base_x: float, base_y: float, half_size, yaw: float) -> bool:
+        margin = max(0.0, float(self.cfg.spawn_clearance_margin))
+        cand_h = (float(half_size[0]) + margin, float(half_size[1]) + margin)
+        cand_c = np.array([base_x, base_y], dtype=float)
+        for i, state in enumerate(self._box_state):
+            if state == self._FREE:
+                continue
+            body = self.data.body(self._box_body_ids[i])
+            base = self._to_base(body.xpos)
+            h = self._box_half_size[i]
+            ex_h = (float(h[0]) + margin, float(h[1]) + margin)
+            if self._boxes_overlap_2d(cand_c, cand_h, yaw, base[:2], ex_h, self._yaw_from_xmat(body.xmat)):
+                return False
+        return True
+
+    def _sample_box_half_size(self) -> np.ndarray:
+        if not (self.cfg.randomize and self.cfg.random_size):
+            return np.array([BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z], dtype=float)
+        hx = float(self._rng.uniform(*self.cfg.object_half_x_range))
+        hy = float(self._rng.uniform(*self.cfg.object_half_y_range))
+        hz = float(self.cfg.object_half_z)
+        return np.array([hx, hy, hz], dtype=float)
+
+    def _apply_box_size(self, i: int, half_size) -> None:
+        hx, hy, hz = [float(v) for v in half_size]
+        gid = self._box_geom_ids[i]
+        bid = self._box_body_ids[i]
+        self.model.geom_size[gid] = (hx, hy, hz)
+        self.model.geom_rbound[gid] = float(math.sqrt(hx * hx + hy * hy + hz * hz))
+        mass = float(self.cfg.object_mass)
+        self.model.body_mass[bid] = mass
+        self.model.body_inertia[bid] = (
+            mass / 3.0 * (hy * hy + hz * hz),
+            mass / 3.0 * (hx * hx + hz * hz),
+            mass / 3.0 * (hx * hx + hy * hy),
+        )
+        self._box_half_size[i] = np.array([hx, hy, hz], dtype=float)
+
+    def _sample_spawn_base_x(self, half_size, yaw: float) -> float | None:
+        if not self.cfg.randomize:
+            return float(self.cfg.lane_x + 0.06 * ((self._spawn_count % 3) - 1))
+        tries = max(1, int(self.cfg.spawn_max_tries))
+        for _ in range(tries):
+            x = float(self._rng.uniform(*self.cfg.spawn_x_range))
+            if self._spawn_pose_is_clear(x, self.cfg.spawn_y, half_size, yaw):
+                return x
+        return None
+
+    def _sample_spawn_class(self) -> str:
+        classes = tuple(self.cfg.classes) or ("transparent",)
+        if self.cfg.randomize and self.cfg.random_class:
+            return str(classes[int(self._rng.integers(0, len(classes)))])
+        return str(classes[self._spawn_count % len(classes)])
+
+    def _schedule_next_random_spawn(self, now: float) -> None:
+        if self.cfg.randomize and self._random_spawn_rate_hz > 0.0:
+            self._next_random_spawn_time = float(now) + float(
+                self._rng.exponential(1.0 / self._random_spawn_rate_hz)
+            )
+        else:
+            self._next_random_spawn_time = float("inf")
+
     def _spawn_box(self) -> None:
         idx = next((i for i, s in enumerate(self._box_state) if s == self._FREE), None)
         if idx is None:
             return
-        cls = self.cfg.classes[self._spawn_count % len(self.cfg.classes)]
-        jitter = 0.06 * ((self._spawn_count % 3) - 1)   # -0.06, 0, +0.06
-        world = self._to_world([self.cfg.lane_x + jitter, self.cfg.spawn_y, self.cfg.grasp_z])
+        cls = self._sample_spawn_class()
+        half_size = self._sample_box_half_size()
+        yaw = float(self._rng.uniform(-math.pi, math.pi)) if (self.cfg.randomize and self.cfg.random_yaw) else 0.0
+        spawn_x = self._sample_spawn_base_x(half_size, yaw)
+        if spawn_x is None:
+            return
+        world = self._to_world([spawn_x, self.cfg.spawn_y, self._belt_top_w - self._base_p[2] + float(half_size[2])])
         self._activate_box(idx)
+        self._apply_box_size(idx, half_size)
         jnt = self._box_joints[idx]
         jnt.qpos[0:3] = world
-        jnt.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+        jnt.qpos[3:7] = self._yaw_quat(yaw)
         jnt.qvel[:] = 0.0
         self._box_state[idx] = self._ON_BELT
         self._box_class[idx] = cls
@@ -872,7 +1178,7 @@ class SimCore:
         jnt.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
         jnt.qvel[:] = 0.0
         gid = self._box_geom_ids[i]
-        self.model.geom_size[gid][2] = BOX_HALF_Z      # un-crush
+        self._apply_box_size(i, (BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z))
         self.model.geom_contype[gid] = 0
         self.model.geom_conaffinity[gid] = 0
         self.model.body_gravcomp[self._box_body_ids[i]] = 1.0
@@ -893,6 +1199,14 @@ class SimCore:
         """Pre-step: assert on-belt boxes' world-Y velocity (solver hint so
         contacts see the conveyor motion). The authoritative advance happens in
         :meth:`_enforce_belt_kinematics` after the step."""
+        if self.cfg.physical_belt:
+            if self._belt_act_id is not None:
+                self.data.ctrl[self._belt_act_id] = (
+                    self.cfg.belt_speed * self.cfg.belt_actuator_speed_scale
+                )
+            if self._belt_joint is not None:
+                self._belt_joint.qvel[0] = self.cfg.belt_speed * self.cfg.belt_actuator_speed_scale
+            return
         floor = self._base_p[2] + self.cfg.grasp_z - 0.03
         for i, jnt in enumerate(self._box_joints):
             if self._box_state[i] != self._ON_BELT:
@@ -906,6 +1220,8 @@ class SimCore:
         velocity-asserted box (~0.10 realized vs 0.12 commanded), which would
         desync the boxes from the encoder-distance integral and every ETA.
         X/Z stay fully dynamic (gravity, pushes, contacts)."""
+        if self.cfg.physical_belt:
+            return
         floor = self._base_p[2] + self.cfg.grasp_z - 0.03
         for i, jnt in enumerate(self._box_joints):
             if self._box_state[i] != self._ON_BELT:
@@ -928,16 +1244,18 @@ class SimCore:
         hit = self._bin_at(base)
         if hit is not None:
             self.bin_hits[hit.name] += 1
-            print(f"[sim] {tag} landed IN bin '{hit.name}' "
-                  f"({base[0]:+.2f}, {base[1]:+.2f})  hits={self.bin_hits}", flush=True)
+            if self.cfg.landing_log:
+                print(f"[sim] {tag} landed IN bin '{hit.name}' "
+                      f"({base[0]:+.2f}, {base[1]:+.2f})  hits={self.bin_hits}", flush=True)
             return hit.name
         self.bin_misses += 1
         near = ""
         if self.bins:
             b = min(self.bins, key=lambda b: math.hypot(base[0] - b.x, base[1] - b.y))
             near = f"  nearest '{b.name}' d={math.hypot(base[0] - b.x, base[1] - b.y):.2f}m"
-        print(f"[sim] {tag} MISSED ({base[0]:+.2f}, {base[1]:+.2f}){near}  "
-              f"misses={self.bin_misses}", flush=True)
+        if self.cfg.landing_log:
+            print(f"[sim] {tag} MISSED ({base[0]:+.2f}, {base[1]:+.2f}){near}  "
+                  f"misses={self.bin_misses}", flush=True)
         return None
 
     def _emit_reward_event(self, i: int, base, actual_bin_name: str | None,
@@ -956,6 +1274,7 @@ class SimCore:
             collateral=collateral,
         )
         self._reward_events.append({
+            "sim_time": float(self.sim_time()),
             "sim_object_id": int(self._box_serial[i]),
             "class_name": class_name,
             "manipulated": manipulated,
@@ -975,7 +1294,6 @@ class SimCore:
         """
         off_belt = self._base_p[2] + self.cfg.grasp_z - 0.05
         fallen = self._base_p[2] - 0.4   # ~floor level, world z
-        bin_bottom = 2 * _BIN_FLOOR_Z + BOX_HALF_Z + 0.03   # resting on a bin floor
         for i, jnt in enumerate(self._box_joints):
             if self._box_state[i] in (self._FREE, self._GRABBED):
                 continue
@@ -983,6 +1301,7 @@ class SimCore:
             base = self._to_base(world)
             loose = self._box_state[i] == self._LOOSE
             in_bin = loose and self._bin_at(base) is not None
+            bin_bottom = 2 * _BIN_FLOOR_Z + float(self._box_half_size[i][2]) + 0.03
             gone = (base[1] < self.cfg.despawn_y or abs(base[0]) > 1.6
                     or (world[2] < bin_bottom if in_bin else world[2] < fallen))
             if gone:
@@ -1017,19 +1336,38 @@ class SimCore:
             # The real detector only reports what is inside the image: gate on
             # the box's top-face centre. Boxes past the view are then tracked
             # by the app's belt dead reckoning, exactly as on hardware.
-            if cam is not None and not cam.sees((b[0], b[1], b[2] + BOX_HALF_Z)):
+            hx, hy, hz = [float(v) for v in self._box_half_size[i]]
+            if cam is not None and not cam.sees((b[0], b[1], b[2] + hz)):
                 continue
             # Base -> belt-frame camera coords (the inverse of camera_debug's
             # constant-translation mapping), then run the corners through the
             # SAME bbox_to_base the real pipeline uses (zero latency in sim).
             cx = (float(b[0]) - ref_x) / sx
             cy = (float(b[1]) - ref_y) / sy
-            cam_bbox = np.array([
-                [cx - BOX_HALF_X, cy - BOX_HALF_Y, 0.0],
-                [cx - BOX_HALF_X, cy + BOX_HALF_Y, 0.0],
-                [cx + BOX_HALF_X, cy + BOX_HALF_Y, 0.0],
-                [cx + BOX_HALF_X, cy - BOX_HALF_Y, 0.0],
-            ])
+            body = self.data.body(self._box_body_ids[i])
+            axes = body.xmat.reshape(3, 3)
+            footprint = []
+            for sx_box, sy_box in ((-1.0, -1.0), (-1.0, 1.0), (1.0, 1.0), (1.0, -1.0)):
+                corner_world = body.xpos + sx_box * hx * axes[:, 0] + sy_box * hy * axes[:, 1]
+                footprint.append(self._to_base(corner_world))
+            if self.cfg.bbox_mode in ("axis", "axis_aligned", "aabb"):
+                pts = np.asarray(footprint, dtype=float)
+                x0, y0 = np.min(pts[:, :2], axis=0)
+                x1, y1 = np.max(pts[:, :2], axis=0)
+                footprint = [
+                    np.array([x0, y0, b[2]], dtype=float),
+                    np.array([x0, y1, b[2]], dtype=float),
+                    np.array([x1, y1, b[2]], dtype=float),
+                    np.array([x1, y0, b[2]], dtype=float),
+                ]
+            cam_corners = []
+            for corner_base in footprint:
+                cam_corners.append([
+                    (float(corner_base[0]) - ref_x) / sx,
+                    (float(corner_base[1]) - ref_y) / sy,
+                    0.0,
+                ])
+            cam_bbox = np.array(cam_corners, dtype=float)
             kw = dict(ref_x=ref_x, ref_y=ref_y, ref_z=ref_z,
                       scale_x=sx, scale_y=sy, y_back_projection=0.0)
             x_base = ref_x + sx * cx
@@ -1049,11 +1387,151 @@ class SimCore:
         return {
             "receipt_time": now,               # strictly increasing per frame
             "belt_mps": self.cfg.belt_speed,
+            "spawn_rate_hz": (
+                self._random_spawn_rate_hz
+                if self.cfg.randomize
+                else (1.0 / self.cfg.spawn_interval if self.cfg.spawn_interval > 0.0 else 0.0)
+            ),
             "perception_delay_s": 0.0,
             "applied_delay_s": 0.0,
             "latency_mode": "sim",
+            "physical_belt": bool(self.cfg.physical_belt),
             "detections": dets,
         }
+
+    def speed_probe_snapshot(self) -> dict:
+        """Diagnostic transport speeds.
+
+        Belt travel is world -Y. Speeds below are positive when moving
+        downstream, matching ``cfg.belt_speed``.
+        """
+        with self.lock:
+            belt_qvel = 0.0
+            if self.cfg.physical_belt and self._belt_joint is not None:
+                belt_qvel = float(self._belt_joint.qvel[0])
+            objects = []
+            for i, state in enumerate(self._box_state):
+                if state == self._FREE:
+                    continue
+                jnt = self._box_joints[i]
+                objects.append({
+                    "slot": i,
+                    "state": state,
+                    "class": self._box_class[i],
+                    "serial": int(self._box_serial[i]),
+                    "x": float(jnt.qpos[0]),
+                    "y": float(jnt.qpos[1]),
+                    "z": float(jnt.qpos[2]),
+                    "base_z": float(self._to_base(jnt.qpos[0:3])[2]),
+                    "vy": float(jnt.qvel[1]),
+                    "downstream_speed": float(-jnt.qvel[1]),
+                })
+            return {
+                "time": float(self.data.time),
+                "commanded_speed": float(self.cfg.belt_speed),
+                "physical_belt": bool(self.cfg.physical_belt),
+                "belt_top_world_z": float(self._belt_top_w),
+                "belt_top_base_z": float(self._belt_top_w - self._base_p[2]),
+                "belt_actuator_command": (
+                    float(self.cfg.belt_speed * self.cfg.belt_actuator_speed_scale)
+                    if self.cfg.physical_belt else 0.0
+                ),
+                "belt_slide_qvel": belt_qvel,
+                "belt_downstream_speed": belt_qvel,
+                "objects": objects,
+            }
+
+    def _step_once_locked(self) -> None:
+        self.data.ctrl[self._act_ids] = self._ctrl_target
+        self._apply_belt_velocity()
+        mujoco.mj_step(self.model, self.data)
+        self._enforce_belt_kinematics(self._dt)
+        gz = float(self.data.site(self._grip_id).xpos[2])
+        if self._grip_z_prev is not None:
+            self._grip_vz = (gz - self._grip_z_prev) / self._dt
+        self._grip_z_prev = gz
+        self._vacuum_tick()
+        if self.cfg.randomize and self._random_spawn_rate_hz > 0.0:
+            spawn_p = min(1.0, self._random_spawn_rate_hz * self._dt)
+            if float(self._rng.random()) < spawn_p:
+                self._spawn_box()
+                self._last_spawn = float(self.data.time)
+                self._schedule_next_random_spawn(float(self.data.time))
+
+    def _post_step_batch(self, n: int, now: float, det_period: float) -> None:
+        with self.lock:
+            self._encoder_distance += self.cfg.belt_speed * self._dt * int(n)
+            if not self.cfg.randomize and now - self._last_spawn >= self.cfg.spawn_interval:
+                self._spawn_box()
+                self._last_spawn = now
+            self._recycle_boxes()
+            pos = [float(self.data.joint(n_).qpos[0]) for n_ in MJ_JOINTS]
+            vel = [float(self.data.joint(n_).qvel[0]) for n_ in MJ_JOINTS]
+            if now - self._last_det_pub >= det_period:
+                self.latest_snapshot = self._build_snapshot(now)
+                self._last_det_pub = now
+        self.belt._push(now, self._encoder_distance)
+        b = self._backend
+        if b is not None:
+            b.current_joints = pos
+            b.current_jointvels = vel
+        if self._recorder is not None:
+            self._recorder.maybe_capture()
+
+    def warp_seconds(self, duration: float) -> None:
+        """Fast-forward idle kinematic-belt waits without integrating every step."""
+        duration = max(0.0, float(duration))
+        if duration <= 0.0:
+            return
+        if self.cfg.physical_belt:
+            self.advance_seconds(duration)
+            return
+        det_period = 1.0 / max(1.0, self.cfg.det_hz)
+        with self.lock:
+            end = float(self.data.time) + duration
+            while self.data.time + 1e-9 < end:
+                next_spawn = float("inf")
+                if self.cfg.randomize and self._random_spawn_rate_hz > 0.0:
+                    next_spawn = self._next_random_spawn_time
+                elif not self.cfg.randomize and self.cfg.spawn_interval > 0.0:
+                    next_spawn = self._last_spawn + self.cfg.spawn_interval
+                next_record = (
+                    self._recorder.next_time()
+                    if self._recorder is not None
+                    else float("inf")
+                )
+                seg_end = min(end, next_spawn, next_record)
+                dt = max(0.0, float(seg_end - self.data.time))
+                if dt > 0.0:
+                    for i, jnt in enumerate(self._box_joints):
+                        if self._box_state[i] != self._ON_BELT:
+                            continue
+                        self._box_belt_y[i] -= self.cfg.belt_speed * dt
+                        jnt.qpos[1] = self._box_belt_y[i]
+                        jnt.qvel[1] = -self.cfg.belt_speed
+                    self._encoder_distance += self.cfg.belt_speed * dt
+                    self.data.time = seg_end
+                    self._recycle_boxes()
+                if next_spawn <= self.data.time + 1e-9:
+                    self._spawn_box()
+                    self._last_spawn = float(self.data.time)
+                    self._schedule_next_random_spawn(float(self.data.time))
+                if self._recorder is not None:
+                    self._recorder.maybe_capture_locked()
+            mujoco.mj_forward(self.model, self.data)
+            self._vacuum_tick()
+            pos = [float(self.data.joint(n_).qpos[0]) for n_ in MJ_JOINTS]
+            vel = [float(self.data.joint(n_).qvel[0]) for n_ in MJ_JOINTS]
+            now = float(self.data.time)
+            if now - self._last_det_pub >= det_period:
+                self.latest_snapshot = self._build_snapshot(now)
+                self._last_det_pub = now
+            encoder_distance = float(self._encoder_distance)
+        self.belt._push(now, encoder_distance)
+        b = self._backend
+        if b is not None:
+            b.current_joints = pos
+            b.current_jointvels = vel
 
     # ------------------------------------------------------------------
     # the stepping thread
@@ -1099,34 +1577,8 @@ class SimCore:
                         with self.lock:
                             for on in suction_events:
                                 self._apply_suction(on)
-                            self.data.ctrl[self._act_ids] = self._ctrl_target
-                            self._apply_belt_velocity()
-                            mujoco.mj_step(self.model, self.data)
-                            self._enforce_belt_kinematics(self._dt)
-                            gz = float(self.data.site(self._grip_id).xpos[2])
-                            if self._grip_z_prev is not None:
-                                self._grip_vz = (gz - self._grip_z_prev) / self._dt
-                            self._grip_z_prev = gz
-                            self._vacuum_tick()
-                    with self.lock:
-                        self._encoder_distance += self.cfg.belt_speed * self._dt * n
-                        now = time.time()
-                        if now - self._last_spawn >= self.cfg.spawn_interval:
-                            self._spawn_box()
-                            self._last_spawn = now
-                        self._recycle_boxes()
-                        # joint snapshot for the backend (fresh lists: readers
-                        # see either the old or the new object, never a tear)
-                        pos = [float(self.data.joint(n_).qpos[0]) for n_ in MJ_JOINTS]
-                        vel = [float(self.data.joint(n_).qvel[0]) for n_ in MJ_JOINTS]
-                        if now - self._last_det_pub >= det_period:
-                            self.latest_snapshot = self._build_snapshot(now)
-                            self._last_det_pub = now
-                    self.belt._push(now, self._encoder_distance)
-                    b = self._backend
-                    if b is not None:
-                        b.current_joints = pos
-                        b.current_jointvels = vel
+                            self._step_once_locked()
+                    self._post_step_batch(n, time.time(), det_period)
                     self._first_step.set()
                 if self._viewer is not None and time.monotonic() - last_sync >= 1.0 / 60.0:
                     self._viewer.sync()
@@ -1148,8 +1600,8 @@ class MujocoRobotBackend(RobotBackend):
     """RobotBackend over the MuJoCo twin: the base's 250 Hz stream engine runs
     the identical hardware logic; only the sample sink and suction differ."""
 
-    def __init__(self, core: SimCore) -> None:
-        super().__init__()
+    def __init__(self, core: SimCore, *, clock=None) -> None:
+        super().__init__(clock=clock)
         self._core = core
         core.bind_backend(self)
 
@@ -1160,13 +1612,26 @@ class MujocoRobotBackend(RobotBackend):
     def _emit_sample(self, positions) -> None:
         self._core.set_ctrl_target(positions)
 
+    def fast_wait_poll_interval(self) -> float | None:
+        if self._core.cfg.realtime:
+            return None
+        if self._core.cfg.physical_belt:
+            return 1.0 / max(1.0, self._core.cfg.det_hz)
+        return 0.25
+
+    def fast_wait(self, duration: float) -> bool:
+        if self._core.cfg.realtime:
+            return False
+        self._core.warp_seconds(duration)
+        return True
+
     def _set_suction(self, on: bool, requested_at: float) -> None:
         self._core.set_suction(on)
         # In-process toggle == immediate controller ack.
         if on:
-            self.last_suction_on_ack_t = time.time()
+            self.last_suction_on_ack_t = self.clock.time()
         else:
-            self.last_suction_off_ack_t = time.time()
+            self.last_suction_off_ack_t = self.clock.time()
 
     def close(self, timeout_sec: float = 5.0) -> None:
         self._core.stop(timeout_sec)
