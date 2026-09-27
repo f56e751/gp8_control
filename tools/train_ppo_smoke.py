@@ -34,9 +34,12 @@ SIM_ENV_KEYS = (
     "GP8_SIM_OBJECT_HALF_X_RANGE",
     "GP8_SIM_OBJECT_HALF_Y_RANGE",
     "GP8_SIM_OBJECT_HALF_Z",
+    "GP8_SIM_SUCTION_P",
+    "GP8_SIM_METAL_SUCTION_BINARY",
     "GP8_SIM_BBOX_MODE",
     "GP8_SIM_CAM_FOV_GATE",
     "GP8_RL_BBOX_OBSERVATION",
+    "GP8_RL_SIM_TRUTH_TRACKS",
 )
 
 
@@ -60,6 +63,28 @@ def _thread_env_defaults() -> None:
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def _env_truth_tracks() -> bool | None:
+    value = os.environ.get("GP8_RL_SIM_TRUTH_TRACKS")
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_truth_tracks(args) -> bool:
+    if args.truth_tracks is not None:
+        return bool(args.truth_tracks)
+    env_value = _env_truth_tracks()
+    if env_value is not None:
+        return bool(env_value)
+    return not bool(args.eval_only)
+
+
+def _set_truth_tracks_env(args) -> bool:
+    enabled = _resolve_truth_tracks(args)
+    os.environ["GP8_RL_SIM_TRUTH_TRACKS"] = "true" if enabled else "false"
+    return enabled
 
 
 def _worker_log_path(out_dir: str, rank: int) -> str:
@@ -139,10 +164,13 @@ def _sim_config_summary(args) -> dict:
             "object_half_x_range": list(map(float, sim_cfg.object_half_x_range)),
             "object_half_y_range": list(map(float, sim_cfg.object_half_y_range)),
             "object_half_z": float(sim_cfg.object_half_z),
+            "suction_p": float(sim_cfg.suction_p),
+            "metal_suction_binary": bool(sim_cfg.metal_suction_binary),
             "bbox_mode": str(sim_cfg.bbox_mode),
             "cam_fov_gate": bool(sim_cfg.cam_fov_gate),
             "rl_realtime": False,
             "rl_bbox_observation": str(args.bbox_observation),
+            "rl_sim_truth_tracks": bool(_env_truth_tracks()),
         },
     }
 
@@ -163,6 +191,7 @@ def _object_debug_rows(runner, mask) -> list[dict]:
             "sim_object_id": getattr(target, "sim_object_id", None),
             "class_name": str(getattr(target, "class_name", "")),
             "conf": float(getattr(target, "conf", 0.0)),
+            "suction_p": float(getattr(target, "suction_p", 1.0)),
             "xyz_now": [
                 float(target.T_grasp_base[0, 3]),
                 float(y_now),
@@ -233,11 +262,13 @@ def _trace_record(
         "dropped_stale_pending": bool(info.get("dropped_stale_pending", False)),
         "reward_events": info.get("reward_events", []),
         "pending_after_step": info.get("pending_action"),
+        "truth_tracks": bool(getattr(runner, "truth_tracks", False)),
     }
 
 
 def train(args) -> int:
     _thread_env_defaults()
+    _set_truth_tracks_env(args)
     if not args.sim_logs:
         os.environ["GP8_RL_SIM_LOG"] = "0"
         os.environ["GP8_SIM_LANDING_LOG"] = "0"
@@ -317,6 +348,7 @@ def train(args) -> int:
 
 def evaluate(args) -> int:
     _thread_env_defaults()
+    _set_truth_tracks_env(args)
     if args.sim_logs:
         os.environ["GP8_RL_SIM_LOG"] = "1"
         os.environ["GP8_SIM_LANDING_LOG"] = "1"
@@ -358,6 +390,7 @@ def evaluate(args) -> int:
                         "track_id": getattr(target, "track_id", None),
                         "sim_object_id": getattr(target, "sim_object_id", None),
                         "class_name": str(getattr(target, "class_name", "")),
+                        "suction_p": float(getattr(target, "suction_p", 1.0)),
                     }
             obs, reward, terminated, truncated, info = env.step(action)
             after_step_sim_time = float(env.unwrapped._runner.clock.time())
@@ -471,6 +504,20 @@ def parse_args(argv=None):
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--sim-logs", action="store_true")
+    truth_group = parser.add_mutually_exclusive_group()
+    truth_group.add_argument(
+        "--truth-tracks",
+        dest="truth_tracks",
+        action="store_true",
+        default=None,
+        help="Refresh simulator tracks from MuJoCo truth.",
+    )
+    truth_group.add_argument(
+        "--camera-tracks",
+        dest="truth_tracks",
+        action="store_false",
+        help="Use camera/FOV detections and belt dead reckoning.",
+    )
     args = parser.parse_args(argv)
     if args.max_episode_seconds is not None and args.max_episode_seconds <= 0.0:
         args.max_episode_seconds = None

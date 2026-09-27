@@ -85,7 +85,7 @@ def empty_object_row(
         if normalize_bbox_observation(bbox_observation) == BBOX_OBSERVATION_CORNERS
         else 2
     )
-    row = [-1.0, -1.0, 0.0, -1.0, 0.0] + [0.0] * bbox_width
+    row = [-1.0, -1.0, 0.0, -1.0, 0.0] + [0.0] * bbox_width + [0.0]
     if include_eta:
         row.extend([-1.0, -1.0])
     return row
@@ -101,7 +101,7 @@ def observation_width(
         if normalize_bbox_observation(bbox_observation) == BBOX_OBSERVATION_CORNERS
         else 2
     )
-    per_object_width = 5 + bbox_width + (2 if include_eta else 0)
+    per_object_width = 6 + bbox_width + (2 if include_eta else 0)
     return int(max_objects) * per_object_width + 6 + 3 + 4
 
 
@@ -140,6 +140,7 @@ def build_observation(
             float(class_id(target.class_name)),
             float(target.conf),
             *bbox_features(target, bbox_observation),
+            float(np.clip(float(getattr(target, "suction_p", 1.0)), 0.0, 1.0)),
         ]
         if include_eta:
             row.extend(etas_for(target) if etas_for is not None else [-1.0, -1.0])

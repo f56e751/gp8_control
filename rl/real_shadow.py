@@ -166,6 +166,7 @@ class RealShadowRl:
                     "track_id": getattr(obj, "track_id", None),
                     "class_name": obj.class_name,
                     "confidence": float(obj.conf),
+                    "suction_p": float(getattr(obj, "suction_p", 1.0)),
                 }
                 for slot, obj in enumerate(self.ordered_objects())
             ],

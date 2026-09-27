@@ -207,6 +207,7 @@ class DetectionIntake:
                 x=float(base_grasp[0]), y=float(base_grasp[1]),
                 cls=d.get("class", "?"),
                 conf=float(d.get("confidence", -1.0)),
+                suction_p=float(d.get("suction_p", 1.0)),
                 cam=d.get("cam", [0.0, 0.0, 0.0]),
                 cam_bbox=d.get("cam_bbox"),
                 base_bbox_grasp=d.get("base_bbox_grasp"),
@@ -233,6 +234,7 @@ class DetectionIntake:
             match.bbox_encoder_distance_m = belt_distance_m
             match.bbox_detect_time = detect_time
             match.conf = dd["conf"]
+            match.suction_p = dd["suction_p"]
             # Class is VOTED, not latched: add this frame's confidence-weighted
             # vote and adopt the running argmax (spawn frame is often the noisy
             # entry-edge frame). Log only the flip (no per-frame spam).
@@ -285,6 +287,7 @@ class DetectionIntake:
                 bbox_encoder_distance_m=belt_distance_m,
                 bbox_detect_time=detect_time,
                 conf=dd["conf"],
+                suction_p=dd["suction_p"],
                 sim_object_id=(
                     None if dd.get("sim_object_id") is None
                     else int(dd["sim_object_id"])

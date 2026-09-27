@@ -187,6 +187,8 @@ _CLASS_RGBA = {
     "transparent": (0.30, 0.65, 1.00, 0.55),
     "metal": (0.62, 0.62, 0.68, 1.00),
 }
+_METAL_SUCTION_OK_RGBA = (0.95, 0.78, 0.18, 1.00)
+_METAL_SUCTION_FAIL_RGBA = (0.85, 0.18, 0.12, 1.00)
 _DEFAULT_RGBA = (0.85, 0.20, 0.20, 1.00)
 
 # The reachable conveyor we add for the twin (the vendored belt is out of the
@@ -333,6 +335,10 @@ def _env_float_range(key: str, default: tuple[float, float]) -> tuple[float, flo
     return (lo, hi) if lo <= hi else default
 
 
+def _clamp01(value: float) -> float:
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
 @dataclass
 class SimConfig:
     """Belt/world parameters (env-overridable via GP8_SIM_*)."""
@@ -394,6 +400,8 @@ class SimConfig:
     grab_gap: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_GAP", 0.008))
     grab_xy_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_XY_MARGIN", 0.01))
     crush_min_frac: float = field(default_factory=lambda: _env_float("GP8_SIM_CRUSH_MIN", 0.4))
+    suction_p: float = field(default_factory=lambda: _env_float("GP8_SIM_SUCTION_P", 1.0))
+    metal_suction_binary: bool = field(default_factory=lambda: _env_bool("GP8_SIM_METAL_SUCTION_BINARY", False))
     # Stiffen the vendored position servos (kp=5000/kv=100 lags a fast throw).
     kp: float = field(default_factory=lambda: _env_float("GP8_SIM_KP", 12000.0))
     kv: float = field(default_factory=lambda: _env_float("GP8_SIM_KV", 220.0))
@@ -409,6 +417,9 @@ class SimConfig:
     # Bins at the app's real throw goal / push targets (see bins_from_config;
     # the app passes its live Config). () = no bins. Width: GP8_SIM_BIN_W.
     bins: tuple = field(default_factory=bins_from_config)
+
+    def __post_init__(self) -> None:
+        self.suction_p = _clamp01(self.suction_p)
 
 
 _BIN_RGBA = {
@@ -691,6 +702,7 @@ class SimCore:
         scene = _find_scene()
         self.cfg = cfg or SimConfig()
         self._rng = np.random.default_rng(self.cfg.seed)
+        self._suction_rng = np.random.default_rng(None if self.cfg.seed is None else int(self.cfg.seed) + 1_000_003)
         self._random_spawn_rate_hz = 0.0
         self._next_random_spawn_time = float("inf")
         if self.cfg.randomize:
@@ -775,6 +787,7 @@ class SimCore:
         self._weld_ids = [int(self.model.equality(n).id) for n in BOX_WELDS]
         self._box_state = [self._FREE] * len(BOX_JOINTS)
         self._box_class = [""] * len(BOX_JOINTS)
+        self._box_suction_p = [float(self.cfg.suction_p)] * len(BOX_JOINTS)
         self._box_serial = [0] * len(BOX_JOINTS)   # spawn number, for the landing log
         self._box_manipulated = [False] * len(BOX_JOINTS)
         self._box_manipulated_skill: list[str | None] = [None] * len(BOX_JOINTS)
@@ -792,6 +805,7 @@ class SimCore:
         self._box_belt_y = [0.0] * len(BOX_JOINTS)
         self._grabbed: int | None = None
         self._vacuum_on = False            # suction armed (seals on contact)
+        self._suction_attempt_ok: bool | None = None
         self._pressing: int | None = None  # box under the cup, being crushed
         self._grip_z_prev: float | None = None
         self._grip_vz = 0.0                # cup face vertical speed [m/s], world
@@ -968,8 +982,10 @@ class SimCore:
         """
         self._vacuum_on = bool(on)
         if on:
+            self._suction_attempt_ok = None
             self._vacuum_tick()
         else:
+            self._suction_attempt_ok = None
             self._pressing = None
             self._release_grabbed()
 
@@ -1017,6 +1033,11 @@ class SimCore:
         jnt.qpos[2] = self._belt_top_w + half          # bottom stays on the belt
         jnt.qvel[2] = 0.0
         if self._grip_vz >= -0.01:                      # cup no longer descending
+            if self._suction_attempt_ok is None:
+                p = float(np.clip(self._box_suction_p[i], 0.0, 1.0))
+                self._suction_attempt_ok = bool(float(self._suction_rng.random()) < p)
+            if not self._suction_attempt_ok:
+                return
             self._weld_box(i)
             self._pressing = None
 
@@ -1136,6 +1157,24 @@ class SimCore:
             return str(classes[int(self._rng.integers(0, len(classes)))])
         return str(classes[self._spawn_count % len(classes)])
 
+    def _sample_suction_p(self, class_name: str) -> float:
+        if not self.cfg.metal_suction_binary:
+            return float(self.cfg.suction_p)
+        if str(class_name) == "transparent":
+            return 1.0
+        if str(class_name) == "metal":
+            return float(self._suction_rng.integers(0, 2))
+        return float(self.cfg.suction_p)
+
+    def _box_rgba(self, class_name: str, suction_p: float) -> tuple:
+        if self.cfg.metal_suction_binary and str(class_name) == "metal":
+            return (
+                _METAL_SUCTION_OK_RGBA
+                if float(suction_p) >= 0.5
+                else _METAL_SUCTION_FAIL_RGBA
+            )
+        return _CLASS_RGBA.get(str(class_name), _DEFAULT_RGBA)
+
     def _schedule_next_random_spawn(self, now: float) -> None:
         if self.cfg.randomize and self._random_spawn_rate_hz > 0.0:
             self._next_random_spawn_time = float(now) + float(
@@ -1154,6 +1193,7 @@ class SimCore:
         spawn_x = self._sample_spawn_base_x(half_size, yaw)
         if spawn_x is None:
             return
+        suction_p = self._sample_suction_p(cls)
         world = self._to_world([spawn_x, self.cfg.spawn_y, self._belt_top_w - self._base_p[2] + float(half_size[2])])
         self._activate_box(idx)
         self._apply_box_size(idx, half_size)
@@ -1163,8 +1203,9 @@ class SimCore:
         jnt.qvel[:] = 0.0
         self._box_state[idx] = self._ON_BELT
         self._box_class[idx] = cls
+        self._box_suction_p[idx] = suction_p
         self._box_belt_y[idx] = float(world[1])
-        self.model.geom_rgba[self._box_geom_ids[idx]] = _CLASS_RGBA.get(cls, _DEFAULT_RGBA)
+        self.model.geom_rgba[self._box_geom_ids[idx]] = self._box_rgba(cls, suction_p)
         self._spawn_count += 1
         self._box_serial[idx] = self._spawn_count
         self._box_manipulated[idx] = False
@@ -1184,6 +1225,7 @@ class SimCore:
         self.model.body_gravcomp[self._box_body_ids[i]] = 1.0
         self._box_state[i] = self._FREE
         self._box_class[i] = ""
+        self._box_suction_p[i] = float(self.cfg.suction_p)
         self._box_manipulated[i] = False
         self._box_manipulated_skill[i] = None
         self._box_class_bin_name[i] = None
@@ -1301,7 +1343,7 @@ class SimCore:
             base = self._to_base(world)
             loose = self._box_state[i] == self._LOOSE
             in_bin = loose and self._bin_at(base) is not None
-            bin_bottom = 2 * _BIN_FLOOR_Z + float(self._box_half_size[i][2]) + 0.03
+            bin_bottom = fallen
             gone = (base[1] < self.cfg.despawn_y or abs(base[0]) > 1.6
                     or (world[2] < bin_bottom if in_bin else world[2] < fallen))
             if gone:
@@ -1375,6 +1417,7 @@ class SimCore:
             dets.append({
                 "class": self._box_class[i],
                 "confidence": 0.9,
+                "suction_p": float(self._box_suction_p[i]),
                 "sim_object_id": int(self._box_serial[i]),
                 "cam": [float(cx), float(cy), 0.0],
                 "cam_bbox": cam_bbox.tolist(),
@@ -1398,6 +1441,96 @@ class SimCore:
             "physical_belt": bool(self.cfg.physical_belt),
             "detections": dets,
         }
+
+    def truth_detection_for(self, sim_object_id: int | None) -> dict | None:
+        """Return a schema-v2 detection for a live sim object, without FOV gating.
+
+        This is a simulator-only RL hook. It does not create tracks; callers use
+        it to refresh already-tracked objects by simulator identity.
+        """
+        with self.lock:
+            return self._truth_detection_for_locked(sim_object_id)
+
+    def _truth_detection_for_locked(self, sim_object_id: int | None) -> dict | None:
+        if sim_object_id is None:
+            return None
+        ref_x, ref_y, ref_z = (
+            extrinsics.REFERENCE_X_BASE,
+            extrinsics.REFERENCE_Y_BASE,
+            extrinsics.REFERENCE_Z_BASE,
+        )
+        sx = extrinsics.SIGN_CX_TO_BASE_X * extrinsics.SCALE_CX_TO_BASE_X
+        sy = extrinsics.SIGN_CY_TO_BASE_Y * extrinsics.SCALE_CY_TO_BASE_Y
+        offset_grasp = extrinsics.DETECTION_OFFSET_GRASP
+        offset_aim = extrinsics.DETECTION_OFFSET_AIM
+        ws_x_abs = extrinsics.WORKSPACE_X_ABS
+
+        for i, jnt in enumerate(self._box_joints):
+            if int(self._box_serial[i]) != int(sim_object_id):
+                continue
+            if self._box_state[i] != self._ON_BELT:
+                return None
+
+            b = self._to_base(jnt.qpos[0:3])
+            hx, hy, _hz = [float(v) for v in self._box_half_size[i]]
+            cx = (float(b[0]) - ref_x) / sx
+            cy = (float(b[1]) - ref_y) / sy
+            body = self.data.body(self._box_body_ids[i])
+            axes = body.xmat.reshape(3, 3)
+            footprint = []
+            for sx_box, sy_box in (
+                (-1.0, -1.0),
+                (-1.0, 1.0),
+                (1.0, 1.0),
+                (1.0, -1.0),
+            ):
+                corner_world = body.xpos + sx_box * hx * axes[:, 0] + sy_box * hy * axes[:, 1]
+                footprint.append(self._to_base(corner_world))
+            if self.cfg.bbox_mode in ("axis", "axis_aligned", "aabb"):
+                pts = np.asarray(footprint, dtype=float)
+                x0, y0 = np.min(pts[:, :2], axis=0)
+                x1, y1 = np.max(pts[:, :2], axis=0)
+                footprint = [
+                    np.array([x0, y0, b[2]], dtype=float),
+                    np.array([x0, y1, b[2]], dtype=float),
+                    np.array([x1, y1, b[2]], dtype=float),
+                    np.array([x1, y0, b[2]], dtype=float),
+                ]
+            cam_bbox = np.array(
+                [
+                    [
+                        (float(corner_base[0]) - ref_x) / sx,
+                        (float(corner_base[1]) - ref_y) / sy,
+                        0.0,
+                    ]
+                    for corner_base in footprint
+                ],
+                dtype=float,
+            )
+            kw = dict(
+                ref_x=ref_x,
+                ref_y=ref_y,
+                ref_z=ref_z,
+                scale_x=sx,
+                scale_y=sy,
+                y_back_projection=0.0,
+            )
+            x_base = ref_x + sx * cx
+            y_base = ref_y + sy * cy
+            return {
+                "class": self._box_class[i],
+                "confidence": 0.9,
+                "suction_p": float(self._box_suction_p[i]),
+                "sim_object_id": int(self._box_serial[i]),
+                "cam": [float(cx), float(cy), 0.0],
+                "cam_bbox": cam_bbox.tolist(),
+                "base_grasp": [x_base, y_base, ref_z + offset_grasp],
+                "base_aim": [x_base, y_base, ref_z + offset_aim],
+                "base_bbox_grasp": bbox_to_base(cam_bbox, z_offset=offset_grasp, **kw).tolist(),
+                "base_bbox_aim": bbox_to_base(cam_bbox, z_offset=offset_aim, **kw).tolist(),
+                "in_workspace": bool(-ws_x_abs < cx < ws_x_abs),
+            }
+        return None
 
     def speed_probe_snapshot(self) -> dict:
         """Diagnostic transport speeds.

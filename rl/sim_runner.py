@@ -106,6 +106,12 @@ def _make_transform(rotation: np.ndarray, translation) -> np.ndarray:
     return transform
 
 
+def _freeze_bbox_like(value):
+    if value is None:
+        return None
+    return tuple(tuple(float(v) for v in row) for row in value)
+
+
 class SimRlRunner:
     """App-compatible simulator core used underneath the Gym wrapper.
 
@@ -129,6 +135,9 @@ class SimRlRunner:
         self.max_objects = int(max_objects)
         self.include_eta = bool(include_eta)
         self.bbox_observation = normalize_bbox_observation(bbox_observation)
+        self.truth_tracks = os.environ.get(
+            "GP8_RL_SIM_TRUTH_TRACKS", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         log_enabled = os.environ.get("GP8_RL_SIM_LOG", "1").strip().lower() not in (
             "0",
             "false",
@@ -280,6 +289,43 @@ class SimRlRunner:
             self.conveyor.current,
             belt_distance_m=self.conveyor.distance_m,
         )
+        self._refresh_truth_tracks(now)
+
+    def _refresh_truth_tracks(self, now: float | None = None) -> None:
+        """Refresh existing simulator tracks from MuJoCo truth when enabled."""
+        if not self.truth_tracks:
+            return
+        now = self.clock.time() if now is None else float(now)
+        belt_distance = self.conveyor.distance_at(now)
+        objects: list[TrackedObject] = []
+        objects.extend(self.queue._objects)
+        if self._active_target is not None:
+            objects.append(self._active_target)
+
+        seen: set[int] = set()
+        for obj in objects:
+            oid = id(obj)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            sim_id = getattr(obj, "sim_object_id", None)
+            truth = self.core.truth_detection_for(sim_id)
+            if truth is None:
+                continue
+            grasp = np.asarray(truth["base_grasp"], dtype=float)
+            aim = np.asarray(truth["base_aim"], dtype=float)
+            obj.T_grasp_base[:3, 3] = grasp[:3]
+            obj.T_aim_base[:3, 3] = aim[:3]
+            obj.detect_time = now
+            obj.encoder_distance_m = belt_distance
+            obj.cam_pos = tuple(truth.get("cam", (0.0, 0.0, 0.0)))
+            obj.cam_bbox = _freeze_bbox_like(truth.get("cam_bbox"))
+            obj.base_bbox_grasp = _freeze_bbox_like(truth.get("base_bbox_grasp"))
+            obj.base_bbox_aim = _freeze_bbox_like(truth.get("base_bbox_aim"))
+            obj.bbox_detect_time = now
+            obj.bbox_encoder_distance_m = belt_distance
+            obj.conf = float(truth.get("confidence", obj.conf))
+            obj.suction_p = float(truth.get("suction_p", getattr(obj, "suction_p", 1.0)))
 
     def action_from_indices(self, object_slot: int, skill_index: int) -> HighLevelAction | None:
         if int(object_slot) >= self.max_objects:
@@ -334,6 +380,7 @@ class SimRlRunner:
 
     def action_mask(self) -> np.ndarray:
         now = self.clock.time()
+        self._refresh_truth_tracks(now)
         current_joint = self.current_joints()
         mask = np.zeros((self.max_objects + 1, len(SKILL_NAMES)), dtype=np.uint8)
         mask[self.max_objects, :] = 1
@@ -384,6 +431,7 @@ class SimRlRunner:
     ) -> np.ndarray:
         include_eta = self.include_eta if include_eta is None else bool(include_eta)
         now = self.clock.time()
+        self._refresh_truth_tracks(now)
         current_joint = self.current_joints()
         return build_observation(
             objects=self.ordered_objects(),

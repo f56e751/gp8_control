@@ -48,6 +48,9 @@ class TrackedObject:
     # Latest detection confidence (camera_debug "confidence"); -1.0 until set.
     # Updated on every dedup re-anchor so it reflects the most recent sighting.
     conf: float = -1.0
+    # Simulator-only suction success probability. Real detections do not carry
+    # this, so hardware-facing RL mirrors use the deterministic default.
+    suction_p: float = 1.0
     # Stable id assigned at creation and KEPT across re-anchors, so logs can
     # follow this track and spot duplicates. Diagnostic only (not used for logic).
     track_id: int = field(default_factory=lambda: next(_track_id_counter))
