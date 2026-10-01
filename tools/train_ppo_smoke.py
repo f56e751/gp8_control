@@ -36,10 +36,12 @@ SIM_ENV_KEYS = (
     "GP8_SIM_OBJECT_HALF_Z",
     "GP8_SIM_SUCTION_P",
     "GP8_SIM_METAL_SUCTION_BINARY",
+    "GP8_SIM_METAL_SUCTION_MODE",
     "GP8_SIM_BBOX_MODE",
     "GP8_SIM_CAM_FOV_GATE",
     "GP8_RL_BBOX_OBSERVATION",
     "GP8_RL_SIM_TRUTH_TRACKS",
+    "GP8_RL_INCLUDE_SUCTION_P",
 )
 
 
@@ -102,6 +104,7 @@ def _make_env(args, *, rank: int = 0) -> FlatMaskedActionWrapper:
         cfg=cfg,
         realtime=False,
         bbox_observation=args.bbox_observation,
+        include_suction_p=args.include_suction_p,
     )
     return FlatMaskedActionWrapper(env)
 
@@ -166,11 +169,13 @@ def _sim_config_summary(args) -> dict:
             "object_half_z": float(sim_cfg.object_half_z),
             "suction_p": float(sim_cfg.suction_p),
             "metal_suction_binary": bool(sim_cfg.metal_suction_binary),
+            "metal_suction_mode": str(sim_cfg.metal_suction_mode),
             "bbox_mode": str(sim_cfg.bbox_mode),
             "cam_fov_gate": bool(sim_cfg.cam_fov_gate),
             "rl_realtime": False,
             "rl_bbox_observation": str(args.bbox_observation),
             "rl_sim_truth_tracks": bool(_env_truth_tracks()),
+            "rl_include_suction_p": bool(args.include_suction_p),
         },
     }
 
@@ -284,6 +289,7 @@ def train(args) -> int:
             model = MaskablePPO.load(
                 args.model,
                 env=env,
+                device=args.device,
                 tensorboard_log=str(out_dir / "tb") if args.tensorboard else None,
             )
             model.verbose = args.verbose
@@ -296,6 +302,7 @@ def train(args) -> int:
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
                 gamma=args.gamma,
+                device=args.device,
                 verbose=args.verbose,
                 tensorboard_log=str(out_dir / "tb") if args.tensorboard else None,
             )
@@ -332,7 +339,10 @@ def train(args) -> int:
                 else float(args.max_episode_seconds)
             ),
             "include_eta": bool(args.include_eta),
+            "include_suction_p": bool(args.include_suction_p),
             "bbox_observation": str(args.bbox_observation),
+            "device_arg": str(args.device),
+            "model_device": str(getattr(model, "device", "")),
             "mean_reward": float(mean_reward),
             "std_reward": float(std_reward),
             "elapsed_wall_s": float(time.time() - t0),
@@ -357,7 +367,7 @@ def evaluate(args) -> int:
         raise SystemExit("--model is required with --eval-only")
     env = _make_env(args)
     try:
-        model = MaskablePPO.load(args.model, env=env)
+        model = MaskablePPO.load(args.model, env=env, device=args.device)
         obs, info = env.reset(seed=args.seed, options={"startup_timeout": args.startup_timeout})
         del info
         total_reward = 0.0
@@ -456,6 +466,8 @@ def evaluate(args) -> int:
             "actions": actions,
             "record_path": os.environ.get("GP8_SIM_RECORD", ""),
             "trace_jsonl": str(Path(args.trace_jsonl).expanduser().resolve()) if args.trace_jsonl else "",
+            "device_arg": str(args.device),
+            "model_device": str(getattr(model, "device", "")),
             "sim_config": _sim_config_summary(args),
         }
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
@@ -487,6 +499,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--include-eta", action="store_true")
     parser.add_argument(
+        "--include-suction-p",
+        action="store_true",
+        default=os.environ.get("GP8_RL_INCLUDE_SUCTION_P", "0").strip().lower()
+        in ("1", "true", "yes", "on"),
+        help="Append per-object suction_p to the RL observation. Default is off for legacy model compatibility.",
+    )
+    parser.add_argument(
         "--bbox-observation",
         choices=("size", "corners"),
         default=os.environ.get("GP8_RL_BBOX_OBSERVATION", "size"),
@@ -500,6 +519,11 @@ def parse_args(argv=None):
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--vec-start-method", default="fork")
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Torch device for MaskablePPO policy/training, e.g. auto, cpu, cuda, cuda:0.",
+    )
     parser.add_argument("--verbose", type=int, default=1)
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--progress", action="store_true")

@@ -50,6 +50,7 @@ class RealRlRunner:
         max_objects: int = 6,
         include_eta: bool = False,
         bbox_observation: str | None = None,
+        include_suction_p: bool = False,
         log_path: str | None = None,
         app: "GP8App | None" = None,
     ) -> None:
@@ -59,6 +60,7 @@ class RealRlRunner:
         self.bbox_observation = normalize_bbox_observation(
             bbox_observation or os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
         )
+        self.include_suction_p = bool(include_suction_p)
         if app is None:
             from gp8_control.app import GP8App
 
@@ -267,6 +269,7 @@ class RealRlRunner:
             ),
             etas_for=lambda target: self._etas_for(target, current_joint, now),
             bbox_observation=self.bbox_observation,
+            include_suction_p=self.include_suction_p,
         )
 
     def write_step_log(

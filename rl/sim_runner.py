@@ -127,6 +127,7 @@ class SimRlRunner:
         max_objects: int = 6,
         include_eta: bool = False,
         bbox_observation: str = "size",
+        include_suction_p: bool = False,
         sim_seed: int | None = None,
         realtime: bool | None = None,
     ) -> None:
@@ -135,6 +136,7 @@ class SimRlRunner:
         self.max_objects = int(max_objects)
         self.include_eta = bool(include_eta)
         self.bbox_observation = normalize_bbox_observation(bbox_observation)
+        self.include_suction_p = bool(include_suction_p)
         self.truth_tracks = os.environ.get(
             "GP8_RL_SIM_TRUTH_TRACKS", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -447,6 +449,7 @@ class SimRlRunner:
             ),
             etas_for=lambda target: self._etas_for(target, current_joint, now),
             bbox_observation=self.bbox_observation,
+            include_suction_p=self.include_suction_p,
         )
 
     def current_joints(self) -> np.ndarray | None:

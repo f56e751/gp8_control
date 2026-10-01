@@ -79,13 +79,16 @@ def bbox_features(target: TrackedObject, bbox_observation: str) -> list[float]:
 def empty_object_row(
     include_eta: bool,
     bbox_observation: str = BBOX_OBSERVATION_SIZE,
+    include_suction_p: bool = False,
 ) -> list[float]:
     bbox_width = (
         8
         if normalize_bbox_observation(bbox_observation) == BBOX_OBSERVATION_CORNERS
         else 2
     )
-    row = [-1.0, -1.0, 0.0, -1.0, 0.0] + [0.0] * bbox_width + [0.0]
+    row = [-1.0, -1.0, 0.0, -1.0, 0.0] + [0.0] * bbox_width
+    if include_suction_p:
+        row.append(0.0)
     if include_eta:
         row.extend([-1.0, -1.0])
     return row
@@ -95,13 +98,19 @@ def observation_width(
     max_objects: int,
     include_eta: bool,
     bbox_observation: str = BBOX_OBSERVATION_SIZE,
+    include_suction_p: bool = False,
 ) -> int:
     bbox_width = (
         8
         if normalize_bbox_observation(bbox_observation) == BBOX_OBSERVATION_CORNERS
         else 2
     )
-    per_object_width = 6 + bbox_width + (2 if include_eta else 0)
+    per_object_width = (
+        5
+        + bbox_width
+        + (1 if include_suction_p else 0)
+        + (2 if include_eta else 0)
+    )
     return int(max_objects) * per_object_width + 6 + 3 + 4
 
 
@@ -118,6 +127,7 @@ def build_observation(
     remaining_time_frac: float = 1.0,
     etas_for=None,
     bbox_observation: str = BBOX_OBSERVATION_SIZE,
+    include_suction_p: bool = False,
 ) -> np.ndarray:
     """Encode the project-standard Gym-style observation vector."""
     bbox_observation = normalize_bbox_observation(bbox_observation)
@@ -140,15 +150,18 @@ def build_observation(
             float(class_id(target.class_name)),
             float(target.conf),
             *bbox_features(target, bbox_observation),
-            float(np.clip(float(getattr(target, "suction_p", 1.0)), 0.0, 1.0)),
         ]
+        if include_suction_p:
+            row.append(float(np.clip(float(getattr(target, "suction_p", 1.0)), 0.0, 1.0)))
         if include_eta:
             row.extend(etas_for(target) if etas_for is not None else [-1.0, -1.0])
         features.extend(row)
 
     missing = int(max_objects) - len(limited)
     if missing > 0:
-        features.extend(empty_object_row(include_eta, bbox_observation) * missing)
+        features.extend(
+            empty_object_row(include_eta, bbox_observation, include_suction_p) * missing
+        )
 
     pending_slot, pending_skill = pending_indices
     remaining = float(np.clip(float(remaining_time_frac), 0.0, 1.0))
@@ -161,7 +174,12 @@ def build_observation(
         remaining,
     ]
     obs = np.asarray(features + globals_, dtype=np.float32)
-    expected = observation_width(max_objects, include_eta, bbox_observation)
+    expected = observation_width(
+        max_objects,
+        include_eta,
+        bbox_observation,
+        include_suction_p,
+    )
     if obs.size != expected:
         raise RuntimeError(f"observation width mismatch {obs.size} != {expected}")
     return obs

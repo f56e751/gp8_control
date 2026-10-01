@@ -15,7 +15,7 @@ def main(argv=None) -> int:
     env = GP8RecyclingEnv(max_objects=3, include_eta=False, max_steps=3)
     try:
         obs, info = env.reset(options={"startup_timeout": 4.0})
-        expected_obs = 3 * 8 + 6 + 3 + 4
+        expected_obs = 3 * 7 + 6 + 3 + 4
         checks = [
             ("obs shape", obs.shape == (expected_obs,)),
             ("mask shape", info["action_mask"].shape == (4, 2)),
@@ -35,6 +35,19 @@ def main(argv=None) -> int:
         if failures:
             print("FAILURES:", ", ".join(failures))
             return 1
+        suction_env = GP8RecyclingEnv(
+            max_objects=3,
+            include_eta=False,
+            max_steps=1,
+            include_suction_p=True,
+        )
+        try:
+            if suction_env.observation_space.shape != (3 * 8 + 6 + 3 + 4,):
+                print("[FAIL] suction observation width")
+                return 1
+            print("[PASS] suction observation width")
+        finally:
+            suction_env.close()
         print("ALL PASS")
         return 0
     finally:

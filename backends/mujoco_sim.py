@@ -402,6 +402,8 @@ class SimConfig:
     crush_min_frac: float = field(default_factory=lambda: _env_float("GP8_SIM_CRUSH_MIN", 0.4))
     suction_p: float = field(default_factory=lambda: _env_float("GP8_SIM_SUCTION_P", 1.0))
     metal_suction_binary: bool = field(default_factory=lambda: _env_bool("GP8_SIM_METAL_SUCTION_BINARY", False))
+    metal_suction_mode: str = field(default_factory=lambda: os.environ.get(
+        "GP8_SIM_METAL_SUCTION_MODE", "binary").strip().lower())
     # Stiffen the vendored position servos (kp=5000/kv=100 lags a fast throw).
     kp: float = field(default_factory=lambda: _env_float("GP8_SIM_KP", 12000.0))
     kv: float = field(default_factory=lambda: _env_float("GP8_SIM_KV", 220.0))
@@ -420,6 +422,8 @@ class SimConfig:
 
     def __post_init__(self) -> None:
         self.suction_p = _clamp01(self.suction_p)
+        if self.metal_suction_mode not in ("binary", "zero", "one"):
+            self.metal_suction_mode = "binary"
 
 
 _BIN_RGBA = {
@@ -1163,6 +1167,10 @@ class SimCore:
         if str(class_name) == "transparent":
             return 1.0
         if str(class_name) == "metal":
+            if self.cfg.metal_suction_mode == "zero":
+                return 0.0
+            if self.cfg.metal_suction_mode == "one":
+                return 1.0
             return float(self._suction_rng.integers(0, 2))
         return float(self.cfg.suction_p)
 

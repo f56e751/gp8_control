@@ -35,6 +35,7 @@ class RealShadowRl:
         max_objects: int = 6,
         include_eta: bool = False,
         bbox_observation: str | None = None,
+        include_suction_p: bool = False,
         log_path: str | None = None,
     ) -> None:
         self.app = app
@@ -43,6 +44,7 @@ class RealShadowRl:
         self.bbox_observation = normalize_bbox_observation(
             bbox_observation or os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
         )
+        self.include_suction_p = bool(include_suction_p)
         self._log_path = Path(log_path).expanduser() if log_path else None
         self._log_file = None
         if self._log_path is not None:
@@ -61,11 +63,15 @@ class RealShadowRl:
             "yes",
         )
         bbox_observation = os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
+        include_suction_p = os.environ.get(
+            "GP8_RL_INCLUDE_SUCTION_P", "0"
+        ).lower() in ("1", "true", "yes", "on")
         return cls(
             app,
             max_objects=max_objects,
             include_eta=include_eta,
             bbox_observation=bbox_observation,
+            include_suction_p=include_suction_p,
             log_path=os.environ.get("GP8_RL_SHADOW_LOG") or "rl_shadow.jsonl",
         )
 
@@ -114,6 +120,7 @@ class RealShadowRl:
             ),
             etas_for=lambda target: self._etas_for(target, joints, now),
             bbox_observation=self.bbox_observation,
+            include_suction_p=self.include_suction_p,
         )
 
     def action_mask(self) -> np.ndarray:

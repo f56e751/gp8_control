@@ -43,6 +43,7 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
         cfg: Config | None = None,
         realtime: bool | None = None,
         bbox_observation: str | None = None,
+        include_suction_p: bool | None = None,
     ) -> None:
         if spaces is None:
             raise ImportError("GP8RecyclingEnv requires gymnasium or gym.")
@@ -57,6 +58,11 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
         self.bbox_observation = normalize_bbox_observation(
             bbox_observation or os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
         )
+        if include_suction_p is None:
+            include_suction_p = os.environ.get(
+                "GP8_RL_INCLUDE_SUCTION_P", "0"
+            ).strip().lower() in ("1", "true", "yes", "on")
+        self.include_suction_p = bool(include_suction_p)
         self._runner: SimRlRunner | None = None
         self._step_count = 0
         self._episode_start_time = 0.0
@@ -68,6 +74,7 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
                     self.max_objects,
                     self.include_eta,
                     self.bbox_observation,
+                    self.include_suction_p,
                 ),
             ),
             dtype=np.float32,
@@ -91,6 +98,7 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
             max_objects=self.max_objects,
             include_eta=self.include_eta,
             bbox_observation=self.bbox_observation,
+            include_suction_p=self.include_suction_p,
             sim_seed=seed,
             realtime=self.realtime,
         )

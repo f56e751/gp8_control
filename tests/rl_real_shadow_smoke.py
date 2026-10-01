@@ -113,7 +113,7 @@ def main(argv=None) -> int:
         ("transparent push vetoed", not bool(mask[1, ACTION_PUSH])),
         ("uncatchable masked", not bool(mask[2, ACTION_THROW]) and not bool(mask[2, ACTION_PUSH])),
         ("heuristic selects metal push", action.tolist() == [0, ACTION_PUSH]),
-        ("observation width", obs.shape == (3 * 10 + 6 + 3 + 4,)),
+        ("observation width", obs.shape == (3 * 9 + 6 + 3 + 4,)),
         ("snapshot has heuristic action", snapshot["heuristic_action"]["skill_name"] == "push"),
         ("pending is noop in shadow v1", snapshot["pending_action"]["object_slot"] == 3),
     ]
