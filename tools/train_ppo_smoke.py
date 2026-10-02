@@ -167,7 +167,7 @@ def _sim_config_summary(args) -> dict:
             "object_half_x_range": list(map(float, sim_cfg.object_half_x_range)),
             "object_half_y_range": list(map(float, sim_cfg.object_half_y_range)),
             "object_half_z": float(sim_cfg.object_half_z),
-            "suction_p": float(sim_cfg.suction_p),
+            "suction_p": dict(sim_cfg.suction_p),
             "metal_suction_binary": bool(sim_cfg.metal_suction_binary),
             "metal_suction_mode": str(sim_cfg.metal_suction_mode),
             "bbox_mode": str(sim_cfg.bbox_mode),
@@ -295,13 +295,26 @@ def train(args) -> int:
             model.verbose = args.verbose
             reset_num_timesteps = False
         else:
+            policy_kwargs = None
+            if args.process_state_input:
+                from gp8_control.rl.state_input import ProcessedStateExtractor
+
+                policy_kwargs = dict(
+                    features_extractor_class=ProcessedStateExtractor,
+                    features_extractor_kwargs=dict(
+                        max_objects=args.max_objects,
+                        episode_seconds=args.max_episode_seconds or 240.0,
+                    ),
+                )
             model = MaskablePPO(
                 "MlpPolicy",
                 env,
+                policy_kwargs=policy_kwargs,
                 seed=args.seed,
                 n_steps=args.n_steps,
                 batch_size=args.batch_size,
                 gamma=args.gamma,
+                ent_coef=args.ent_coef,
                 device=args.device,
                 verbose=args.verbose,
                 tensorboard_log=str(out_dir / "tb") if args.tensorboard else None,
@@ -341,6 +354,9 @@ def train(args) -> int:
             "include_eta": bool(args.include_eta),
             "include_suction_p": bool(args.include_suction_p),
             "bbox_observation": str(args.bbox_observation),
+            "process_state_input": bool(args.process_state_input),
+            "gamma": float(args.gamma),
+            "ent_coef": float(args.ent_coef),
             "device_arg": str(args.device),
             "model_device": str(getattr(model, "device", "")),
             "mean_reward": float(mean_reward),
@@ -518,7 +534,13 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--vec-start-method", default="fork")
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--process-state-input",
+        action="store_true",
+        help="Re-encode joints, pending, class and time inside the policy (rl/state_input.py).",
+    )
     parser.add_argument(
         "--device",
         default="auto",

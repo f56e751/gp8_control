@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from typing import Any
 
@@ -93,6 +94,10 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
                 super_reset(seed=seed)
         if self._runner is not None:
             self._runner.close()
+            self._runner = None
+            # The old sim sits in reference cycles; collect now so its MuJoCo
+            # buffers don't pile up across episodes.
+            gc.collect()
         self._runner = SimRlRunner(
             cfg=self.cfg,
             max_objects=self.max_objects,
@@ -126,14 +131,16 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
         deadline = self._episode_deadline()
         reward, exec_info = self._runner.step(next_action)
         self._step_count += 1
-        terminated = False
         episode_sim_time = self._episode_sim_time()
         step_limit_hit = self.max_steps > 0 and self._step_count >= self.max_steps
         time_limit_hit = (
             self.max_episode_seconds is not None
             and episode_sim_time >= self.max_episode_seconds
         )
-        truncated = bool(step_limit_hit or time_limit_hit)
+        # Remaining time is observed, so the time budget is a true terminal
+        # (no bootstrap); the unobserved step cap stays a truncation.
+        terminated = bool(time_limit_hit)
+        truncated = bool(step_limit_hit and not time_limit_hit)
         obs = self._runner.observation(
             remaining_time_frac=self._remaining_time_frac()
         )

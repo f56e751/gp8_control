@@ -335,6 +335,19 @@ def _env_float_range(key: str, default: tuple[float, float]) -> tuple[float, flo
     return (lo, hi) if lo <= hi else default
 
 
+def _env_suction_p(key: str) -> dict[str, float]:
+    """``"0.9"`` -> {"*": 0.9} (every class); ``"metal:0.5,transparent:0.9"`` -> per class."""
+    raw = os.environ.get(key, "").strip()
+    if raw and ":" not in raw:
+        return {"*": _clamp01(float(raw))}
+    out = {}
+    for part in raw.split(","):
+        if ":" in part:
+            name, p = part.split(":", 1)
+            out[name.strip()] = _clamp01(float(p))
+    return out
+
+
 def _clamp01(value: float) -> float:
     return float(np.clip(float(value), 0.0, 1.0))
 
@@ -400,7 +413,9 @@ class SimConfig:
     grab_gap: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_GAP", 0.008))
     grab_xy_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_XY_MARGIN", 0.01))
     crush_min_frac: float = field(default_factory=lambda: _env_float("GP8_SIM_CRUSH_MIN", 0.4))
-    suction_p: float = field(default_factory=lambda: _env_float("GP8_SIM_SUCTION_P", 1.0))
+    # Suction success probability per class (unlisted classes: "*" or 1.0).
+    # GP8_SIM_METAL_SUCTION_BINARY overrides it for metal.
+    suction_p: dict = field(default_factory=lambda: _env_suction_p("GP8_SIM_SUCTION_P"))
     metal_suction_binary: bool = field(default_factory=lambda: _env_bool("GP8_SIM_METAL_SUCTION_BINARY", False))
     metal_suction_mode: str = field(default_factory=lambda: os.environ.get(
         "GP8_SIM_METAL_SUCTION_MODE", "binary").strip().lower())
@@ -421,7 +436,6 @@ class SimConfig:
     bins: tuple = field(default_factory=bins_from_config)
 
     def __post_init__(self) -> None:
-        self.suction_p = _clamp01(self.suction_p)
         if self.metal_suction_mode not in ("binary", "zero", "one"):
             self.metal_suction_mode = "binary"
 
@@ -791,11 +805,13 @@ class SimCore:
         self._weld_ids = [int(self.model.equality(n).id) for n in BOX_WELDS]
         self._box_state = [self._FREE] * len(BOX_JOINTS)
         self._box_class = [""] * len(BOX_JOINTS)
-        self._box_suction_p = [float(self.cfg.suction_p)] * len(BOX_JOINTS)
+        self._box_suction_p = [1.0] * len(BOX_JOINTS)
         self._box_serial = [0] * len(BOX_JOINTS)   # spawn number, for the landing log
         self._box_manipulated = [False] * len(BOX_JOINTS)
         self._box_manipulated_skill: list[str | None] = [None] * len(BOX_JOINTS)
         self._box_class_bin_name: list[str | None] = [None] * len(BOX_JOINTS)
+        self._box_sealed = [False] * len(BOX_JOINTS)        # welded at least once
+        self._box_reward_done = [False] * len(BOX_JOINTS)   # reward already emitted
         self._reward_events: list[dict] = []
         self._box_half_size = [
             np.array([BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z], dtype=float)
@@ -945,6 +961,23 @@ class SimCore:
                 return True
         return False
 
+    def resolve_unsealed_pick(self, sim_object_id: int | None) -> bool:
+        """After a suction pick: if the box never sealed, emit its manipulated-miss
+        reward now instead of when it later rides off the belt end (no repeat)."""
+        if sim_object_id is None:
+            return False
+        with self.lock:
+            for i, serial in enumerate(self._box_serial):
+                if int(serial) != int(sim_object_id) or self._box_state[i] == self._FREE:
+                    continue
+                if self._box_sealed[i] or self._box_reward_done[i]:
+                    return False
+                base = self._to_base(self._box_joints[i].qpos[0:3])
+                self._emit_reward_event(i, base, None, collateral=False)
+                self._box_reward_done[i] = True
+                return True
+        return False
+
     def is_object_live(self, sim_object_id: int | None) -> bool:
         """Whether a sim object id still refers to an active physical box."""
         if sim_object_id is None:
@@ -1064,6 +1097,7 @@ class SimCore:
         self.model.eq_data[eqid][10] = 1.0   # torquescale
         self.data.eq_active[eqid] = 1
         self._box_state[best] = self._GRABBED
+        self._box_sealed[best] = True
         self._grabbed = best
 
     def _release_grabbed(self) -> None:
@@ -1162,17 +1196,14 @@ class SimCore:
         return str(classes[self._spawn_count % len(classes)])
 
     def _sample_suction_p(self, class_name: str) -> float:
-        if not self.cfg.metal_suction_binary:
-            return float(self.cfg.suction_p)
-        if str(class_name) == "transparent":
-            return 1.0
-        if str(class_name) == "metal":
+        if self.cfg.metal_suction_binary and str(class_name) == "metal":
             if self.cfg.metal_suction_mode == "zero":
                 return 0.0
             if self.cfg.metal_suction_mode == "one":
                 return 1.0
             return float(self._suction_rng.integers(0, 2))
-        return float(self.cfg.suction_p)
+        p = self.cfg.suction_p
+        return float(p.get(str(class_name), p.get("*", 1.0)))
 
     def _box_rgba(self, class_name: str, suction_p: float) -> tuple:
         if self.cfg.metal_suction_binary and str(class_name) == "metal":
@@ -1219,6 +1250,8 @@ class SimCore:
         self._box_manipulated[idx] = False
         self._box_manipulated_skill[idx] = None
         self._box_class_bin_name[idx] = None
+        self._box_sealed[idx] = False
+        self._box_reward_done[idx] = False
 
     def _park_box(self, i: int) -> None:
         """Retire box i: collisions off, gravity compensated, stashed below the floor."""
@@ -1233,10 +1266,12 @@ class SimCore:
         self.model.body_gravcomp[self._box_body_ids[i]] = 1.0
         self._box_state[i] = self._FREE
         self._box_class[i] = ""
-        self._box_suction_p[i] = float(self.cfg.suction_p)
+        self._box_suction_p[i] = 1.0
         self._box_manipulated[i] = False
         self._box_manipulated_skill[i] = None
         self._box_class_bin_name[i] = None
+        self._box_sealed[i] = False
+        self._box_reward_done[i] = False
 
     def _activate_box(self, i: int) -> None:
         """Re-enable a parked box's collisions/gravity before placing it."""
@@ -1310,6 +1345,8 @@ class SimCore:
 
     def _emit_reward_event(self, i: int, base, actual_bin_name: str | None,
                            collateral: bool) -> None:
+        if self._box_reward_done[i]:
+            return
         class_name = self._box_class[i]
         manipulated = bool(self._box_manipulated[i])
         class_bin_name = (

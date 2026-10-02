@@ -503,7 +503,10 @@ class SimRlRunner:
             secondary=self._chain_action.target if self._chain_action is not None else None,
         )
         self.traj_ctrl.set_motion_op(action.skill_name)
-        return skill.execute(request)
+        result = skill.execute(request)
+        if action.skill_name == "throw":
+            self.core.resolve_unsealed_pick(getattr(target, "sim_object_id", None))
+        return result
 
     def _evaluate_feasibility(
         self,
