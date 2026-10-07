@@ -336,9 +336,9 @@ def _env_float_range(key: str, default: tuple[float, float]) -> tuple[float, flo
     return (lo, hi) if lo <= hi else default
 
 
-def _env_suction_p(key: str) -> dict[str, float]:
+def _env_suction_p(key: str, default: str = "") -> dict[str, float]:
     """``"0.9"`` -> {"*": 0.9} (every class); ``"metal:0.5,transparent:0.9"`` -> per class."""
-    raw = os.environ.get(key, "").strip()
+    raw = os.environ.get(key, default).strip()
     if raw and ":" not in raw:
         return {"*": _clamp01(float(raw))}
     out = {}
@@ -369,17 +369,18 @@ class SimConfig:
     seed: int | None = field(default_factory=lambda: _env_int_or_none("GP8_SIM_SEED"))
     belt_speed_range: tuple[float, float] = field(
         default_factory=lambda: _env_float_range("GP8_SIM_BELT_SPEED_RANGE", (0.05, 0.20)))
+    # Set rate; the 12-box pool and spawn clearance keep the real inflow well below it.
     spawn_rate_hz_range: tuple[float, float] = field(
-        default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_RATE_HZ_RANGE", (0.5, 1.0)))
+        default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_RATE_HZ_RANGE", (2.0, 4.0)))
     spawn_x_range: tuple[float, float] = field(
         default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_X_RANGE", (0.30, 0.58)))
     random_class: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_CLASS", True))
     random_size: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_SIZE", True))
     random_yaw: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_YAW", True))
     object_half_x_range: tuple[float, float] = field(
-        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_X_RANGE", (0.0375, 0.075)))
+        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_X_RANGE", (0.0375, 0.05)))
     object_half_y_range: tuple[float, float] = field(
-        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_Y_RANGE", (0.05, 0.15)))
+        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_Y_RANGE", (0.05, 0.11)))
     object_half_z: float = field(default_factory=lambda: _env_float("GP8_SIM_OBJECT_HALF_Z", BOX_HALF_Z))
     object_mass: float = field(default_factory=lambda: _env_float("GP8_SIM_OBJECT_MASS", 0.2))
     spawn_clearance_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_CLEARANCE_MARGIN", 0.03))
@@ -414,9 +415,11 @@ class SimConfig:
     grab_gap: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_GAP", 0.008))
     grab_xy_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_XY_MARGIN", 0.01))
     crush_min_frac: float = field(default_factory=lambda: _env_float("GP8_SIM_CRUSH_MIN", 0.4))
-    # Suction success probability per class (unlisted classes: "*" or 1.0).
+    # Suction success probability per class (unlisted classes: "*" or 1.0); randomized
+    # (RL) runs default to metal 0.5 / transparent 0.9.
     # GP8_SIM_METAL_SUCTION_BINARY overrides it for metal.
-    suction_p: dict = field(default_factory=lambda: _env_suction_p("GP8_SIM_SUCTION_P"))
+    suction_p: dict = field(default_factory=lambda: _env_suction_p(
+        "GP8_SIM_SUCTION_P", "metal:0.5,transparent:0.9" if _env_bool("GP8_SIM_RANDOMIZE") else ""))
     metal_suction_binary: bool = field(default_factory=lambda: _env_bool("GP8_SIM_METAL_SUCTION_BINARY", False))
     metal_suction_mode: str = field(default_factory=lambda: os.environ.get(
         "GP8_SIM_METAL_SUCTION_MODE", "binary").strip().lower())
