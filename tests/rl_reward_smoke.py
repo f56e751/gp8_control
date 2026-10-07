@@ -92,6 +92,15 @@ def main(argv=None) -> int:
             ) == -0.3,
         ),
         (
+            "unmanipulated collateral into its class bin",
+            resolved_object_reward(
+                manipulated=False,
+                actual_bin_name="throw",
+                class_bin_name="throw",
+                collateral=True,
+            ) == 1.0,
+        ),
+        (
             "unmanipulated natural exit",
             resolved_object_reward(
                 manipulated=False,

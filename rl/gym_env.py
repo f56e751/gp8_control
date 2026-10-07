@@ -129,6 +129,8 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
             else None
         )
         deadline = self._episode_deadline()
+        step_index = self._step_count
+        self._runner.core.step_index = step_index
         reward, exec_info = self._runner.step(next_action)
         self._step_count += 1
         episode_sim_time = self._episode_sim_time()
@@ -155,6 +157,14 @@ class GP8RecyclingEnv(gym.Env if gym is not None else object):
         info["truncated_by_steps"] = bool(step_limit_hit)
         info["truncated_by_time"] = bool(time_limit_hit)
         info["late_reward_dropped"] = float(late_reward)
+        # (steps back to the causing step, reward) for rewards that arrived late;
+        # rl/credit.py moves them there before PPO computes advantages.
+        info["credit_moves"] = [
+            (step_index - e["cause_step"], float(e["reward"]))
+            for e in info.get("reward_events", [])
+            if not e.get("late_for_episode") and e.get("cause_step") is not None
+            and e["cause_step"] < step_index
+        ]
         if not valid:
             info["invalid_action_treated_as"] = "skip"
         return obs, float(reward), terminated, truncated, info

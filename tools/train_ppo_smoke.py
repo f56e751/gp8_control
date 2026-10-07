@@ -321,8 +321,11 @@ def train(args) -> int:
             )
             reset_num_timesteps = True
         start_timesteps = int(getattr(model, "num_timesteps", 0))
+        from gp8_control.rl.credit import CauseCreditCallback
+
         model.learn(
             total_timesteps=args.timesteps,
+            callback=CauseCreditCallback(),
             progress_bar=args.progress,
             reset_num_timesteps=reset_num_timesteps,
         )
@@ -530,8 +533,8 @@ def parse_args(argv=None):
     parser.add_argument("--startup-timeout", type=float, default=8.0)
     parser.add_argument("--tail-seconds", type=float, default=2.0)
     parser.add_argument("--trace-jsonl", default="")
-    parser.add_argument("--n-steps", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--n-steps", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--vec-start-method", default="fork")
     parser.add_argument("--gamma", type=float, default=1.0)

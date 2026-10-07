@@ -249,10 +249,11 @@ def resolved_object_reward(
     class_bin_name: str | None,
     collateral: bool,
 ) -> float:
-    """Sparse resolved-object reward, matching the old env's outcome shape."""
-    if manipulated:
-        return 1.0 if actual_bin_name is not None and actual_bin_name == class_bin_name else -0.3
-    return -0.3 if collateral else 0.0
+    """Outcome-based: +1 in its class bin (picked or knocked in), -0.3 if picked
+    or knocked off anywhere else, 0 if it just rides past."""
+    if actual_bin_name is not None and actual_bin_name == class_bin_name:
+        return 1.0
+    return -0.3 if (manipulated or collateral) else 0.0
 
 
 def bins_from_config(cfg=None) -> tuple:
@@ -812,6 +813,10 @@ class SimCore:
         self._box_class_bin_name: list[str | None] = [None] * len(BOX_JOINTS)
         self._box_sealed = [False] * len(BOX_JOINTS)        # welded at least once
         self._box_reward_done = [False] * len(BOX_JOINTS)   # reward already emitted
+        # RL step that decided each box's fate (picked, or knocked off the belt);
+        # the env sets step_index before each step.
+        self.step_index = 0
+        self._box_cause_step: list[int | None] = [None] * len(BOX_JOINTS)
         self._reward_events: list[dict] = []
         self._box_half_size = [
             np.array([BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z], dtype=float)
@@ -956,6 +961,7 @@ class SimCore:
                 if self._box_state[i] == self._FREE:
                     return False
                 self._box_manipulated[i] = True
+                self._box_cause_step[i] = self.step_index
                 self._box_manipulated_skill[i] = str(skill_name)
                 self._box_class_bin_name[i] = class_bin_name
                 return True
@@ -1252,6 +1258,7 @@ class SimCore:
         self._box_class_bin_name[idx] = None
         self._box_sealed[idx] = False
         self._box_reward_done[idx] = False
+        self._box_cause_step[idx] = None
 
     def _park_box(self, i: int) -> None:
         """Retire box i: collisions off, gravity compensated, stashed below the floor."""
@@ -1272,6 +1279,7 @@ class SimCore:
         self._box_class_bin_name[i] = None
         self._box_sealed[i] = False
         self._box_reward_done[i] = False
+        self._box_cause_step[i] = None
 
     def _activate_box(self, i: int) -> None:
         """Re-enable a parked box's collisions/gravity before placing it."""
@@ -1371,6 +1379,7 @@ class SimCore:
             "reward": reward,
             "base_xyz": [float(base[0]), float(base[1]), float(base[2])],
             "collateral": bool(collateral),
+            "cause_step": self._box_cause_step[i],
         })
 
     def _recycle_boxes(self) -> None:
@@ -1400,6 +1409,8 @@ class SimCore:
                 self._park_box(i)
             elif self._box_state[i] == self._ON_BELT and world[2] < off_belt:
                 self._box_state[i] = self._LOOSE   # pushed / knocked off the belt
+                if not self._box_manipulated[i]:
+                    self._box_cause_step[i] = self.step_index
 
     # ------------------------------------------------------------------
     # synthesized perception (schema-v2, through the real transform code)
