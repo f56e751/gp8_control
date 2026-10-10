@@ -165,12 +165,35 @@ MJ_BASE_BODY = "yaskawa_robot"   # gp8 base frame == this body; detections are b
 MJ_GRIP_SITE = "grip_site"
 MJ_LINK6 = "link6"               # weld body1 (the vendored suction welds anchor here)
 
-# Free-joint boxes already in the vendored model, reused as the object pool,
-# and their per-box suction welds (body1=link6, body2=red_box_N, active=false).
-BOX_BODIES = ["red_box"] + [f"red_box_{i}" for i in range(2, 13)]
-BOX_JOINTS = ["box_free"] + [f"box_free_{i}" for i in range(2, 13)]
-BOX_GEOMS = ["red_box_geom"] + [f"red_box_geom_{i}" for i in range(2, 13)]
-BOX_WELDS = ["suction_weld_red_box"] + [f"suction_weld_red_box_{i}" for i in range(2, 13)]
+# Free-joint boxes in the vendored model, reused as the object pool. Dense RL
+# runs can extend this pool at MjSpec build time with matching generated boxes.
+DEFAULT_BOX_COUNT = 12
+
+
+def _box_suffix(i: int) -> str:
+    return "" if i == 0 else f"_{i + 1}"
+
+
+def _box_bodies(count: int) -> list[str]:
+    return [f"red_box{_box_suffix(i)}" for i in range(int(count))]
+
+
+def _box_joints(count: int) -> list[str]:
+    return [f"box_free{_box_suffix(i)}" for i in range(int(count))]
+
+
+def _box_geoms(count: int) -> list[str]:
+    return [f"red_box_geom{_box_suffix(i)}" for i in range(int(count))]
+
+
+def _box_welds(count: int) -> list[str]:
+    return [f"suction_weld_red_box{_box_suffix(i)}" for i in range(int(count))]
+
+
+BOX_BODIES = _box_bodies(DEFAULT_BOX_COUNT)
+BOX_JOINTS = _box_joints(DEFAULT_BOX_COUNT)
+BOX_GEOMS = _box_geoms(DEFAULT_BOX_COUNT)
+BOX_WELDS = _box_welds(DEFAULT_BOX_COUNT)
 # red_box_geom half-extents (size in combined_test.xml): x, y (footprint), z (height)
 BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z = 0.05, 0.075, 0.015
 # Parked (unused) boxes sit below the ground plane, each at its own spot, with
@@ -204,6 +227,7 @@ _PHYSICAL_BELT_HALF_X = 0.215
 _PHYSICAL_BELT_HALF_Y = 500.0
 _PHYSICAL_BELT_HALF_Z = 0.035
 _BELT_CONTACT_OLD = "old"
+_PUSHER_GEOM = "pusher_collision"
 
 
 @dataclass(frozen=True)
@@ -322,6 +346,16 @@ def _env_int_or_none(key: str) -> int | None:
         return None
 
 
+def _env_int(key: str, default: int) -> int:
+    val = os.environ.get(key)
+    if val is None or val == "":
+        return int(default)
+    try:
+        return int(val)
+    except ValueError:
+        return int(default)
+
+
 def _env_float_range(key: str, default: tuple[float, float]) -> tuple[float, float]:
     raw = os.environ.get(key)
     if not raw:
@@ -369,22 +403,24 @@ class SimConfig:
     seed: int | None = field(default_factory=lambda: _env_int_or_none("GP8_SIM_SEED"))
     belt_speed_range: tuple[float, float] = field(
         default_factory=lambda: _env_float_range("GP8_SIM_BELT_SPEED_RANGE", (0.05, 0.20)))
-    # Set rate; the 12-box pool and spawn clearance keep the real inflow well below it.
+    # Set rate; the active box pool and spawn clearance keep the real inflow below it.
     spawn_rate_hz_range: tuple[float, float] = field(
-        default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_RATE_HZ_RANGE", (2.0, 4.0)))
+        default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_RATE_HZ_RANGE", (0.5, 2.0)))
     spawn_x_range: tuple[float, float] = field(
         default_factory=lambda: _env_float_range("GP8_SIM_SPAWN_X_RANGE", (0.30, 0.58)))
     random_class: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_CLASS", True))
     random_size: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_SIZE", True))
     random_yaw: bool = field(default_factory=lambda: _env_bool("GP8_SIM_RANDOM_YAW", True))
     object_half_x_range: tuple[float, float] = field(
-        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_X_RANGE", (0.0375, 0.05)))
+        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_X_RANGE", (0.03, 0.06)))
     object_half_y_range: tuple[float, float] = field(
-        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_Y_RANGE", (0.05, 0.11)))
+        default_factory=lambda: _env_float_range("GP8_SIM_OBJECT_HALF_Y_RANGE", (0.05, 0.10)))
     object_half_z: float = field(default_factory=lambda: _env_float("GP8_SIM_OBJECT_HALF_Z", BOX_HALF_Z))
     object_mass: float = field(default_factory=lambda: _env_float("GP8_SIM_OBJECT_MASS", 0.2))
-    spawn_clearance_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_CLEARANCE_MARGIN", 0.03))
+    spawn_clearance_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_SPAWN_CLEARANCE_MARGIN", 0.01))
     spawn_max_tries: int = field(default_factory=lambda: int(_env_float("GP8_SIM_SPAWN_MAX_TRIES", 10)))
+    box_count: int = field(default_factory=lambda: _env_int(
+        "GP8_SIM_BOX_COUNT", 24 if _env_bool("GP8_SIM_RANDOMIZE") else DEFAULT_BOX_COUNT))
     bbox_mode: str = field(default_factory=lambda: os.environ.get("GP8_SIM_BBOX_MODE", "oriented").strip().lower())
     # Boxes enter the belt just UPSTREAM of the real camera's field of view
     # (nan = derived in SimCore from `camera`: view edge + a box + 5 cm), so
@@ -442,6 +478,7 @@ class SimConfig:
     def __post_init__(self) -> None:
         if self.metal_suction_mode not in ("binary", "zero", "one"):
             self.metal_suction_mode = "binary"
+        self.box_count = max(DEFAULT_BOX_COUNT, int(self.box_count))
 
 
 _BIN_RGBA = {
@@ -475,14 +512,70 @@ def _add_bin(spec, base_pos, b: SimBin) -> None:
                       size=size, pos=pos, rgba=rgba)
 
 
-def _add_old_belt_box_contact_pairs(spec) -> None:
-    for box_geom in BOX_GEOMS:
+def _add_old_belt_box_contact_pairs(spec, box_geoms: list[str] | tuple[str, ...]) -> None:
+    for box_geom in box_geoms:
         spec.add_pair(
             geomname1=BELT_GEOM,
             geomname2=box_geom,
             friction=[0.7, 0.3, 0.05, 0.0001, 0.0001],
             solref=[0.002, 1.0],
             solimp=[0.99, 0.999, 0.001, 0.5, 2.0],
+        )
+
+
+def _add_generated_pusher_box_contact_pairs(spec, box_count: int) -> None:
+    """Mirror the vendored pusher<->box contact pairs for generated boxes."""
+    for box_geom in _box_geoms(int(box_count))[DEFAULT_BOX_COUNT:]:
+        spec.add_pair(
+            geomname1=box_geom,
+            geomname2=_PUSHER_GEOM,
+            friction=[1.5, 0.1, 0.01, 0.0001, 0.0001],
+            solref=[0.01, 1.0],
+            solimp=[0.9, 0.95, 0.001, 0.5, 2.0],
+        )
+
+
+def _add_generated_box_pool(spec, box_count: int) -> None:
+    """Extend the vendored 12-box pool with equivalent generated bodies."""
+    for i in range(DEFAULT_BOX_COUNT, int(box_count)):
+        body = spec.worldbody.add_body(
+            name=_box_bodies(i + 1)[i],
+            pos=[float(v) for v in _park_pos(i)],
+        )
+        body.explicitinertial = True
+        body.ipos = [0.0, 0.0, 0.0]
+        body.iquat = [1.0, 0.0, 0.0, 0.0]
+        body.mass = 0.2
+        body.inertia = [
+            (1.0 / 3.0) * 0.2 * (BOX_HALF_Y**2 + BOX_HALF_Z**2),
+            (1.0 / 3.0) * 0.2 * (BOX_HALF_X**2 + BOX_HALF_Z**2),
+            (1.0 / 3.0) * 0.2 * (BOX_HALF_X**2 + BOX_HALF_Y**2),
+        ]
+        body.add_joint(name=_box_joints(i + 1)[i], type=mujoco.mjtJoint.mjJNT_FREE)
+        body.add_site(
+            name=f"box_site{_box_suffix(i)}",
+            pos=[0.0, -0.04, 0.0],
+            size=[0.01],
+            rgba=[0.5, 0.5, 0.5, 0.3],
+        )
+        body.add_geom(
+            name=_box_geoms(i + 1)[i],
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z],
+            contype=1,
+            conaffinity=1,
+            friction=[1.0, 0.1, 0.1],
+            rgba=[1.0, 0.0, 0.0, 1.0],
+        )
+        spec.add_equality(
+            name=_box_welds(i + 1)[i],
+            type=mujoco.mjtEq.mjEQ_WELD,
+            objtype=mujoco.mjtObj.mjOBJ_BODY,
+            name1=MJ_LINK6,
+            name2=_box_bodies(i + 1)[i],
+            active=False,
+            solref=[0.002, 1.0],
+            solimp=[0.95, 0.99, 0.001, 0.5, 2.0],
         )
 
 
@@ -508,7 +601,8 @@ def _pose_camera(spec, base_pos, cam: SimCamera) -> None:
 def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
                       grasp_z: float, half_len: float, bins=(), camera: SimCamera | None = None,
                       physical_belt: bool = False, object_half_z: float = BOX_HALF_Z,
-                      belt_contact_params: str = "current"):
+                      belt_contact_params: str = "current",
+                      box_count: int = DEFAULT_BOX_COUNT):
     """Load the vendored scene and add a reachable conveyor (+ bins) via MjSpec.
 
     The surface top sits one box-half below grasp_z so a box rests with its
@@ -518,7 +612,13 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
     targets placed at their base-frame XY.
     Returns a compiled MjModel. Glue: never edits the vendored XML on disk.
     """
+    box_count = max(DEFAULT_BOX_COUNT, int(box_count))
+    box_bodies = _box_bodies(box_count)
+    box_geoms = _box_geoms(box_count)
     spec = mujoco.MjSpec.from_file(scene_path)
+    if box_count > DEFAULT_BOX_COUNT:
+        _add_generated_box_pool(spec, box_count)
+        _add_generated_pusher_box_contact_pairs(spec, box_count)
     bx, by, bz = float(base_pos[0]), float(base_pos[1]), float(base_pos[2])
     top = bz + grasp_z - float(object_half_z)  # belt surface top (world z)
     thick = _PHYSICAL_BELT_HALF_Z if physical_belt else 0.02
@@ -558,7 +658,7 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
         )
         act.set_to_velocity(80000.0)
         if str(belt_contact_params).lower() == _BELT_CONTACT_OLD:
-            _add_old_belt_box_contact_pairs(spec)
+            _add_old_belt_box_contact_pairs(spec, box_geoms)
     for b in bins:
         _add_bin(spec, base_pos, b)
     if camera is not None:
@@ -568,7 +668,7 @@ def _build_twin_model(scene_path: str, base_pos, lane_x: float, center_y: float,
     # passive-force pass skips the feature entirely when that count is 0, so
     # the flag must be non-zero at COMPILE time; _activate_box zeroes it on
     # spawn and _park_box restores it.
-    for name in BOX_BODIES:
+    for name in box_bodies:
         spec.body(name).gravcomp = 1.0
     # Allow HD offscreen rendering (the recorder); default framebuffer is 640x480.
     spec.visual.global_.offwidth = max(int(spec.visual.global_.offwidth), 1280)
@@ -751,7 +851,7 @@ class SimCore:
         self.model = _build_twin_model(
             str(scene), base, self.cfg.lane_x, center_y, self.cfg.grasp_z, half_len,
             self.bins, self.cfg.camera, self.cfg.physical_belt, self.cfg.object_half_z,
-            self.cfg.belt_contact_params)
+            self.cfg.belt_contact_params, self.cfg.box_count)
         # Landing telemetry: loose (thrown / pushed) boxes are classified when
         # they come down — inside a bin footprint below its rim, or a miss.
         self.bin_hits: dict[str, int] = {b.name: 0 for b in self.bins}
@@ -803,34 +903,38 @@ class SimCore:
         self._ctrl_target = np.array(_HOME, dtype=float)   # currently applied
 
         # --- object pool -----------------------------------------------------
-        self._box_joints = [self.data.joint(n) for n in BOX_JOINTS]
-        self._box_geom_ids = [int(self.model.geom(n).id) for n in BOX_GEOMS]
-        self._box_body_ids = [int(self.model.body(n).id) for n in BOX_BODIES]
-        self._weld_ids = [int(self.model.equality(n).id) for n in BOX_WELDS]
-        self._box_state = [self._FREE] * len(BOX_JOINTS)
-        self._box_class = [""] * len(BOX_JOINTS)
-        self._box_suction_p = [1.0] * len(BOX_JOINTS)
-        self._box_serial = [0] * len(BOX_JOINTS)   # spawn number, for the landing log
-        self._box_manipulated = [False] * len(BOX_JOINTS)
-        self._box_manipulated_skill: list[str | None] = [None] * len(BOX_JOINTS)
-        self._box_class_bin_name: list[str | None] = [None] * len(BOX_JOINTS)
-        self._box_sealed = [False] * len(BOX_JOINTS)        # welded at least once
-        self._box_reward_done = [False] * len(BOX_JOINTS)   # reward already emitted
+        self._box_names = _box_bodies(self.cfg.box_count)
+        self._box_joint_names = _box_joints(self.cfg.box_count)
+        self._box_geom_names = _box_geoms(self.cfg.box_count)
+        self._box_weld_names = _box_welds(self.cfg.box_count)
+        self._box_joints = [self.data.joint(n) for n in self._box_joint_names]
+        self._box_geom_ids = [int(self.model.geom(n).id) for n in self._box_geom_names]
+        self._box_body_ids = [int(self.model.body(n).id) for n in self._box_names]
+        self._weld_ids = [int(self.model.equality(n).id) for n in self._box_weld_names]
+        self._box_state = [self._FREE] * len(self._box_joints)
+        self._box_class = [""] * len(self._box_joints)
+        self._box_suction_p = [1.0] * len(self._box_joints)
+        self._box_serial = [0] * len(self._box_joints)   # spawn number, for the landing log
+        self._box_manipulated = [False] * len(self._box_joints)
+        self._box_manipulated_skill: list[str | None] = [None] * len(self._box_joints)
+        self._box_class_bin_name: list[str | None] = [None] * len(self._box_joints)
+        self._box_sealed = [False] * len(self._box_joints)        # welded at least once
+        self._box_reward_done = [False] * len(self._box_joints)   # reward already emitted
         # RL step that decided each box's fate (picked, or knocked off the belt);
         # the env sets step_index before each step.
         self.step_index = 0
-        self._box_cause_step: list[int | None] = [None] * len(BOX_JOINTS)
+        self._box_cause_step: list[int | None] = [None] * len(self._box_joints)
         self._reward_events: list[dict] = []
         self._box_half_size = [
             np.array([BOX_HALF_X, BOX_HALF_Y, BOX_HALF_Z], dtype=float)
-            for _ in BOX_JOINTS
+            for _ in self._box_joints
         ]
         # Kinematic along-belt coordinate per ON_BELT box (world Y): contact
         # friction during a step brakes a purely velocity-asserted box (~0.10
         # realized vs 0.12 commanded), which would desync the boxes from the
         # encoder-distance integral and every ETA. Y is therefore DRIVEN;
         # X/Z stay dynamic (gravity, pushes, contacts).
-        self._box_belt_y = [0.0] * len(BOX_JOINTS)
+        self._box_belt_y = [0.0] * len(self._box_joints)
         self._grabbed: int | None = None
         self._vacuum_on = False            # suction armed (seals on contact)
         self._suction_attempt_ok: bool | None = None
@@ -842,7 +946,7 @@ class SimCore:
         # Vendored collision masks, restored on spawn (parked boxes get 0/0).
         self._box_contype = [int(self.model.geom_contype[g]) for g in self._box_geom_ids]
         self._box_conaff = [int(self.model.geom_conaffinity[g]) for g in self._box_geom_ids]
-        for i in range(len(BOX_JOINTS)):
+        for i in range(len(self._box_joints)):
             self._park_box(i)
 
         # --- world-source outputs -------------------------------------------
