@@ -32,6 +32,7 @@ from std_msgs.msg import Float64, String
 
 from gp8_control.perception import extrinsics
 from gp8_control.perception.bbox_geometry import as_bbox, bbox_center, bbox_to_base
+from gp8_control.perception.direction_check import BeltDirectionMonitor
 from gp8_control.perception.clock_sync import (
     ContinuousClockSync,
     latency_url_from_stream,
@@ -94,6 +95,10 @@ class CameraDebugNode(Node):
 
         self._snap_lock = threading.Lock()
         self._snap: dict | None = None
+        # Live check that the camera->base mapping is oriented right: objects
+        # must move toward the robot (base Y decreasing) at the belt speed.
+        self._direction = BeltDirectionMonitor()
+        self._direction_state: str | None = None
 
         self._stream_url = os.environ.get(
             "GP8_PERCEPTION_URL", PERCEPTION_URL_DEFAULT
@@ -321,9 +326,20 @@ class CameraDebugNode(Node):
                 "center_confirmed": bool(centred),
             })
 
+        self._direction.update(receipt, detections, v)
+        direction = self._direction.status()
+        if direction["state"] != self._direction_state:
+            self._direction_state = direction["state"]
+            log = (self.get_logger().info if direction["state"] in ("OK", "NO DATA", "BELT STOPPED")
+                   else self.get_logger().warn)
+            log(f"[direction] {direction['state']}: {direction['message']} "
+                f"(GP8_CAM_SIGN_CX={extrinsics.SIGN_CX_TO_BASE_X:+g}, "
+                f"GP8_CAM_SIGN_CY={extrinsics.SIGN_CY_TO_BASE_Y:+g})")
+
         snap = {
             "receipt_time": receipt,
             "stream_record_ts": stream_ts,
+            "direction_check": direction,
             "belt_mps": v,
             "perception_delay_s": delay_s,
             "frame_age_s": frame_age,
@@ -385,6 +401,7 @@ class CameraDebugNode(Node):
 
         out = ["\033[H\033[J"]
         out.append("=== GP8 Camera Debug — live ===\n")
+        out.append(_direction_line(snap.get("direction_check")))
         out.append(
             f" belt: {v:6.3f} m/s   "
             f"stream delay: {delay:.3f}s   "
@@ -454,6 +471,20 @@ class CameraDebugNode(Node):
                 )
         sys.stdout.write("".join(out))
         sys.stdout.flush()
+
+_DIR_COLOR = {"OK": "\033[1;32m", "FLIPPED": "\033[1;41;97m", "SCALE?": "\033[1;33m"}
+
+
+def _direction_line(direction: dict | None) -> str:
+    """One coloured dashboard line: is the camera axis direction right?"""
+    if not direction:
+        return " 방향: (판정 전)\n"
+    state = direction.get("state", "?")
+    color = _DIR_COLOR.get(state, "\033[2m")
+    signs = (f"[CAM_SIGN_CX {extrinsics.SIGN_CX_TO_BASE_X:+g}, "
+             f"CY {extrinsics.SIGN_CY_TO_BASE_Y:+g}]")
+    return f" 방향: {color} {state} \033[0m {direction.get('message', '')}  {signs}\n"
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)

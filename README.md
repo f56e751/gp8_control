@@ -105,7 +105,7 @@ ros2 control list_hardware_components            # MotomanHardware 가 active �
 | 로봇이 잠긴 듯 반응 없음 | 이전 드라이버가 남음 → 전부 Ctrl-C, `pkill -f ros2_control_node`, 다시 |
 | `fallback 0.083 m/s until first message` 가 계속 | `/conveyor/speed` 없음 → 엔코더 전원·USB, 터미널 1 의 `conveyor_node` 에러 |
 | 물체를 안 집음 | 카메라 스트림 끊김 → `ros2 topic hz /camera_debug/detections`, [카메라 PC](#카메라-pc-robot6) |
-| **모든 물체를 한참(~2 s) 일찍** 처리 | 카메라 축 방향이 반대 → `gp8_camera` 로 띄웠는지 (`GP8_CAM_SIGN_*`) |
+| **모든 물체를 한참(~2 s) 일찍** 처리 | 카메라 축 방향이 반대 → `gp8_camera` 대시보드 맨 윗줄 **방향:** 이 `FLIPPED`(빨강)인지, 카메라 영상(`http://147.46.175.15:8080/`) 오른쪽 화살표가 `REVERSED` 인지 확인 → `GP8_CAM_SIGN_CY` 부호 |
 | 물체 **뒤/앞**을 잡음 (속도에 비례) | `GP8_TRACK_LEAD_T` 조정 (0.02 단위) |
 | 처음 몇 cm 일찍 처리 | 카메라 v4(`center_confirmed`) 송출인지 확인 — 로그에 `[track-CONFIRM]` 이 물체마다 떠야 함 |
 | 같은 물체를 두 번 / 빈 곳을 집음 | 로그의 `[track-MERGE]`·`[track-OVERSIZE]`, 트랙 수 확인. 카메라 로그를 [replay](#결과--도구) 로 재현 |
@@ -119,6 +119,10 @@ ros2 control list_hardware_components            # MotomanHardware 가 active �
 - 실행/재시작: `docker stop iitp_local; cd /PublicSSD/iitp/demo/iitp_perception && ./docker_local.sh`
 - 확인: `curl -s http://147.46.175.15:8080/detections/stream | head -c 400` → `"schema_version": 4`
 - 모든 검출 기록: `results_local/detections.jsonl` (replay 도구 입력)
+- 영상(`http://147.46.175.15:8080/`) 오른쪽에 추적기가 학습한 **벨트 흐름 화살표**가
+  뜬다: 초록 `OK` = 로봇 기본 부호와 일치, 주황 `REVERSED` = 로봇에 `GP8_CAM_SIGN_CY=-1`
+  필요 (현재 설치 상태, `gp8_camera` 가 기본으로 적용). X축 부호는 움직임으로 판정
+  못 하므로 벨트 한쪽에 둔 물체로 확인.
 - 로봇 쪽 v4(중앙 프레임에서 위치 재고정)는 카메라가 v4 를 보낼 때만 동작한다.
 
 ---
