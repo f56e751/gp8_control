@@ -119,11 +119,24 @@ ros2 control list_hardware_components            # MotomanHardware 가 active �
 - 실행/재시작: `docker stop iitp_local; cd /PublicSSD/iitp/demo/iitp_perception && ./docker_local.sh`
 - 확인: `curl -s http://147.46.175.15:8080/detections/stream | head -c 400` → `"schema_version": 4`
 - 모든 검출 기록: `results_local/detections.jsonl` (replay 도구 입력)
-- 영상(`http://147.46.175.15:8080/`) 오른쪽에 추적기가 학습한 **벨트 흐름 화살표**가
-  뜬다: 초록 `OK` = 로봇 기본 부호와 일치, 주황 `REVERSED` = 로봇에 `GP8_CAM_SIGN_CY=-1`
-  필요 (현재 설치 상태, `gp8_camera` 가 기본으로 적용). X축 부호는 움직임으로 판정
-  못 하므로 벨트 한쪽에 둔 물체로 확인.
 - 로봇 쪽 v4(중앙 프레임에서 위치 재고정)는 카메라가 v4 를 보낼 때만 동작한다.
+
+### 카메라 방향 확인 (축 부호)
+
+영상(`http://147.46.175.15:8080/`) 오른쪽에 추적기가 학습한 **벨트 흐름 화살표**가
+뜬다. 재시작 직후나 물체가 아직 안 지나갔으면 `FLOW: learning`(학습 중), 벨트가
+멈추면 `FLOW: stopped`. 물체가 한두 개 지나가면 화살표로 바뀐다.
+
+| 영상 화살표 | 의미 | 실행 |
+|---|---|---|
+| **DOWN (+cy)**, 주황 `REVERSED` (2026-10-19 현재 설치) | 카메라가 180° 돌아가 있음 | 그냥 `gp8_camera` (기본 `CX=+1`, `CY=-1`) |
+| **UP (−cy)**, 초록 `OK` (원래 방향으로 다시 단 경우) | 부호 반전 불필요 | `GP8_CAM_SIGN_CX=-1 GP8_CAM_SIGN_CY=+1 gp8_camera` |
+
+- **최종 확인**: `gp8_camera` 대시보드 맨 윗줄 `방향:` 이 초록 `OK` 면 맞다.
+  빨강 `FLIPPED` 면 `GP8_CAM_SIGN_CY` 부호를 반대로.
+- **X축은 판정 불가** (물체가 옆으로 안 움직임): 기본값은 180° 회전을 가정해 X·Y
+  둘 다 반전한다. 카메라를 다시 달았다면 벨트 한쪽 끝에 물체를 올려 로봇이 같은
+  쪽으로 가는지 확인하고, 반대면 `GP8_CAM_SIGN_CX` 부호를 바꾼다.
 
 ---
 
