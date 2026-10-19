@@ -45,6 +45,15 @@ class Config:
     # it can't diverge to the reach boundary. Set near the real pick time.
     MAX_PICK_LEAD: float = 1.2
 
+    # Robot/world backend seam selection: "hw" (default) = real adv4ncr
+    # controller (TrajectoryController) + camera_debug/conveyor topics
+    # (HardwareWorldSource); "mujoco" = the in-process MuJoCo physics twin
+    # (backends/mujoco_sim.py — needs mujoco>=3.1, `uv sync --extra sim`).
+    # Precedence: CLI flag --backend > env GP8_BACKEND > "hw".
+    BACKEND: str = field(
+        default_factory=lambda: _env_default("GP8_BACKEND", "hw")
+    )
+
     # Test override for the push/throw ActionSelector. Empty = normal routing
     # (per-class via SKILL_BY_CLASS: metal -> push, transparent -> throw). Set to a
     # skill name ("throw" or "push")
@@ -201,10 +210,10 @@ class Config:
     # opening radius); these values affect planning direction/evaluation only,
     # never the robot's safety limits.
     THROW_GOAL_X: float = field(
-        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_X", "1.1"))
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_X", "0.85"))
     )
     THROW_GOAL_Y: float = field(
-        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_Y", "-0.25"))
+        default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_Y", "0.0"))
     )
     THROW_GOAL_RADIUS: float = field(
         default_factory=lambda: float(os.environ.get("GP8_THROW_GOAL_RADIUS", "0.10"))
@@ -278,6 +287,20 @@ class Config:
     # 동일하다. env GP8_TRACK_ASSOC.
     TRACK_ASSOC: str = field(
         default_factory=lambda: _env_default("GP8_TRACK_ASSOC", "hungarian")
+    )
+
+    # Ghost / duplicate guards (2026-10-19 HW: one-frame detector ghosts and a
+    # 0.39 m "glued" box spawned tracks the arm then pushed at empty belt).
+    # A track becomes selectable only after TRACK_MIN_HITS detections or the
+    # producer's centre confirmation (real objects get ~30 frames crossing the
+    # view). Detections longer than OBJECT_MAX_FOOTPRINT_M on either axis are
+    # ignored (hardware intake only; 0 disables). env GP8_TRACK_MIN_HITS /
+    # GP8_OBJECT_MAX_FOOTPRINT_M.
+    TRACK_MIN_HITS: int = field(
+        default_factory=lambda: int(_env_default("GP8_TRACK_MIN_HITS", "3"))
+    )
+    OBJECT_MAX_FOOTPRINT_M: float = field(
+        default_factory=lambda: float(_env_default("GP8_OBJECT_MAX_FOOTPRINT_M", "0.30"))
     )
 
     # Pick-feasibility safety factor. _select_ambush_target drops queue heads

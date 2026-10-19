@@ -7,6 +7,7 @@ that does NOT pull torch / rclpy so it's safe to import from any node.
 
 from __future__ import annotations
 
+import os
 import numpy as np
 
 
@@ -56,8 +57,10 @@ REFERENCE_Z_BASE: float = 0.630   # only used for display; ambush picks at GRASP
 
 # Per-axis sign: flip these if a test shows the arm goes to the opposite side.
 # cy is upstream-positive → same as base +Y (belt flows toward base −Y).
-SIGN_CX_TO_BASE_X: float = -1.0
-SIGN_CY_TO_BASE_Y: float = +1.0
+# GP8_CAM_SIGN_CX / GP8_CAM_SIGN_CY override them per run (e.g. a camera that
+# was re-mounted rotated 180 deg flips both) without editing this file.
+SIGN_CX_TO_BASE_X: float = float(os.environ.get("GP8_CAM_SIGN_CX", "-1.0"))
+SIGN_CY_TO_BASE_Y: float = float(os.environ.get("GP8_CAM_SIGN_CY", "+1.0"))
 
 # Per-axis scale: if the camera's belt-frame coords don't match the robot's
 # metric belt-frame perfectly (e.g., calibration scaling), set these to a

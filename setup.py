@@ -15,12 +15,15 @@ setup(
         f"{package_name}.utils",
         f"{package_name}.trajectory",
         f"{package_name}.model",
-        f"{package_name}.mock",
+        f"{package_name}.backends",
         f"{package_name}.gui",
         f"{package_name}.robots",
         f"{package_name}.tracking",
         f"{package_name}.planning",
         f"{package_name}.skills",
+        f"{package_name}.rl",
+        f"{package_name}.validation",
+        f"{package_name}.tools",
         f"{package_name}.tests",
     ],
     package_dir={
@@ -31,12 +34,15 @@ setup(
         f"{package_name}.utils": "utils",
         f"{package_name}.trajectory": "trajectory",
         f"{package_name}.model": "model",
-        f"{package_name}.mock": "mock",
+        f"{package_name}.backends": "backends",
         f"{package_name}.gui": "gui",
         f"{package_name}.robots": "robots",
         f"{package_name}.tracking": "tracking",
         f"{package_name}.planning": "planning",
         f"{package_name}.skills": "skills",
+        f"{package_name}.rl": "rl",
+        f"{package_name}.validation": "validation",
+        f"{package_name}.tools": "tools",
         f"{package_name}.tests": "tests",
     },
     data_files=[
@@ -60,12 +66,8 @@ setup(
     entry_points={
         "console_scripts": [
             "gp8_app = gp8_control.app:main",
-            "mock_robot = gp8_control.mock.mock_robot:main",
-            # MuJoCo-backed twin (Level B). NOTE: needs `mujoco` in the uv venv,
-            # so launch it with .venv/bin/python -m gp8_control.mock.mujoco_robot
-            # (or sim_mujoco.launch.py) — plain `ros2 run` uses system python.
-            "mujoco_robot = gp8_control.mock.mujoco_robot:main",
-            "fake_belt = gp8_control.mock.fake_belt:main",
+            "gp8_real_rl = gp8_control.rl.real_runner:main",
+            "gp8_s2r_analyze = gp8_control.validation.analyze:main",
             "gui_server = gp8_control.gui.server:main",
             "name_bridge = gp8_control.bridge:main",
             "terminal_debug = gp8_control.terminal_debug:main",
@@ -96,7 +98,7 @@ setup(
             # base-frame Z, then hold suction ON until the operator releases it.
             "suction_hold_at_z = gp8_control.tests.suction_hold_at_z:main",
             # EE-line IK streaming validation (stroke-style Cartesian control
-            # for descent/chain). Sim: stream_sim.launch.py first. Needs scipy;
+            # for descent/chain). Needs scipy;
             # if system python lacks it, run via .venv/bin/python -m.
             "line_stream_test = gp8_control.tests.line_stream_test:main",
         ],

@@ -149,6 +149,15 @@ class CameraDebugNode(Node):
         bounding_boxes = record.get("bounding_boxes") or []
         class_names = record.get("class_names") or []
         confidences = record.get("confidences") or [0.0] * len(bounding_boxes)
+        # Producer-side object identity and per-detection distance from the
+        # image centre (schema v3 / v4).  Padded with None so an older
+        # producer -- or a backend that supplies neither -- still zips.
+        track_ids = list(record.get("track_ids") or [])
+        track_ids += [None] * (len(bounding_boxes) - len(track_ids))
+        radii = list(record.get("center_radius_m") or [])
+        radii += [None] * (len(bounding_boxes) - len(radii))
+        confirmed = list(record.get("center_confirmed") or [])
+        confirmed += [False] * (len(bounding_boxes) - len(confirmed))
         delay_s = float(record.get("elapsed_s") or 0.0)
         stream_ts = float(record.get("timestamp") or 0.0)
 
@@ -239,7 +248,10 @@ class CameraDebugNode(Node):
         sy = extrinsics.SIGN_CY_TO_BASE_Y * extrinsics.SCALE_CY_TO_BASE_Y
 
         detections = []
-        for box, cls, conf in zip(bounding_boxes, class_names, confidences):
+        for box, cls, conf, src_tid, radius, centred in zip(
+            bounding_boxes, class_names, confidences, track_ids, radii,
+            confirmed
+        ):
             try:
                 cam_bbox = as_bbox(box)
             except (TypeError, ValueError) as exc:
@@ -302,6 +314,11 @@ class CameraDebugNode(Node):
                 "base_bbox_grasp": base_bbox_grasp.tolist(),
                 "base_bbox_aim": base_bbox_aim.tolist(),
                 "in_workspace": bool(in_ws),
+                # Passed through untouched; the control side decides how much
+                # to trust the id and which frame wins on radius.
+                "src_track_id": None if src_tid is None else int(src_tid),
+                "center_radius": None if radius is None else float(radius),
+                "center_confirmed": bool(centred),
             })
 
         snap = {

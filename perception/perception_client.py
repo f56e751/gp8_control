@@ -6,7 +6,7 @@ output purely through the documented wire contract:
 
     GET http://<camera-pc-ip>:8080/detections/stream   (NDJSON, one record/line)
     {
-      "schema_version": 2,
+      "schema_version": 4,
       "timestamp": <epoch s>, "elapsed_s": <inference s>,
       "capture_timestamp": <RealSense global-time epoch s or null>,
       "capture_age_s": <frame-to-inference-start seconds or null>,
@@ -16,8 +16,16 @@ output purely through the documented wire contract:
         [[X_tl,Y_tl,Z], [X_tr,Y_tr,Z], [X_br,Y_br,Z], [X_bl,Y_bl,Z]], ...
       ],
       "class_names": ["metal"|"transparent"|"cardboard", ...],
-      "confidences": [<float>, ...]      # parallel arrays, aligned by index
-    }
+      "confidences": [<float>, ...],     # parallel arrays, aligned by index
+      "track_ids": [<int>, ...] | null,  # producer-side object identity: the
+                                         # same id across frames is the same
+                                         # physical object.
+      "center_radius_m": [<float>, ...]  # distance from the image centre. Both
+    }                                    # position and class are most accurate
+                                         # where this is smallest, so keep the
+                                         # estimate from that frame.
+                                         # Either may be null from a producer
+                                         # that cannot supply it.
 
 stream_detections() reconnects automatically on network drops; exceptions from
 your on_record callback propagate (so robot-side bugs surface instead of being
@@ -29,7 +37,10 @@ import urllib.error
 import urllib.request
 
 # Schema this client was written against. A mismatch is warned about once.
-EXPECTED_SCHEMA_VERSION = 2
+# v3 added "track_ids", v4 added "center_radius_m"; every earlier field kept
+# its meaning, so an older producer still works and the paths that use these
+# two fall back to the previous position-only behaviour.
+EXPECTED_SCHEMA_VERSION = 4
 
 
 def stream_detections(

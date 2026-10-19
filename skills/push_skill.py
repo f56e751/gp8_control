@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import datetime
 import os
-import time
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -68,8 +67,8 @@ PUSH_CLASSES: set[str] = {
 # pushed, so ``execute`` aborts cleanly (the old secondary/plan_throw_landing
 # fallback was throw-legacy and removed 2026-07-14).
 PUSH_BIN_TARGET_MAP: dict[str, tuple] = {
-    "transparent": (1.2, -0.30, 0.0),  
-    "metal":       (0.80,  0.60, 0.0),
+    "transparent": (0.85, 0.00, 0.0),
+    "metal":       (0.85, 0.60, 0.0),
 }
 
 
@@ -694,7 +693,7 @@ class PushSkill(ManipulationSkill):
         before firing; cleanup after.
         """
         ctx = self.ctx
-        _t_exec0 = time.time()   # pipeline diagnostic (see the [pipeline] log)
+        _t_exec0 = ctx.clock.time()   # pipeline diagnostic (see the [pipeline] log)
         # Fresh cycle-log meta: build_push_trajectory replaces this dict wholesale,
         # but an abort BEFORE the build (no-bin) would otherwise log the PREVIOUS
         # cycle's values into its CSV row.
@@ -810,7 +809,7 @@ class PushSkill(ManipulationSkill):
         # Chain pre-plan: the arm frees up ~(object arrival + post-contact
         # motion) from now — estimate for next_chain_target's pre_delay.
         v_belt = ctx.conveyor.current
-        y_now = ctx.object_y_now(target, time.time(), v_belt)
+        y_now = ctx.object_y_now(target, ctx.clock.time(), v_belt)
         t_wait_est = max(0.0, (y_now - float(T_grasp[1, 3])) / max(v_belt, 1e-6))
         push_time = self._stroke_time_to(push_distance)
         nxt = ctx.next_chain_target(grasp_retreat_joint, t_wait_est + push_time)
@@ -849,7 +848,7 @@ class PushSkill(ManipulationSkill):
         # wait entry (chain pre-plan + ARM build). NOT added to any timing
         # equation — logged so a nonzero build cost is visible evidence if
         # the fire ever trends late.
-        _pipe = time.time() - _t_exec0
+        _pipe = ctx.clock.time() - _t_exec0
         ctx.log.info(
             f"[pipeline] exec→wait {_pipe * 1000:.0f}ms "
             f"(build+plan; not modelled in the fire lead)"
@@ -869,7 +868,7 @@ class PushSkill(ManipulationSkill):
         # budget (intercept_time_budget) should make this rare; hard safety net.
         stroke_end_y = T_grasp_retreat[1, 3] + push_distance * push_dir_exec[1]
         stroke_min_y = min(float(T_grasp_retreat[1, 3]), float(stroke_end_y))
-        _t_guard = time.time()
+        _t_guard = ctx.clock.time()
         _v_guard = ctx.conveyor.current
         obj_y_map = ctx.object_y_now(target, _t_guard, _v_guard)
         # Judge the REAL object, not the trailing map: the map runs
@@ -917,7 +916,7 @@ class PushSkill(ManipulationSkill):
         #   fire_early_ms = (delta/v − lead)  [>0 early, <0 late]
         # is the RESIDUAL after the applied correction — ≈0 means "fired
         # exactly as the corrected schedule intended".
-        _t_fire = time.time()
+        _t_fire = ctx.clock.time()
         _v_fire = ctx.conveyor.current
         _delta_fire = (
             ctx.object_y_now(target, _t_fire, _v_fire) - float(T_grasp[1, 3])
@@ -1598,6 +1597,7 @@ class PushSkill(ManipulationSkill):
             "swing_mode": PUSH_SWING_MODE,
             "swing": self._swing_at(1.0),   # end-of-stroke tilt (both modes)
             "chain_dest": chain_dest,
+            "full_traj_s": float(ts_full[-1]) if len(ts_full) else 0.0,
         }
 
         # FLOW MODE: hand the composed trajectory (and its exact contact
@@ -2514,6 +2514,7 @@ class PushSkill(ManipulationSkill):
             "lead_ms": _ms(meta.get("lead_ms")),
             "applied_lag_ms": _ms(PUSH_PERCEPTION_LAG * 1000.0),
             "approach_ms": _ms(meta.get("approach_s", 0.0) * 1000.0),
+            "full_traj_ms": _ms(meta.get("full_traj_s", 0.0) * 1000.0),
             "budget_position_ms": _ms(
                 None if meta.get("budget_position_s") is None
                 else meta["budget_position_s"] * 1000.0

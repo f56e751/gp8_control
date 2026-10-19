@@ -23,9 +23,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 
+from gp8_control.backends import RobotBackend, WorldSource
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
-from gp8_control.conveyor import ConveyorSpeedTracker
 from gp8_control.perception.detection_intake import DetectionIntake
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
@@ -33,6 +33,7 @@ from gp8_control.tracking import (
     TrackedObject,
     TrackedObjectQueue,
     FrameGate,
+    is_established,
 )
 from gp8_control.config import Config
 from gp8_control.planning import (
@@ -80,18 +81,16 @@ class GP8App:
         # here so the viz can keep drawing it while the cycle runs.
         self._active_target: TrackedObject | None = None
 
-        # Latest corrected detection snapshot from the camera_debug node.
-        # See /camera_debug/detections — camera_debug owns the perception
-        # stream + cam→base transform + v*delay back-projection.
-        self._cam_latest: dict | None = None
-
         self._node: Node | None = None
         self._executor: MultiThreadedExecutor | None = None
         self._spin_thread: threading.Thread | None = None
         self._spinner_dead = False
-        self.traj_ctrl: TrajectoryController | None = None
+        # The two backend seams (cfg.BACKEND selects hw vs mujoco in setup()).
+        self.traj_ctrl: RobotBackend | None = None
+        self.world: WorldSource | None = None
         self.moveit_ctrl: MoveItController | None = None
-        self.conveyor: ConveyorSpeedTracker | None = None
+        # ConveyorSpeedTracker-compatible belt state (== self.world.belt).
+        self.conveyor = None
 
         self.M1: np.ndarray | None = None
         self.M2: np.ndarray | None = None
@@ -104,6 +103,10 @@ class GP8App:
         self.throw_skill: ThrowSkill | None = None
         self.push_skill: PushSkill | None = None
         self.selector: ActionSelector | None = None
+        self.rl_shadow = None
+        # Sim-to-real validation recorder (GP8_S2R_VALIDATE=1); see validation/.
+        self.s2r = None
+        self.s2r_source: str | None = None   # run label; RealRlRunner sets "rl_<backend>"
 
         # Coarse drop: only when an object's extrapolated y has fallen below the
         # WORST-CASE downstream reach edge (-MAX_REACH, the centerline lane). The
@@ -121,6 +124,8 @@ class GP8App:
             eps_y_max=self.cfg.OBJECT_MATCH_EPS_Y_MAX,
             merge_eps_y_max=self.cfg.OBJECT_MERGE_EPS_Y_MAX,
             assoc=self.cfg.TRACK_ASSOC,
+            max_footprint_m=(self.cfg.OBJECT_MAX_FOOTPRINT_M
+                             if self.cfg.OBJECT_MAX_FOOTPRINT_M > 0 else None),
         )
 
     # ------------------------------------------------------------------
@@ -137,28 +142,36 @@ class GP8App:
             String, "/gp8_manager/tracked_state", 10
         )
 
-        self.traj_ctrl = TrajectoryController(self._node)
+        # Backend seams: the SAME app/skill code drives hardware or the MuJoCo
+        # twin — only the two injected implementations differ (cfg.BACKEND,
+        # env GP8_BACKEND / --backend).
+        if self.cfg.BACKEND == "mujoco":
+            from gp8_control.backends.mujoco_sim import (   # needs mujoco>=3.1
+                MujocoRobotBackend, MujocoWorldSource, SimConfig, SimCore,
+                bins_from_config,
+            )
+            # Bins at THIS config's throw goal / push targets (env + launch
+            # overrides included), so sim landings are judged where the real
+            # bins stand.
+            core = SimCore(SimConfig(grasp_z=self.cfg.GRASP_Z,
+                                     bins=bins_from_config(self.cfg)))
+            core.start()
+            self.traj_ctrl = MujocoRobotBackend(core)
+            self.world = MujocoWorldSource(core)
+        else:
+            self.traj_ctrl = TrajectoryController(self._node)
+            from gp8_control.backends.ros_world import HardwareWorldSource
+            self.world = HardwareWorldSource(self._node, self.cfg)
+        self.conveyor = self.world.belt
         # MoveItController는 현재 어디서도 호출되지 않는다 (초기 자세 이동도
         # trajectory()로 처리). 기본은 생성하지 않아 move_group 의존과 그
-        # __init__의 30초 대기를 없앤다. 옛 동작이 필요하면 GP8_USE_MOVEIT=1.
+        # __init__의 30초 대기를 없앤다. 옛 동작이 필요하면 GP8_USE_MOVEIT=1
+        # (하드웨어 백엔드 전용).
         self.moveit_ctrl = (
             MoveItController(self._node)
-            if os.environ.get("GP8_USE_MOVEIT", "0").lower() in ("1", "true", "yes")
+            if self.cfg.BACKEND == "hw"
+            and os.environ.get("GP8_USE_MOVEIT", "0").lower() in ("1", "true", "yes")
             else None
-        )
-        # camera_debug node owns the perception stream + corrections; we just
-        # subscribe to its corrected detection list.
-        self._node.create_subscription(
-            String, "/camera_debug/detections",
-            self._on_camera_debug_detections, 10,
-        )
-        # Encoder telemetry is the single source of truth for belt speed.
-        self.conveyor = ConveyorSpeedTracker(
-            self._node,
-            self.cfg.CONVEYOR_TOPIC,
-            self.cfg.CONVEYOR_SPEED,
-            self.cfg.CONVEYOR_STALE_SECONDS,
-            distance_topic=self.cfg.CONVEYOR_DISTANCE_TOPIC,
         )
 
         self.traj_ctrl.wait_for_servers()
@@ -177,6 +190,7 @@ class GP8App:
         self._setup_joint_limits()
         self._build_planner()
         self._build_skills()
+        self._attach_s2r_recorder()
         self._enable_robot()
         # Always start from a known-off suction state.
         self._node.get_logger().info("Forcing suction OFF at startup.")
@@ -277,6 +291,7 @@ class GP8App:
             # the selector's skills map) so the intercept solver can use its timeline.
             skill_obj_for=lambda obj: self.selector.skills[self.selector.skill_for(obj)],
             idle_joint=idle_joint,
+            ok=rclpy.ok,
         )
         self.throw_skill = ThrowSkill(self.ctx)
         self.push_skill = PushSkill(self.ctx)
@@ -323,6 +338,23 @@ class GP8App:
             by_class=self.cfg.SKILL_BY_CLASS,
             force=force,
         )
+        from gp8_control.rl.real_shadow import RealShadowRl
+        self.rl_shadow = RealShadowRl.from_env(self)
+        if self.rl_shadow is not None:
+            self._node.get_logger().info(
+                "RL shadow logging enabled; policy actions are read-only; "
+                f"log={self.rl_shadow.log_path}"
+            )
+
+    def _attach_s2r_recorder(self) -> None:
+        from gp8_control.validation.recorder import Sim2RealRecorder
+
+        self.s2r = Sim2RealRecorder.from_env(
+            self, source=self.s2r_source or f"app_{self.cfg.BACKEND}")
+        if self.s2r is not None:
+            self._node.get_logger().info(
+                f"[s2r] sim-to-real validation recording -> {self.s2r.run_dir}"
+            )
 
     def _enable_robot(self) -> None:
         """Ready the robot for motion (one-time; a no-op on the adv4ncr stream backend)."""
@@ -336,8 +368,11 @@ class GP8App:
 
     def _move_to_initial_pose(self) -> None:
         # ros2 launch ExecuteProcess does not forward stdin; only prompt
-        # when running interactively.
-        if sys.stdin.isatty():
+        # when running interactively. GP8_INITIAL_POSE_CONFIRM=0 skips the
+        # prompt entirely (cleared workspace, e.g. the RL/s2r runner).
+        if os.environ.get("GP8_INITIAL_POSE_CONFIRM", "1").lower() in ("0", "false", "no", "off"):
+            self._node.get_logger().info("Moving to initial pose (no confirmation).")
+        elif sys.stdin.isatty():
             try:
                 input("Press Enter to move to initial pose (Ctrl+C to abort).")
             except EOFError:
@@ -416,6 +451,11 @@ class GP8App:
         target_it = None
         vetoed_ids = set()
         for candidate in list(self.queue._objects):
+            # Tentative track (fewer than TRACK_MIN_HITS frames and not yet
+            # centre-confirmed): keep it queued -- it may still merge or turn
+            # out real -- but never act on it. One-frame ghosts die here.
+            if not is_established(candidate, self.cfg.TRACK_MIN_HITS):
+                continue
             # Place/judge the intercept with the timeline of the skill that will
             # ACTUALLY run this object (push has a much larger time-to-contact than
             # throw). Routing is geometry-independent, so resolving it here matches
@@ -455,7 +495,9 @@ class GP8App:
         # know we won't push would waste the chain move.
         self.queue.remove(target)
         secondary = next(
-            (o for o in self.queue._objects if o.track_id not in vetoed_ids),
+            (o for o in self.queue._objects
+             if o.track_id not in vetoed_ids
+             and is_established(o, self.cfg.TRACK_MIN_HITS)),
             None,
         )
         # Keep the active target visible in belt_viz while we execute the cycle.
@@ -582,30 +624,28 @@ class GP8App:
     # Epoch stages
     # ------------------------------------------------------------------
     def _ingest_detections(self, now: float) -> None:
-        """Fold the latest camera_debug snapshot into the queue (spatial dedup).
+        """Fold every camera_debug snapshot received since the last call into
+        the queue, oldest first (spatial dedup).
 
         Thin wrapper around ``DetectionIntake.ingest`` (perception/): the
         detection→queue association lives there; the app keeps only the
         frame-gate bookkeeping keyed on whether anything new was added.
+        Draining ALL buffered frames (not just the latest) matters while a
+        skill blocks the loop for seconds: the producer flags each object's
+        centre frame exactly once, and a dropped flag left the 2026-10-19 HW
+        run with 12/23 tracks never pose-confirmed.
         """
-        receipt_time = (
-            float(self._cam_latest.get("receipt_time", now))
-            if self._cam_latest is not None else now
-        )
-        belt_distance_at_detection = self.conveyor.distance_at(receipt_time)
-        added = self.detection_intake.ingest(
-            self._cam_latest, self.queue, self._active_target,
-            self.conveyor.current, self._node.get_logger(),
-            belt_distance_m=belt_distance_at_detection,
-        )
+        added = 0
+        for snap in self.world.drain_snapshots():
+            receipt_time = float(snap.get("receipt_time", now))
+            belt_distance_at_detection = self.conveyor.distance_at(receipt_time)
+            added += self.detection_intake.ingest(
+                snap, self.queue, self._active_target,
+                self.conveyor.current, self._node.get_logger(),
+                belt_distance_m=belt_distance_at_detection,
+            )
         if added:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
-
-    def _on_camera_debug_detections(self, msg: String) -> None:
-        try:
-            self._cam_latest = json.loads(msg.data)
-        except (ValueError, TypeError):
-            pass
 
     # ------------------------------------------------------------------
     # Main loop
@@ -637,6 +677,14 @@ class GP8App:
             time.sleep(self.cfg.TIME_STEP)
             return
 
+        rl_shadow_record = None
+        if self.rl_shadow is not None:
+            try:
+                rl_shadow_record = self.rl_shadow.snapshot()
+                rl_shadow_record["epoch"] = int(epoch)
+            except Exception as e:
+                self._node.get_logger().warn(f"RL shadow snapshot failed: {e}")
+
         request = self._select_ambush_target(now, current_joint)
         if request is not None:
             # Decide push vs throw (rule-based today; RL later) and run it.
@@ -648,11 +696,47 @@ class GP8App:
                 f"Route id={request.target.track_id} {request.target.class_name} "
                 f"(conf {request.target.conf:.2f}) -> {skill.name}"
             )
+            if self.rl_shadow is not None:
+                try:
+                    if rl_shadow_record is None:
+                        rl_shadow_record = {"epoch": int(epoch), "ts": time.time()}
+                    self.rl_shadow.attach_app_selection(
+                        rl_shadow_record,
+                        selected_request=request,
+                        selected_skill=skill,
+                    )
+                    self.rl_shadow.write_record(rl_shadow_record)
+                except Exception as e:
+                    self._node.get_logger().warn(
+                        f"RL shadow selected-action log failed: {e}"
+                    )
             # Tag this cycle's queued commands with the skill (push/throw) for the
             # diagnostic motion CSV (no-op unless GP8_MOTION_LOG_DIR is set).
             self.traj_ctrl.set_motion_op(skill.name)
-            skill.execute(request)
+            s2r_step = None
+            if self.s2r is not None:
+                s2r_step = self.s2r.begin_step(
+                    self, kind="app",
+                    executed={"skill": skill.name,
+                              "track_id": request.target.track_id,
+                              "class_name": request.target.class_name},
+                )
+            result = skill.execute(request)
+            if s2r_step is not None:
+                self.s2r.end_step(
+                    s2r_step,
+                    info={"execution_success": bool(getattr(result, "success", False)),
+                          "execution_detail": str(getattr(result, "detail", ""))},
+                )
         else:
+            if self.rl_shadow is not None and rl_shadow_record is not None:
+                try:
+                    self.rl_shadow.attach_app_selection(rl_shadow_record)
+                    self.rl_shadow.write_record(rl_shadow_record)
+                except Exception as e:
+                    self._node.get_logger().warn(
+                        f"RL shadow idle-action log failed: {e}"
+                    )
             # Queue non-empty but nothing selectable (e.g. every object vetoed):
             # without this the epoch loop would re-run the intercept solver at
             # ~kHz until the vetoed objects reach the drop line.
@@ -675,6 +759,23 @@ class GP8App:
                 self.traj_ctrl.exit_queue_mode()
             except Exception as e:
                 self._node.get_logger().warn(f"exit_queue_mode failed: {e}")
+            try:
+                # Backend teardown: HW drains pending suction IO writes (so a
+                # final suction_off is transmitted); sim stops the stepper and
+                # finalizes an in-progress GP8_SIM_RECORD video.
+                self.traj_ctrl.close()
+            except Exception as e:
+                self._node.get_logger().warn(f"backend close failed: {e}")
+            try:
+                if self.rl_shadow is not None:
+                    self.rl_shadow.close()
+            except Exception as e:
+                self._node.get_logger().warn(f"RL shadow close failed: {e}")
+            try:
+                if self.s2r is not None:
+                    self.s2r.close()   # flush + launch the analyzer detached
+            except Exception as e:
+                self._node.get_logger().warn(f"s2r recorder close failed: {e}")
             # Stop the background spinner before tearing down the node so spin()
             # returns and its daemon thread exits cleanly.
             if self._executor is not None:
@@ -689,6 +790,17 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         prog="gp8_app",
         description="GP8 conveyor pick-and-place orchestrator.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["hw", "mujoco"],
+        default=None,
+        help=(
+            "Robot/world backend: 'hw' (default) drives the real adv4ncr "
+            "controller + camera_debug perception; 'mujoco' runs the in-process "
+            "MuJoCo physics twin (needs mujoco>=3.1: uv sync --extra sim). "
+            "Overrides the GP8_BACKEND env var."
+        ),
     )
     parser.add_argument(
         "--skill",
@@ -741,6 +853,8 @@ def main(argv=None) -> None:
     args, _ = parser.parse_known_args(argv)
 
     cfg = Config()
+    if args.backend is not None:
+        cfg.BACKEND = args.backend     # CLI flag wins over the env default
     if args.skill is not None:
         cfg.FORCE_SKILL = args.skill   # CLI flag wins over the env default
     if args.track_z_start is not None:

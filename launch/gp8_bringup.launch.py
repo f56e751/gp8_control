@@ -225,6 +225,14 @@ def generate_launch_description():
             "Empty keeps throw_goal_x/y/radius behavior."
         ),
     )
+    # Sim-to-real validation recording (validation/): `s2r_validate:=true`
+    # records the run and auto-writes ~/gp8_s2r_runs/<stamp>_app_hw/report.md
+    # on shutdown. Omitted -> shell GP8_S2R_VALIDATE, else off.
+    s2r_validate_arg = DeclareLaunchArgument(
+        "s2r_validate",
+        default_value=EnvironmentVariable("GP8_S2R_VALIDATE", default_value="false"),
+        description="Record + analyze this run for sim-to-real fidelity (true/false).",
+    )
 
     # Robot model (URDF -> TF), robot_description, and SRDF are now provided by
     # the included adv4ncr stack's robot_state_publisher and by move_group
@@ -334,7 +342,11 @@ def generate_launch_description():
         # 2. Known standalone package source tree (when colcon copy-build
         #    puts __file__ inside install/share and the walk-up above can't
         #    escape back to the repo).
+        # <ws>/install/gp8_control/share/gp8_control/launch -> <ws>/src/gp8_control:
+        # a copy-built workspace finds ITS OWN source venv before the legacy paths.
+        ws_root = os.path.abspath(os.path.join(launch_dir, *([os.pardir] * 5)))
         for fallback in (
+            os.path.join(ws_root, "src", "gp8_control", ".venv", "bin", "python"),
             os.path.expanduser("~/ros2_ws/src/gp8_control/.venv/bin/python"),
             os.path.expanduser("~/Documents/Github/iitp_robot_control/.venv/bin/python"),
         ):
@@ -418,7 +430,22 @@ def generate_launch_description():
             "GP8_THROW_GOAL_Y": LaunchConfiguration("throw_goal_y"),
             "GP8_THROW_GOAL_RADIUS": LaunchConfiguration("throw_goal_radius"),
             "GP8_THROW_BINS": LaunchConfiguration("throw_bins"),
+            "GP8_S2R_VALIDATE": LaunchConfiguration("s2r_validate"),
         },
+    )
+
+    # Belt encoder (esp32_encoder): /conveyor/speed + /conveyor/distance_mm,
+    # the app's belt-speed / encoder-distance source. `conveyor:=false` when it
+    # already runs elsewhere. Serial port auto-detected.
+    conveyor_arg = DeclareLaunchArgument(
+        "conveyor", default_value="true",
+        description="Run the esp32 belt encoder node (/conveyor/speed).",
+    )
+    conveyor_node = Node(
+        package="esp32_encoder",
+        executable="conveyor_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("conveyor")),
     )
 
     rviz = Node(
@@ -457,6 +484,9 @@ def generate_launch_description():
         throw_goal_y_arg,
         throw_goal_radius_arg,
         throw_bins_arg,
+        s2r_validate_arg,
+        conveyor_arg,
+        conveyor_node,
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,

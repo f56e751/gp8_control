@@ -14,6 +14,8 @@ Launches (same pieces, same defaults as gp8_bringup):
      even in the default "stream" backend; inactive so it never claims the
      command interface from the active JGPC.
   3. MoveIt 2 (move_group).
+  4. esp32 belt encoder node (/conveyor/speed, /conveyor/distance_mm);
+     `conveyor:=false` to skip (e.g. when it already runs elsewhere).
 
 No camera, no perception, no app. Requires the motoman_ROS2 workspace overlaid
 (its install/setup.bash sourced) so motoman_bringup resolves — same requirement
@@ -30,6 +32,7 @@ Usage:
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -94,6 +97,22 @@ def generate_launch_description():
         ]),
     )
 
+    # =====================================================================
+    # 4. Belt encoder (esp32_encoder) — the app's belt speed / encoder
+    #    distance source. Without it the app dead-reckons on the fallback
+    #    CONVEYOR_SPEED. Serial port auto-detected (param `port` overrides).
+    # =====================================================================
+    conveyor_arg = DeclareLaunchArgument(
+        "conveyor", default_value="true",
+        description="Run the esp32 belt encoder node (/conveyor/speed).",
+    )
+    conveyor_node = Node(
+        package="esp32_encoder",
+        executable="conveyor_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("conveyor")),
+    )
+
     return LaunchDescription([
         robot_ip_arg,
         inc_factor_arg,
@@ -101,4 +120,6 @@ def generate_launch_description():
         adv4ncr_stack,
         jtc_spawner_inactive,
         moveit_launch,
+        conveyor_arg,
+        conveyor_node,
     ])
