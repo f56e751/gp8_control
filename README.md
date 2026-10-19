@@ -159,6 +159,12 @@ confidence 분포), 결정→모션 지연(중앙 40 ms). 관측 차원(91)은 �
 정의: `rl/sim_profile.py`. 실기 runner 는 학습과 같은 240 s 반복 에피소드 시계로
 `remaining_time_frac` 을 넣는다 (`gp8_s2r --episode-seconds 0` 이면 예전처럼 1.0).
 
+> **2026-10-19 이전에 학습한 모델은 재학습 권장.** 처리한 물체가 큐에서 빠지지 않던
+> 버그(`TrackedObject` 비교, `da90bc0` 에서 수정)가 학습 sim 에도 있었다 — 큐 맨 앞이
+> 아닌 물체는 실행 후에도 남아 다시 후보로 보였고, 관측의 `pending_slot` 이 자주
+> "없음(6)" 으로 들어갔다. 관측 bbox corner 위치 보정도 같은 날 들어갔다(학습 sim 의
+> truth track 입력은 그대로).
+
 ```bash
 uv sync --extra sim --extra rl        # 한 번
 cd <ws>/src && GP8_SIM_PROFILE=hw2026 GP8_SIM_PHYSICAL_BELT=true GP8_SIM_BELT_CONTACT_PARAMS=old \
