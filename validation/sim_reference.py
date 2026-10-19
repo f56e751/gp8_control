@@ -78,7 +78,8 @@ def run_sim_reference(
         }
         rec = Sim2RealRecorder(
             out_dir, clock=runner.clock, source=source, schema=schema,
-            auto_analyze=False, meta=meta)
+            auto_analyze=False, meta=meta,
+            background_poll=bool(runner.core.cfg.realtime))
         rec.attach(runner)
         instrument_runner(runner, rec, episode_seconds=episode_seconds)
         # n_steps counts EXECUTED skills (idle steps only advance TIME_STEP and

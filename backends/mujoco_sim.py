@@ -63,14 +63,33 @@ else:
 # The vendored sim/ tree is deliberately NOT colcon-installed (setup.py), so
 # when this module is imported from the install-tree copy the __file__-relative
 # path misses — fall back to the source tree (or the GP8_SIM_SCENE override).
+def _source_tree_candidates(*rel: str) -> list[Path]:
+    """Where the vendored, NOT colcon-installed source files live.
+
+    Order: next to this file (running from the source tree); then THIS
+    workspace's ``src/gp8_control`` when running from ``<ws>/install`` (a
+    copy-built install has no sim/ or config/ tree); the legacy
+    ``~/ros2_ws`` path only last. Without the workspace step an install in
+    another workspace silently loaded ~/ros2_ws's (older) scene -- on
+    2026-10-19 that scene's belt moved boxes at 0.79x the encoder.
+    """
+    here = Path(__file__).resolve()
+    out = [here.parents[1].joinpath(*rel)]
+    for parent in here.parents:
+        if parent.name == "install":
+            out.append(parent.parent.joinpath("src", "gp8_control", *rel))
+            break
+    out.append(Path.home().joinpath("ros2_ws", "src", "gp8_control", *rel))
+    return out
+
+
 def _find_scene() -> Path:
     rel = ("sim", "recycling_mujoco", "scene.xml")
     candidates = []
     env = os.environ.get("GP8_SIM_SCENE")
     if env:
         candidates.append(Path(env))
-    candidates.append(Path(__file__).resolve().parents[1].joinpath(*rel))
-    candidates.append(Path.home().joinpath("ros2_ws", "src", "gp8_control", *rel))
+    candidates.extend(_source_tree_candidates(*rel))
     for c in candidates:
         if c.is_file():
             return c
@@ -89,8 +108,7 @@ def _find_camera_info() -> Path | None:
     env = os.environ.get("GP8_SIM_CAMERA_INFO")
     if env:
         candidates.append(Path(env))
-    candidates.append(Path(__file__).resolve().parents[1].joinpath(*rel))
-    candidates.append(Path.home().joinpath("ros2_ws", "src", "gp8_control", *rel))
+    candidates.extend(_source_tree_candidates(*rel))
     return next((c for c in candidates if c.is_file()), None)
 
 

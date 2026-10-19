@@ -79,6 +79,7 @@ class RealRlRunner:
     def start(self) -> None:
         self.app.s2r_source = f"rl_{self.cfg.BACKEND}"
         self.app.setup()
+        self._episode_t0 = time.time()
         self._install_rl_hooks()
         if self.app.s2r is not None:
             from gp8_control.validation.recorder import instrument_runner
@@ -267,6 +268,19 @@ class RealRlRunner:
                 return np.array([slot, skill_index], dtype=int)
         return skip_action(self.max_objects)
 
+    #: Training episodes are 240 s and the policy observes remaining time
+    #: (1 -> 0). The real loop has no episodes, so it runs on a repeating
+    #: episode clock of the same length (0 = keep the old constant 1.0).
+    episode_seconds: float = 240.0
+    _episode_t0: float | None = None
+
+    def remaining_time_frac(self, now: float | None = None) -> float:
+        if not self.episode_seconds or self._episode_t0 is None:
+            return 1.0
+        now = time.time() if now is None else float(now)
+        phase = ((now - self._episode_t0) % self.episode_seconds) / self.episode_seconds
+        return float(1.0 - phase)
+
     def observation(self, include_eta: bool | None = None) -> np.ndarray:
         include_eta = self.include_eta if include_eta is None else bool(include_eta)
         now = time.time()
@@ -279,6 +293,7 @@ class RealRlRunner:
             ee_xyz=self.ee_xyz(current_joint),
             pending_indices=self._pending_indices(),
             belt_speed=self.app.conveyor.current,
+            remaining_time_frac=self.remaining_time_frac(now),
             y_now_for=lambda target: self.app.ctx.object_y_now(
                 target, now, self.app.conveyor.current
             ),
@@ -559,6 +574,9 @@ def main(argv=None) -> int:
                         help="run directory (default ~/gp8_s2r_runs/<stamp>_rl_<backend>)")
     parser.add_argument("--confirm-initial", action="store_true",
                         help="ask for Enter before moving to the initial pose")
+    parser.add_argument("--episode-seconds", type=float, default=240.0,
+                        help="repeating episode clock fed to remaining_time_frac "
+                             "(training episode length; 0 = constant 1.0)")
     args = parser.parse_args(argv)
     if not args.confirm_initial:
         os.environ.setdefault("GP8_INITIAL_POSE_CONFIRM", "0")
@@ -575,6 +593,7 @@ def main(argv=None) -> int:
         bbox_observation=args.bbox_observation,
         log_path=args.log or None,
     )
+    runner.episode_seconds = float(args.episode_seconds)
     try:
         runner.start()
         step_idx = 0

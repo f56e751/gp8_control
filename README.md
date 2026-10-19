@@ -133,6 +133,23 @@ ros2 control list_hardware_components            # MotomanHardware 가 active �
 | MuJoCo 스모크 테스트 | `.venv/bin/python -m gp8_control.tests.sim_smoke [--viewer]` |
 | MuJoCo 시뮬레이터로 앱 실행 | `ros2 launch gp8_control sim.launch.py [viewer:=true]` |
 
+### RL 학습 — 실기형 sim 설정 (`GP8_SIM_PROFILE=hw2026`)
+
+2026-10-19 실기 측정값에 맞춘 학습 환경: 벨트 0.10–0.30 m/s, 유입 0.2–0.7 Hz,
+실기 관측 크기·레인·축정렬 bbox, 카메라형 관측 노이즈(위치 치우침·흔들림, 실기
+confidence 분포), 결정→모션 지연(중앙 40 ms). 관측 차원(91)은 그대로.
+기존 기본 설정은 바뀌지 않으며, 명시적으로 export 한 `GP8_SIM_*` 값이 우선한다.
+정의: `rl/sim_profile.py`. 실기 runner 는 학습과 같은 240 s 반복 에피소드 시계로
+`remaining_time_frac` 을 넣는다 (`gp8_s2r --episode-seconds 0` 이면 예전처럼 1.0).
+
+```bash
+uv sync --extra sim --extra rl        # 한 번
+cd <ws>/src && GP8_SIM_PROFILE=hw2026 GP8_SIM_PHYSICAL_BELT=true GP8_SIM_BELT_CONTACT_PARAMS=old \
+  gp8_control/.venv/bin/python -m gp8_control.tools.train_ppo_smoke \
+  --out-dir gp8_control/runs/hw2026_100k --timesteps 100000 --n-envs 16 --n-steps 16 \
+  --batch-size 128 --max-episode-seconds 240 --bbox-observation corners --truth-tracks --device auto
+```
+
 검증 리포트가 보는 것 (`validation/`): 250 Hz 명령 대비 실제 추종(같은 명령을
 MuJoCo 팔에 재생해 HW vs sim 비교), 결정→첫 모션 지연, 석션 IO, 그리고 RL
 관측값(91차원)의 채널별 정확도와 sim 분포 비교. 자세한 건 `validation/README.md`.

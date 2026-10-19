@@ -43,6 +43,9 @@ SIM_ENV_KEYS = (
     "GP8_RL_BBOX_OBSERVATION",
     "GP8_RL_SIM_TRUTH_TRACKS",
     "GP8_RL_INCLUDE_SUCTION_P",
+    "GP8_SIM_PROFILE",
+    "GP8_RL_OBS_NOISE",
+    "GP8_RL_DECISION_LATENCY",
 )
 
 
@@ -577,6 +580,12 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    # Resolve GP8_SIM_PROFILE into concrete env defaults up front so the run
+    # metadata records them and SubprocVecEnv workers inherit them.
+    from gp8_control.rl.sim_profile import apply_sim_profile
+    applied = apply_sim_profile()
+    if applied:
+        print(f"[train] sim profile {os.environ.get('GP8_SIM_PROFILE')}: {applied}", flush=True)
     if args.eval_only:
         return evaluate(args)
     return train(args)

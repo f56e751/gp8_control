@@ -120,8 +120,15 @@ class Sim2RealRecorder:
         auto_analyze: bool = True,
         analyze_args: tuple[str, ...] = (),
         meta: dict | None = None,
+        background_poll: bool = True,
     ) -> None:
         self.run_dir = Path(run_dir).expanduser()
+        # Wall-clock world polling is only meaningful when the world runs in
+        # wall time. A non-realtime sim outruns it and mutates track fields
+        # between the poller's reads (that skewed bbox-vs-encoder slopes to
+        # ~0.79 in recorded sim runs) -- there, poll only synchronously at
+        # each decision step (begin_step).
+        self.background_poll = bool(background_poll)
         (self.run_dir / "stream").mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self.source = str(source)
@@ -329,7 +336,8 @@ class Sim2RealRecorder:
     def _background(self) -> None:
         next_flush = time.monotonic() + FLUSH_PERIOD_S
         while not self._stop.is_set():
-            self._poll_world_safe()
+            if self.background_poll:
+                self._poll_world_safe()
             if time.monotonic() >= next_flush:
                 self.flush()
                 next_flush = time.monotonic() + FLUSH_PERIOD_S
@@ -550,7 +558,9 @@ def instrument_runner(runner, rec: Sim2RealRecorder, *, episode_seconds: float |
                 return orig_step(action)
             last_idle[0] = now
         remaining = 1.0
-        if episode_seconds:
+        if callable(getattr(runner, "remaining_time_frac", None)):
+            remaining = runner.remaining_time_frac()   # what the runner feeds its policy
+        elif episode_seconds:
             remaining = max(0.0, 1.0 - (clock.time() - t0) / float(episode_seconds))
         rec_step = rec.begin_step(
             runner,

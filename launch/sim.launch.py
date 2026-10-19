@@ -37,9 +37,16 @@ def _resolve_venv_python() -> str:
         if parent == d:
             break
         d = parent
-    fallback = os.path.expanduser("~/ros2_ws/src/gp8_control/.venv/bin/python")
-    if os.path.isfile(fallback):
-        return fallback
+    # <ws>/install/gp8_control/share/gp8_control/launch -> <ws>/src/gp8_control:
+    # a copy-built install must use ITS OWN workspace's venv + source tree, not
+    # the legacy ~/ros2_ws one (which would run that tree's code entirely).
+    ws_root = os.path.abspath(os.path.join(launch_dir, *([os.pardir] * 5)))
+    for fallback in (
+        os.path.join(ws_root, "src", "gp8_control", ".venv", "bin", "python"),
+        os.path.expanduser("~/ros2_ws/src/gp8_control/.venv/bin/python"),
+    ):
+        if os.path.isfile(fallback):
+            return fallback
     raise RuntimeError(
         "Could not locate .venv/bin/python. Run `uv sync --extra sim` inside "
         "ros2_ws/src/gp8_control or set GP8_VENV_PYTHON."

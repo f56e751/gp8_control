@@ -31,6 +31,11 @@ from gp8_control.rl.common import (
     normalize_bbox_observation,
     skip_action,
 )
+from gp8_control.rl.sim_profile import (
+    DecisionLatencyModel,
+    ObsNoiseModel,
+    apply_sim_profile,
+)
 from gp8_control.skills.base import SkillResult
 from gp8_control.skills import PickRequest, PushSkill, SkillContext, ThrowSkill
 from gp8_control.skills.push_skill import (
@@ -106,6 +111,15 @@ def _make_transform(rotation: np.ndarray, translation) -> np.ndarray:
     return transform
 
 
+def _shift_bbox(value, dx: float, dy: float):
+    if value is None:
+        return None
+    pts = np.asarray(value, dtype=float).copy()
+    pts[:, 0] += dx
+    pts[:, 1] += dy
+    return pts
+
+
 def _freeze_bbox_like(value):
     if value is None:
         return None
@@ -131,6 +145,9 @@ class SimRlRunner:
         sim_seed: int | None = None,
         realtime: bool | None = None,
     ) -> None:
+        # A named profile (GP8_SIM_PROFILE, e.g. hw2026) only fills env
+        # defaults, so it must run before any env-derived setting is read.
+        apply_sim_profile()
         self.cfg = cfg or Config()
         self.cfg.BACKEND = "mujoco"
         self.max_objects = int(max_objects)
@@ -193,6 +210,13 @@ class SimRlRunner:
         self._chain_action: HighLevelAction | None = None
         self._episode_start = self.clock.time()
         self._pending_action: HighLevelAction | None = None
+        # Hardware-likeness models (off unless GP8_RL_OBS_NOISE /
+        # GP8_RL_DECISION_LATENCY or a profile turns them on).
+        self._obs_noise = ObsNoiseModel.from_env()
+        self._latency = DecisionLatencyModel.from_env()
+        self._noise_rng = np.random.default_rng(
+            None if sim_seed is None else int(sim_seed) + 7_000_003)
+        self._obj_bias: dict[int, tuple[float, float, float, float]] = {}
         self._build_skills()
 
     def _build_skills(self) -> None:
@@ -316,17 +340,31 @@ class SimRlRunner:
                 continue
             grasp = np.asarray(truth["base_grasp"], dtype=float)
             aim = np.asarray(truth["base_aim"], dtype=float)
+            bbox_grasp = truth.get("base_bbox_grasp")
+            bbox_aim = truth.get("base_bbox_aim")
+            conf = float(truth.get("confidence", obj.conf))
+            if self._obs_noise is not None:
+                noise = self._obs_noise
+                bx, by, ox, oy = self._obj_bias.setdefault(
+                    int(sim_id), noise.object_bias(self._noise_rng))
+                jx, jy = noise.frame_jitter(self._noise_rng)
+                grasp = grasp.copy(); aim = aim.copy()
+                grasp[0] += bx; grasp[1] += by
+                aim[0] += bx; aim[1] += by
+                bbox_grasp = _shift_bbox(bbox_grasp, bx + ox + jx, by + oy + jy)
+                bbox_aim = _shift_bbox(bbox_aim, bx + ox + jx, by + oy + jy)
+                conf = noise.confidence(self._noise_rng)
             obj.T_grasp_base[:3, 3] = grasp[:3]
             obj.T_aim_base[:3, 3] = aim[:3]
             obj.detect_time = now
             obj.encoder_distance_m = belt_distance
             obj.cam_pos = tuple(truth.get("cam", (0.0, 0.0, 0.0)))
             obj.cam_bbox = _freeze_bbox_like(truth.get("cam_bbox"))
-            obj.base_bbox_grasp = _freeze_bbox_like(truth.get("base_bbox_grasp"))
-            obj.base_bbox_aim = _freeze_bbox_like(truth.get("base_bbox_aim"))
+            obj.base_bbox_grasp = _freeze_bbox_like(bbox_grasp)
+            obj.base_bbox_aim = _freeze_bbox_like(bbox_aim)
             obj.bbox_detect_time = now
             obj.bbox_encoder_distance_m = belt_distance
-            obj.conf = float(truth.get("confidence", obj.conf))
+            obj.conf = conf
             obj.suction_p = float(truth.get("suction_p", getattr(obj, "suction_p", 1.0)))
 
     def action_from_indices(self, object_slot: int, skill_index: int) -> HighLevelAction | None:
@@ -357,6 +395,13 @@ class SimRlRunner:
                 self._pending_action = None
                 self.clock.sleep(self.cfg.TIME_STEP)
             elif pending is not None and pending.target is not None:
+                if self._latency is not None and not self.core.cfg.realtime:
+                    # The real loop spends wall time deciding / planning
+                    # before the first motion sample while the belt moves on;
+                    # a non-realtime sim would otherwise spend none.
+                    latency = self._latency.sample(self._noise_rng)
+                    info["decision_latency_s"] = latency
+                    self.clock.sleep(latency)
                 result = self._execute_action(pending)
                 info.update(
                     executed=True,
