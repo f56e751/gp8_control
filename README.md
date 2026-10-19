@@ -115,7 +115,7 @@ ros2 control list_hardware_components            # MotomanHardware 가 active �
 ## 카메라 PC (robot6)
 
 - 접속: `ssh iitp@147.46.175.15`, 코드: `/PublicSSD/iitp/demo/iitp_perception`
-  (데모 브랜치 `test/v4-center-anchor` — schema v4: `track_ids`, `center_confirmed`)
+  (`master` — schema v4: `track_ids`, `center_radius_m`, `center_confirmed`)
 - 실행/재시작: `docker stop iitp_local; cd /PublicSSD/iitp/demo/iitp_perception && ./docker_local.sh`
 - 확인: `curl -s http://147.46.175.15:8080/detections/stream | head -c 400` → `"schema_version": 4`
 - 모든 검출 기록: `results_local/detections.jsonl` (replay 도구 입력)
