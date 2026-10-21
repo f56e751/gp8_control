@@ -130,6 +130,7 @@ class SimRlRunner:
         include_suction_p: bool = False,
         sim_seed: int | None = None,
         realtime: bool | None = None,
+        core_factory=None,
     ) -> None:
         self.cfg = cfg or Config()
         self.cfg.BACKEND = "mujoco"
@@ -156,7 +157,9 @@ class SimRlRunner:
                 sim_cfg.seed = int(sim_seed)
         if realtime is not None:
             sim_cfg.realtime = bool(realtime)
-        self.core = SimCore(sim_cfg)
+        # Optional simulation-only injection; existing app/RL callers retain
+        # the native core and all shared skill/control behavior by default.
+        self.core = (core_factory or SimCore)(sim_cfg)
         self.clock: Clock = WALL_CLOCK if sim_cfg.realtime else _SimClock(self.core)
         self.traj_ctrl = MujocoRobotBackend(self.core, clock=self.clock)
         self.world = MujocoWorldSource(self.core)
