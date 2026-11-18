@@ -30,6 +30,27 @@ seed 0~9의 10개 에피소드로 평가했습니다.
   학습 seed 10개)가 나옵니다. 크기마다 두 조건 중 높은 쪽을 골라도 DPPO가 2.0~4.5점 높습니다.
 - 100 에피소드에서는 DPPO가 휴리스틱(74.46)과 비슷한 수준입니다.
 
+### 체크포인트
+
+위 표의 12개 칸마다 학습 seed 10개 중 평가 반환이 가장 높았던 정책을 `checkpoints/`에 올려
+두었습니다(파일당 약 10MB, 파일 이름의 `_s<k>`가 학습 seed). 괄호 안은 그 체크포인트를 시뮬레이터
+seed 0~9로 평가한 평균 반환으로, 위 표 괄호의 최고값과 같습니다.
+
+| 학습 데이터 | DPPO | IQL | BC |
+|---|---|---|---|
+| 100 에피소드 | `dppo_n100_s8.pt` (77.82) | `iql_n100_s5.pt` (72.70) | `bc_n100_s1.pt` (75.20) |
+| 200 에피소드 | `dppo_n200_s1.pt` (83.36) | `iql_n200_s3.pt` (80.10) | `bc_n200_s0.pt` (75.59) |
+| 500 에피소드 | `dppo_n500_s8.pt` (83.29) | `iql_n500_s1.pt` (78.51) | `bc_n500_s4.pt` (76.96) |
+| 1,000 에피소드 | `dppo_n1000_s5.pt` (83.60) | `iql_n1000_s7.pt` (79.95) | `bc_n1000_s3.pt` (76.02) |
+
+```bash
+gp8_control/.venv/bin/python -m gp8_control.examples.dppo.eval_offline_policy \
+    --ckpt gp8_control/examples/dppo/checkpoints/dppo_n1000_s5.pt --tag dppo_n1000_s5 \
+    --seeds 0-9 --workers 5 --out dppo_n1000_s5.jsonl
+```
+
+노드 종류가 다르면 평가 반환이 위 값과 조금 다를 수 있습니다(아래 "재현성" 참고).
+
 ### DPPO 구성 요소별 비교
 
 학습률 감소 조건, 학습 seed 10개.
@@ -185,6 +206,7 @@ gp8_control/examples/dppo/scripts/summarize.sh gp8_control/examples/dppo/runs/ta
 | `eval_offline_policy.py` | 시뮬레이터 평가 (체크포인트 / 휴리스틱 / 무작위) |
 | `collect_offline_data.py` | 오프라인 데이터 수집 |
 | `simenv.py` | 수집과 평가가 함께 쓰는 시뮬레이터 설정, 환경 생성, 행동 인코딩 |
+| `checkpoints/` | 결과 표 12개 칸마다 가장 좋았던 학습 seed의 정책 |
 | `data_seeds_1000.txt` | 결과에 쓴 1,000 에피소드의 seed. 앞에서부터 100 / 200 / 500개가 작은 데이터셋 |
 | `scripts/make_subsets.sh` | 100 / 200 / 500 에피소드 데이터셋 만들기 |
 | `scripts/make_table_tasks.sh`, `slurm_task.sh`, `summarize.sh` | 표 전체 재현과 집계 |
