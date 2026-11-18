@@ -99,12 +99,6 @@ gp8_control/.venv/bin/python -m gp8_control.examples.dppo.eval_offline_policy \
 | 원본 DPPO에 가까운 설정(구간 20~50, 배치 64~256, anchor 없음, 정렬 없음, 상한 있는 거리 `1 − π(a\|s)`) | 66.3–69.0 | 3 |
 | listwise(InfoNCE) 형태의 loss, 덜 선호된 구간의 행동 확률만 낮추는 loss, 덜 선호된 구간에서 정책을 균등 분포로 보내는 loss | 76.4–79.0 | 3–10 |
 
-- **방법에서 뺀 것.** 앙상블, MLP 정책, 길이 1인 구간은 쓰지 않았습니다. 구간 길이 1은 구간 비교가
-  아니라서 DPPO가 아니고, 정책은 원본 DPPO 코드의 Transformer 구조를 옮겨 썼습니다.
-- **IQL 조건.** IQL은 하이퍼파라미터를 고른 값(expectile 0.9, temperature 10)으로 쓰고, DPPO와
-  같은 학습 스텝 수와 학습률 감소를 줍니다. 논문 기본값 결과는 위 "평가 방법에 대해 알아 둘 점"에
-  있습니다.
-
 ## 방법
 
 1. **데이터** (`collect_offline_data.py`). 앱의 휴리스틱 정책(금속은 밀기, 투명은 던지기)에
