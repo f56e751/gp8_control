@@ -153,8 +153,13 @@ class GP8App:
             # Bins at THIS config's throw goal / push targets (env + launch
             # overrides included), so sim landings are judged where the real
             # bins stand.
-            core = SimCore(SimConfig(grasp_z=self.cfg.GRASP_Z,
-                                     bins=bins_from_config(self.cfg)))
+            if self.cfg.MODE in ("cycle", "pieces"):
+                from gp8_control.cycle_throw.runner import cycle_sim_config
+                sim_cfg = cycle_sim_config(self.cfg)
+            else:
+                sim_cfg = SimConfig(grasp_z=self.cfg.GRASP_Z,
+                                    bins=bins_from_config(self.cfg))
+            core = SimCore(sim_cfg)
             core.start()
             self.traj_ctrl = MujocoRobotBackend(core)
             self.world = MujocoWorldSource(core)
@@ -647,6 +652,15 @@ class GP8App:
         if added:
             self.frame_gate.mark(now)  # kept for backward compat (queue-empty reset)
 
+    def _cycle_intake(self) -> None:
+        """Cycle mode: the perception half of run_epoch (no skill dispatch)."""
+        now = time.time()
+        self.conveyor.check_freshness()
+        self._publish_belt_state()
+        self._ingest_detections(now)
+        self.queue.update(now, self.conveyor.current,
+                          belt_distance_m=self.conveyor.distance_m)
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -746,6 +760,60 @@ class GP8App:
         self.setup()
         epoch = 0
         try:
+            if self.cfg.MODE == "cycle":
+                # The cycle planner owns the arm and the object stream; this
+                # thread only feeds it perception (cycle_throw/runner.py).
+                from gp8_control.cycle_throw.runner import CycleThrowRunner
+
+                from gp8_control.cycle_throw.push_slot import make_push_handler
+
+                # Objects the ActionSelector routes to push (metal by default)
+                # are pushed by the normal PushSkill in slots between planner
+                # segments; everything else goes to the planner.
+                top_z = None
+                if self.cfg.BACKEND == "mujoco":
+                    from gp8_control.cycle_throw.runner import sim_object_top
+                    top_z = sim_object_top(self.world._core.cfg)
+                # Orderly stop (scripts/cycle_demo.sh sends SIGUSR1 before it stops
+                # the driver): take no new object, let the planner end at its wait
+                # point, stop the buffer and give the interfaces back to JGPC
+                # (traj_ctrl.close() in the finally) while ROS is still up.
+                import signal
+
+                wind_down = threading.Event()
+                signal.signal(signal.SIGUSR1, lambda *_: wind_down.set())
+                CycleThrowRunner(
+                    self, skill_for=self.ctx.skill_for,
+                    push_handler=make_push_handler(self.ctx, self.push_skill, self.queue),
+                    top_z=top_z,
+                ).run(intake=self._cycle_intake,
+                      ok=lambda: (rclpy.ok() and not self._spinner_dead
+                                  and not wind_down.is_set()))
+                self._node.get_logger().info("[cycle] wound down: arm at rest, back to JGPC next")
+                return
+            if self.cfg.MODE == "pieces":
+                # Skills plan pieces; the teammate's planner parts (robot6) turn
+                # every piece into commands on one command path
+                # (cycle_throw/piece_runner.py). Same stop as cycle mode.
+                import signal
+
+                from gp8_control.cycle_throw.piece_runner import PieceRunner
+                from gp8_control.skills.planner_throw_skill import PlannerThrowSkill
+
+                top_z = None
+                if self.cfg.BACKEND == "mujoco":
+                    from gp8_control.cycle_throw.runner import sim_object_top
+                    top_z = sim_object_top(self.world._core.cfg)
+                wind_down = threading.Event()
+                signal.signal(signal.SIGUSR1, lambda *_: wind_down.set())
+                PieceRunner(
+                    self, ctx=self.ctx, skill_for=self.ctx.skill_for, top_z=top_z,
+                    skills={"throw": PlannerThrowSkill(self.ctx), "push": self.push_skill},
+                ).run(intake=self._cycle_intake,
+                      ok=lambda: (rclpy.ok() and not self._spinner_dead
+                                  and not wind_down.is_set()))
+                self._node.get_logger().info("[pieces] wound down: arm at rest, back to JGPC next")
+                return
             while rclpy.ok() and not self._spinner_dead:
                 epoch += 1
                 try:
@@ -803,6 +871,19 @@ def main(argv=None) -> None:
         ),
     )
     parser.add_argument(
+        "--mode",
+        choices=["skills", "cycle", "pieces"],
+        default=None,
+        help=(
+            "'skills' (default): per-object ActionSelector -> skill loop. "
+            "'cycle': the vendored grasp-and-throw cycle planner owns the arm "
+            "(throws every object into its class bin; hardware needs "
+            "GP8_STREAM_HZ=500 with a 500 Hz driver). 'pieces': skills plan "
+            "pieces (planner throw, push) on one command path, no push slots "
+            "(cycle_throw/piece_runner.py). Overrides GP8_MODE."
+        ),
+    )
+    parser.add_argument(
         "--skill",
         choices=["throw", "robust_throw", "push"],
         default=None,
@@ -855,6 +936,13 @@ def main(argv=None) -> None:
     cfg = Config()
     if args.backend is not None:
         cfg.BACKEND = args.backend     # CLI flag wins over the env default
+    if args.mode is not None:
+        cfg.MODE = args.mode           # CLI flag wins over the env default
+    if cfg.MODE not in ("skills", "cycle", "pieces"):
+        raise SystemExit(f"GP8_MODE={cfg.MODE!r}: expected 'skills', 'cycle' or 'pieces'")
+    # The hardware backend reads it at construction (cycle mode creates the
+    # SampleBufferController topics before the executor spins).
+    os.environ["GP8_MODE"] = cfg.MODE
     if args.skill is not None:
         cfg.FORCE_SKILL = args.skill   # CLI flag wins over the env default
     if args.track_z_start is not None:

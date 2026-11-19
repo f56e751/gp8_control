@@ -22,6 +22,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from gp8_control.robots.base_robot import BaseRobot
+from gp8_control.utils.stream_rate import STREAM_DT, STREAM_HZ
 from gp8_control.utils.lie_algebra import (
     adjoint_se3,
     exp_se3,
@@ -52,15 +53,21 @@ class GP8(BaseRobot):
         np.array([455.0, 385.0, 520.0, 550.0, 550.0, 1000.0])
     )
 
-    # Measured YRC1000micro external-increment velocity ceilings at
-    # axis_increment_factor=1.0 [rad/s].  These are lower than the datasheet
-    # limits above because GP_getMaxIncPerIpCycle() includes the controller's
-    # no-lookahead increment-motion governor.  Values were measured on the GP8
-    # hardware on 2026-07-03; other factors scale these limits linearly.
-    _RT_STREAM_VELOCITY_LIMITS: np.ndarray = np.array(
-        [3.97, 3.36, 4.52, 4.77, 4.80, 8.76], dtype=float
+    # RT-stream velocity ceilings at axis_increment_factor=1.0 [rad/s], for the
+    # active command period (GP8_STREAM_HZ, utils/stream_rate.py).
+    #  * 250 Hz: measured on the GP8 on 2026-07-03. They are datasheet x 0.5 to
+    #    within 0.5 %: the YRC1000micro interpolates every 2 ms, so a 4 ms
+    #    stream leaves every other cycle without a new command. This is not a
+    #    controller governor.
+    #  * 500 Hz: maxIncrement per 2 ms cycle equals the datasheet speed
+    #    (teammate's telnet [PRMTR] reading, 2026-09-18).
+    # Other axis_increment_factor values scale these limits linearly.
+    _RT_STREAM_VELOCITY_LIMITS: np.ndarray = (
+        np.radians(np.array([455.0, 385.0, 520.0, 550.0, 550.0, 1000.0]))
+        if STREAM_HZ == 500.0
+        else np.array([3.97, 3.36, 4.52, 4.77, 4.80, 8.76], dtype=float)
     )
-    RT_CONTROL_PERIOD: float = 0.004
+    RT_CONTROL_PERIOD: float = STREAM_DT
     DEFAULT_RT_ACCELERATION_FACTOR: float = 0.02
 
     def __init__(self) -> None:
@@ -96,7 +103,7 @@ class GP8(BaseRobot):
 
         YRC external-increment motion uses ``_ACC_MAX = 2 * maxIncrement *
         ACC_FACTOR``.  Since ``rt_stream_velocity_limits`` is maxIncrement
-        converted to rad/s at the 4 ms interpolation period, the SI-unit limit
+        converted to rad/s at the stream period (RT_CONTROL_PERIOD), the SI-unit limit
         is ``2 * velocity_factor1 * acceleration_factor / period``.
         """
         acceleration_factor = float(acceleration_factor)

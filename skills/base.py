@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,6 +25,41 @@ class SkillResult:
     """
 
     success: bool
+    detail: str = ""
+
+
+@dataclass
+class MotionPiece:
+    """What a skill wants the arm to do, without doing it (piece mode).
+
+    The piece runner executes pieces in order through ONE command path: the
+    planner's filter-compensated command fit and the controller buffer. A skill
+    that returns pieces therefore never waits, never sends, and can follow any
+    other skill's piece directly.
+
+    kind "joint": the planned REALIZED joint motion (robot sign) on the 2 ms
+    grid, ``Q[i]`` at time ``t0 + i * dt``. ``Q[0]`` is the pose the arm rests
+    at when the piece starts; the piece ends at rest. ``keys`` are exact
+    realized points ``(t_abs, q, v)`` the command fit must meet (a push
+    contact). ``suction`` lists ``(t_abs, on)`` events.
+
+    kind "filtered": ``Q`` are COMMANDS as the plain 2 ms stream would send
+    them from ``t0``; the planned realized motion is the controller filter
+    applied to them (a motion tuned as raw commands on the real arm, e.g. the
+    push stroke). ``meta`` carries skill-specific sample indices.
+
+    kind "planner": a request for the cycle planner (a throw), see
+    ``cycle_throw/piece_link.py``. The planner computes the motion itself.
+    """
+
+    kind: str
+    t0: float = 0.0
+    dt: float = 0.002
+    Q: "np.ndarray | None" = None
+    keys: list = field(default_factory=list)
+    suction: list = field(default_factory=list)
+    request: "dict | None" = None
+    meta: dict = field(default_factory=dict)
     detail: str = ""
 
 
@@ -195,6 +230,18 @@ class ManipulationSkill(ABC):
         except OSError as e:
             if logger is not None:
                 logger.warn(f"csv-log write failed: {e}")
+
+    def plan_piece(
+        self, request: "PickRequest", t_start: float
+    ) -> "MotionPiece | SkillResult":
+        """Piece mode: plan this skill's motion as a :class:`MotionPiece`.
+
+        ``request.current_joint`` is the pose the arm will REST at from
+        ``t_start`` (planner time, s) on; the piece may start at ``t_start`` or
+        later. Return a SkillResult (success False) to decline. The default
+        declines: a skill takes part in piece mode only once it implements this.
+        """
+        return SkillResult(False, f"{self.name} has no piece mode")
 
     @abstractmethod
     def execute(self, request: "PickRequest") -> "SkillResult":

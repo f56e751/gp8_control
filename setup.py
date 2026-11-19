@@ -25,6 +25,7 @@ setup(
         f"{package_name}.validation",
         f"{package_name}.tools",
         f"{package_name}.tests",
+        f"{package_name}.cycle_throw",
     ],
     package_dir={
         package_name: ".",
@@ -44,6 +45,7 @@ setup(
         f"{package_name}.validation": "validation",
         f"{package_name}.tools": "tools",
         f"{package_name}.tests": "tests",
+        f"{package_name}.cycle_throw": "cycle_throw",
     },
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),

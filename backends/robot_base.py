@@ -54,9 +54,9 @@ from typing import Optional, Sequence
 import numpy as np
 
 from gp8_control.utils.clock import Clock, WALL_CLOCK
-
-STREAM_HZ = 250.0
-STREAM_DT = 1.0 / STREAM_HZ   # 4 ms
+# 250 Hz (4 ms) by default; GP8_STREAM_HZ=500 for the 2 ms stream once the
+# driver runs at 500 Hz (see utils/stream_rate.py).
+from gp8_control.utils.stream_rate import STREAM_DT, STREAM_HZ
 
 
 def _max_abs_diff(a, b) -> float:
@@ -70,6 +70,51 @@ def _traj_total(timestep) -> float:
     ~T*(n+1)/2 and grossly inflates timeouts/deadlines). Review finding #3/#4."""
     t = np.asarray(timestep, dtype=float).ravel()
     return float(t[-1]) if t.size else 0.0
+
+
+def resample_trajectory(traj, vel, timestep, final_joint=None, dt: float = STREAM_DT):
+    """App trajectory (knots, ~20 Hz) -> samples on a ``dt`` grid from t = 0.
+
+    Cubic Hermite through the knot positions AND velocities, each sample
+    clamped to its two bracketing knots (never past a commanded waypoint, see
+    the floor note inside). ``final_joint`` appends a rest knot 0.05 s after
+    the last one. Returns ``(grid, samples)`` with samples (n_grid, n_joints).
+    """
+    arr = np.asarray(traj, dtype=float)                       # (n_joints, n_steps)
+    varr = np.asarray(vel, dtype=float)                       # velocity profile (same shape)
+    n_joints, n_steps = arr.shape
+    times = np.asarray(timestep, dtype=float).ravel()         # cumulative time_from_start
+    if final_joint is not None:
+        arr = np.concatenate(
+            [arr, np.asarray(final_joint, dtype=float).reshape(n_joints, 1)], axis=1)
+        varr = np.concatenate([varr, np.zeros((n_joints, 1))], axis=1)   # settle at rest
+        times = np.append(times, times[-1] + 0.05)
+    T = float(times[-1])
+    grid = np.arange(0.0, T + dt, dt)
+    # Resample onto the 4ms grid HONORING the knot velocities (#R3: a plain linear resample of
+    # the coarse ~20Hz arc yields chord-slope velocity, not the designed NN release speed —
+    # matters because throw range ~ v^2). Cubic-Hermite uses positions+velocities; fall back to
+    # linear if times aren't strictly increasing (degenerate/segment-join) or scipy is missing.
+    if varr.shape == arr.shape and np.all(np.diff(times) > 0):
+        try:
+            from scipy.interpolate import CubicHermiteSpline
+            samples = np.column_stack(
+                [CubicHermiteSpline(times, arr[j], varr[j])(grid) for j in range(n_joints)])
+            # SAFETY: cubic-Hermite can OVER/UNDERSHOOT beyond the knot values — a descent
+            # decelerating to belt contact dips BELOW the final pose. The receiver is a POSITION
+            # controller, so a below-surface command drives the tool INTO the belt -> shock
+            # (alarm 4315). Clamp each sample to the envelope of its two bracketing knots:
+            # keeps the cubic velocity shape WITHIN bounds but never past a commanded waypoint
+            # (linear never overshoots; this makes cubic equally floor-safe).
+            seg = np.clip(np.searchsorted(times, grid, side="right") - 1, 0, len(times) - 2)
+            lo = np.minimum(arr[:, seg], arr[:, seg + 1]).T   # (n_grid, n_joints)
+            hi = np.maximum(arr[:, seg], arr[:, seg + 1]).T
+            samples = np.clip(samples, lo, hi)
+        except Exception:
+            samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
+    else:
+        samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
+    return grid, samples
 
 
 class RobotBackend(ABC):
@@ -175,41 +220,10 @@ class RobotBackend(ABC):
         ``tick_fn`` → called every sample (e.g. to prime suction on a positioning move).
         Returns {'fired': bool, 'primed_next': bool}.
         """
-        arr = np.asarray(traj, dtype=float)                       # (n_joints, n_steps)
-        varr = np.asarray(vel, dtype=float)                       # velocity profile (same shape)
-        n_joints, n_steps = arr.shape
         times = np.asarray(timestep, dtype=float).ravel()         # cumulative time_from_start
+        n_steps = np.asarray(traj).shape[1]
         t_release = float(times[int(release_index)]) if release_index is not None else None
-        if final_joint is not None:
-            arr = np.concatenate(
-                [arr, np.asarray(final_joint, dtype=float).reshape(n_joints, 1)], axis=1)
-            varr = np.concatenate([varr, np.zeros((n_joints, 1))], axis=1)   # settle at rest
-            times = np.append(times, times[-1] + 0.05)
-        T = float(times[-1])
-        grid = np.arange(0.0, T + STREAM_DT, STREAM_DT)
-        # Resample onto the 4ms grid HONORING the knot velocities (#R3: a plain linear resample of
-        # the coarse ~20Hz arc yields chord-slope velocity, not the designed NN release speed —
-        # matters because throw range ~ v^2). Cubic-Hermite uses positions+velocities; fall back to
-        # linear if times aren't strictly increasing (degenerate/segment-join) or scipy is missing.
-        if varr.shape == arr.shape and np.all(np.diff(times) > 0):
-            try:
-                from scipy.interpolate import CubicHermiteSpline
-                samples = np.column_stack(
-                    [CubicHermiteSpline(times, arr[j], varr[j])(grid) for j in range(n_joints)])
-                # SAFETY: cubic-Hermite can OVER/UNDERSHOOT beyond the knot values — a descent
-                # decelerating to belt contact dips BELOW the final pose. The receiver is a POSITION
-                # controller, so a below-surface command drives the tool INTO the belt -> shock
-                # (alarm 4315). Clamp each sample to the envelope of its two bracketing knots:
-                # keeps the cubic velocity shape WITHIN bounds but never past a commanded waypoint
-                # (linear never overshoots; this makes cubic equally floor-safe).
-                seg = np.clip(np.searchsorted(times, grid, side="right") - 1, 0, len(times) - 2)
-                lo = np.minimum(arr[:, seg], arr[:, seg + 1]).T   # (n_grid, n_joints)
-                hi = np.maximum(arr[:, seg], arr[:, seg + 1]).T
-                samples = np.clip(samples, lo, hi)
-            except Exception:
-                samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
-        else:
-            samples = np.column_stack([np.interp(grid, times, arr[j]) for j in range(n_joints)])
+        grid, samples = resample_trajectory(traj, vel, timestep, final_joint, STREAM_DT)
 
         st = {"fired": False, "primed_next": False}
         start = self.clock.monotonic()      # pacing clock (monotonic)

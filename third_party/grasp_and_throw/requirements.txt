@@ -1,0 +1,4 @@
+numpy==1.26.4
+scipy==1.15.3
+casadi==3.8.1
+# build/build_set.sh stage 6 (start networks) also needs torch with CUDA, in a Python of its own: GT_TORCH_PY=/path/to/python (README.md, section 7.3)

@@ -401,6 +401,34 @@ def _env_suction_p(key: str, default: str = "") -> dict[str, float]:
     return out
 
 
+def servo_filter_taps(spec: str, dt: float) -> np.ndarray | None:
+    """FIR impulse response of the YRC1000micro command smoothing on a ``dt`` grid.
+
+    Identified from GP8 logs by the cycle-planner work: realized joint =
+    command delayed by D, then moving averages of W1 and W2 (RMS 0.35 deg).
+    ``spec``: "" / "off" = none (raw ZOH), "box200_80" = D 0.04 s, W 0.20 s and
+    0.08 s (the identified model), "box200" = D 0.08 s, W 0.20 s, or
+    "D:W1[:W2...]" in seconds. Same construction as the planner's
+    ``sep_pick.kernel`` (third_party/grasp_and_throw).
+    """
+    spec = (spec or "").strip().lower()
+    if spec in ("", "0", "off", "none"):
+        return None
+    if spec == "box200_80":
+        delay, widths = 0.04, (0.20, 0.08)
+    elif spec == "box200":
+        delay, widths = 0.08, (0.20,)
+    else:
+        parts = [float(x) for x in spec.split(":")]
+        delay, widths = parts[0], tuple(parts[1:])
+    h = np.zeros(int(round(delay / dt)) + 1)
+    h[-1] = 1.0
+    for w in widths:
+        n = max(1, int(round(w / dt)))
+        h = np.convolve(h, np.full(n, 1.0 / n))
+    return h
+
+
 def _clamp01(value: float) -> float:
     return float(np.clip(float(value), 0.0, 1.0))
 
@@ -477,6 +505,12 @@ class SimConfig:
     metal_suction_binary: bool = field(default_factory=lambda: _env_bool("GP8_SIM_METAL_SUCTION_BINARY", False))
     metal_suction_mode: str = field(default_factory=lambda: os.environ.get(
         "GP8_SIM_METAL_SUCTION_MODE", "binary").strip().lower())
+    # Controller command smoothing applied before the position servos (see
+    # servo_filter_taps). "" = raw zero-order hold of the stream (default);
+    # "box200_80" = the identified YRC1000micro model, which the cycle planner
+    # plans around. env GP8_SIM_SERVO_FILTER.
+    servo_filter: str = field(default_factory=lambda: os.environ.get(
+        "GP8_SIM_SERVO_FILTER", "").strip().lower())
     # Stiffen the vendored position servos (kp=5000/kv=100 lags a fast throw).
     kp: float = field(default_factory=lambda: _env_float("GP8_SIM_KP", 12000.0))
     kv: float = field(default_factory=lambda: _env_float("GP8_SIM_KV", 220.0))
@@ -919,6 +953,10 @@ class SimCore:
         # command history rather than being applied early to a lagging arm.
         self._pending_ctrl: deque = deque(maxlen=4000)   # (t, kind, payload); ~16 s
         self._ctrl_target = np.array(_HOME, dtype=float)   # currently applied
+        # Optional controller smoothing (cfg.servo_filter): the actuators then
+        # follow the FIR-filtered command instead of the raw ZOH command.
+        self._servo_taps = servo_filter_taps(self.cfg.servo_filter, self._dt)
+        self._servo_hist: np.ndarray | None = None   # (len(taps), 6), newest last
 
         # --- object pool -----------------------------------------------------
         self._box_names = _box_bodies(self.cfg.box_count)
@@ -1130,7 +1168,7 @@ class SimCore:
     # RobotBackend hooks (called from the app/skill thread)
     # ------------------------------------------------------------------
     def set_ctrl_target(self, positions) -> None:
-        """Queue one 4 ms command sample (stream thread). Never blocks."""
+        """Queue one stream command sample (4 ms or 2 ms, GP8_STREAM_HZ). Never blocks."""
         stamp = self.sim_time() if not self.cfg.realtime else time.monotonic()
         self._pending_ctrl.append((stamp, "ctrl", np.array(positions, dtype=float)))
 
@@ -1755,8 +1793,21 @@ class SimCore:
                 "objects": objects,
             }
 
+    def _servo_command(self) -> np.ndarray:
+        """Command the position actuators track this substep: the ZOH stream
+        sample, or (cfg.servo_filter) the controller-filtered command."""
+        taps = self._servo_taps
+        if taps is None:
+            return self._ctrl_target
+        if self._servo_hist is None:   # start at rest on the first command
+            self._servo_hist = np.tile(self._ctrl_target, (taps.size, 1))
+        else:
+            self._servo_hist = np.roll(self._servo_hist, -1, axis=0)
+            self._servo_hist[-1] = self._ctrl_target
+        return taps[::-1] @ self._servo_hist
+
     def _step_once_locked(self) -> None:
-        self.data.ctrl[self._act_ids] = self._ctrl_target
+        self.data.ctrl[self._act_ids] = self._servo_command()
         self._apply_belt_velocity()
         mujoco.mj_step(self.model, self.data)
         self._enforce_belt_kinematics(self._dt)

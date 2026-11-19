@@ -30,6 +30,13 @@ class Config:
 
     # Workspace
     MAX_REACH: float = 0.65
+    # Reach used to place a PUSH contact (entry edge of the intercept window)
+    # and to veto a backswing outside it. Default = MAX_REACH. A larger value
+    # meets cans earlier upstream (less waiting at the backswing); the stroke
+    # end keeps its own IK-verified cap (push_skill.PUSH_END_MAX_RADIUS).
+    PUSH_MAX_REACH: float = field(
+        default_factory=lambda: float(os.environ.get("GP8_PUSH_MAX_REACH", "") or 0.65)
+    )
     CONVEYOR_SPEED: float = 0.083
     CONVEYOR_TOPIC: str = "/conveyor/speed"
     CONVEYOR_DISTANCE_TOPIC: str = "/conveyor/distance_mm"
@@ -52,6 +59,19 @@ class Config:
     # Precedence: CLI flag --backend > env GP8_BACKEND > "hw".
     BACKEND: str = field(
         default_factory=lambda: _env_default("GP8_BACKEND", "hw")
+    )
+
+    # Run mode. "skills" = the normal per-object loop (ActionSelector ->
+    # ManipulationSkill). "cycle" = the vendored grasp-and-throw cycle planner
+    # (cycle_throw/, third_party/grasp_and_throw) owns the arm and the object
+    # stream: every object is thrown into its class bin (metal / paper /
+    # transparent at x = GT_BIN_X, default 1.35 m; z -0.11), belt GT_BELT
+    # (default 0.12 m/s; one learned model set per combination). Hardware also needs
+    # GP8_STREAM_HZ=500 with a 500 Hz driver. "pieces" = skills plan pieces (the
+    # planner's throw, push) run on one command path (cycle_throw/piece_runner.py).
+    # Precedence: CLI --mode > env GP8_MODE.
+    MODE: str = field(
+        default_factory=lambda: _env_default("GP8_MODE", "skills")
     )
 
     # Test override for the push/throw ActionSelector. Empty = normal routing

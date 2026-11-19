@@ -1,0 +1,8 @@
+# runtime / build outputs of the vendored planner (never commit)
+out/
+planner/logs/rt_tmp/
+planner/logs/20*_*/
+planner/logs/build_*.log
+__pycache__/
+# the vendored build/ scripts are source (the repo root ignores build/)
+!/build/

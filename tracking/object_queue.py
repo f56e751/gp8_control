@@ -298,6 +298,10 @@ class TrackedObjectQueue:
     #: tracks that carry DIFFERENT producer ids (see merge_duplicates).
     src_merge_overlap: float = 0.5
 
+    def snapshot(self) -> list[TrackedObject]:
+        """Shallow copy of the queued objects, head first (read-only use)."""
+        return list(self._objects)
+
     def remove(self, obj: TrackedObject) -> None:
         """Remove ``obj`` wherever it sits (no-op if absent).
 

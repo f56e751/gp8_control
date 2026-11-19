@@ -1,3 +1,4 @@
 sim/recycling_mujoco/meshes/*.stl filter=lfs diff=lfs merge=lfs -text
 sim/recycling_mujoco/meshes/*.obj filter=lfs diff=lfs merge=lfs -text
 sim/recycling_mujoco/models/ckpt/*.pt filter=lfs diff=lfs merge=lfs -text
+third_party/grasp_and_throw/planner/logs/nnws*/*.npz filter=lfs diff=lfs merge=lfs -text

@@ -38,6 +38,55 @@ Yaskawa **GP8** 컨베이어 분류 데모 (ROS 2 Humble). 카메라 PC가 벨�
 RUN=$(ls -td ~/gp8_s2r_runs/*/ | head -1); cat $RUN/report.md
 ```
 
+### C. 고속 처리 — 조각 모드 / cycle 모드 (robot6 와 함께)
+
+팀원 grasp-and-throw 플래너(`third_party/grasp_and_throw`, 실기 검증본, **원본 그대로**)로 던지고, 캔은 PushSkill 로 친다.
+계획은 **robot6** (`iitp@147.46.175.15`, 16 코어) 에서, 명령은 로봇 PC 의 **컨트롤러 버퍼**(SampleBufferController, 2 ms 틱) 로 나간다.
+
+| 모드 | 무엇 | 언제 |
+|---|---|---|
+| **`pieces`** (권장) | 스킬이 조각을 내고, 던지기·push·집기를 **한 명령 경로**로 멈춤 없이 잇는다 (`cycle_throw/PIECES.md`) | 페트와 캔이 섞일 때 |
+| `cycle` | 플래너가 전부 던지고, 캔은 플래너가 쉴 때 push slot 에서 민다 (`cycle_throw/RUN_HW.md`) | 비교용 |
+
+**한 줄 실행 (로봇 PC)** — 비전(robot6 docker `iitp_local`) 시작 확인 → robot6 부하 확인 → `camera_debug` → 드라이버 + 앱:
+```bash
+GP8_DEMO_MODE=pieces GP8_DEMO_CHECK_ONLY=1 gp8_cycle   # 로봇 없이 점검 (robot6 계획 + 가짜 버퍼), SUMMARY PASS 확인
+GP8_DEMO_MODE=pieces gp8_cycle                         # 실기. Ctrl+C 한 번 = 정리 종료 (두 번 = 즉시)
+# 백그라운드로 띄운 경우: kill -TERM <gp8_cycle pid>
+```
+실기에서 쓰는 값의 예: `GP8_DEMO_MODE=pieces GP8_PUSH_HEIGHT=0.00 GP8_PUSH_ACCEL=24 GP8_CYCLE_TOP_Z=-0.01 GP8_CAM_SIGN_CX=-1 GP8_CAM_SIGN_CY=+1 gp8_cycle`
+
+**robot6 준비 (2026-11 완료, 새로 깔 때만)**
+- 체크아웃 `/PublicSSD/iitp/demo/gp8_control` (이 레포 main) + `.venv` (numpy 1.26, scipy, casadi). 앱이 ssh 로 조각 서버
+  (`cycle_throw/piece_link.py`) 를 띄운다. 코드를 바꾸면 **로봇 PC 와 robot6 둘 다** `git pull` (robot6 은 git-lfs 가 없어
+  모델 파일이 "수정됨" 으로 보이는데 그대로 둔다).
+- 로봇 PC → robot6 키: `~/.ssh/id_ed25519_robot6`, `~/.ssh/config` 의 `robot6-planner`. 확인: `ssh -o BatchMode=yes robot6-planner hostname`
+- 모델 묶음: 레포에는 기본 묶음 (`GT_BELT` 0.12 × `GT_BIN_X` 1.35) 만 있고 나머지 7 개는 robot6 체크아웃에만 있다.
+- 비전: robot6 `/PublicSSD/iitp/demo/iitp_perception/docker_local.sh` (gp8_cycle 이 필요하면 띄운다). RealSense 가
+  `Frame didn't arrive` 로 죽으면 USB 를 다시 꽂는다.
+
+**로봇 PC 준비**: 드라이버 500 Hz (`feature/sample-buffer`, `sample_buffer:=true`), `GP8_STREAM_HZ=500` (gp8_cycle 이 넣는다).
+gp8_control 을 다시 빌드할 때는 드라이버 작업공간을 먼저 불러온다 (안 그러면 `motoman_bringup not found`):
+`source /opt/ros/humble/setup.bash && source ~/Desktop/motoman_ros2_safety_review/motoman_ROS2/install/setup.bash && colcon build --packages-select gp8_control`
+
+**문제가 생기면**
+- 앱이 오류로 멈추면 석션을 스스로 끈다. 안 꺼졌으면: 로봇 PC 에서 주소 10017 에 1 쓰기 (Simple Message TCP 50242, `controllers/trajectory_controller.py::_call_io`).
+- 계산이 늦으면 멈추지 않고 고정 대기점으로 간다 (로그 `steps not ready in time`). 자주 나오면 robot6 부하 (`uptime`, 4 코어 이상 바쁘면 gp8_cycle 이 거부).
+- 펜던트 REMOTE + PLAY, 알람 없음. CODE 112 가 남아 있으면 펜던트에서 리셋.
+
+| 변수 (조각 모드) | 기본 | 의미 |
+|---|---|---|
+| `GP8_PUSH_HEIGHT` | 0.03 | push 접촉 높이 [m] (실기 0.00~0.01 확인) |
+| `GP8_PUSH_ACCEL` | 12 | push 가속 [m/s²]. 24 면 도움닫기가 짧을 때 세진다 |
+| `GP8_PUSH_MAX_REACH` | 0.70 (gp8_cycle) | push 를 칠 수 있는 반경 [m] (skill 모드 0.65) |
+| `GP8_PIECE_REACH_HI` | 0.65 | 집기 반경 [m] (트윈 0.70 문제없음, 실기 미확인) |
+| `GP8_PIECE_PICK_SOFT_DZ` / `_SOFT_T` | 0.03 m / 0.25 s | 집기 마지막 구간 부드러운 착지 |
+| `GP8_CYCLE_TOP_Z` | 0.042 (gp8_cycle) | 물체 윗면 높이 [m] (석션 목표 높이) |
+| `GT_BELT` / `GT_BIN_X` | 0.12 / 1.35 | 벨트 속도·통 거리 (모델 묶음 선택) |
+| 그 밖 | | `cycle_throw/PIECES.md` |
+
+MuJoCo twin: `GP8_MODE=pieces ros2 launch gp8_control sim.launch.py` (필터 모델 자동 적용).
+
 > 명령이 "찾을 수 없음"이면 [처음 한 번 설정](#처음-한-번-설정)의 alias 등록을 먼저.
 > alias 없이 직접: `<ws>/src/gp8_control/scripts/{app,robot,camera,s2r_run}.sh`
 

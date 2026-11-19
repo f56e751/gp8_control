@@ -74,6 +74,21 @@ JOINT_STATES_TOPIC = "/joint_states"
 # JointGroupPositionController command topic (position_controllers/JointGroupPositionController)
 # — the 250 Hz streaming path: publish a Float64MultiArray of joint positions per cycle.
 JGPC_COMMAND_TOPIC = "/JointGroupPositionController/commands"
+JGPC_NAME = "JointGroupPositionController"
+# Controller-clock sample buffer (motoman_controllers/SampleBuffer, driver branch
+# feature/sample-buffer): loaded INACTIVE by the bringup (sample_buffer:=true);
+# cycle mode switches it in for JGPC and back at the end. Same interface and
+# switching as the teammate's HW-validated hwpkg trajectory_controller (11-04).
+SBUF_NAME = "SampleBufferController"
+SBUF_SAMPLES_TOPIC = f"/{SBUF_NAME}/samples"
+SBUF_PROGRESS_TOPIC = f"/{SBUF_NAME}/progress"
+
+
+def sample_buffer_wanted() -> bool:
+    """Cycle mode on hardware writes to the controller buffer unless
+    GP8_CYCLE_OUTPUT=stream (the app's own 2 ms Python stream)."""
+    return (os.environ.get("GP8_MODE", "") in ("cycle", "pieces")
+            and os.environ.get("GP8_CYCLE_OUTPUT", "buffer").strip().lower() == "buffer")
 
 
 def _wait_future(fut, timeout_sec=None):
@@ -149,6 +164,107 @@ class TrajectoryController(RobotBackend):
         self._io_thread = threading.Thread(target=self._io_worker, daemon=True)
         self._io_thread.start()
         self._io_closed = False
+
+        # Controller-clock buffer client (None unless cycle mode wants it). The
+        # topics must exist before the app's executor starts spinning.
+        self.buf = None
+        self._sbuf_switched = False
+        if sample_buffer_wanted():
+            self._buf_setup(cb_group)
+
+    # ------------------------------------------------------------------
+    # Controller-clock sample buffer (cycle mode)
+    # ------------------------------------------------------------------
+    def _buf_setup(self, cb_group) -> None:
+        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+        from motoman_msgs.msg import SampleChunk, SampleProgress   # driver feature/sample-buffer
+        from gp8_control.controllers.sample_buffer import BufferClient
+
+        self._SampleChunk = SampleChunk
+        self._sbuf_pub = self._node.create_publisher(
+            SampleChunk, SBUF_SAMPLES_TOPIC,
+            QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST))
+        self._node.create_subscription(
+            SampleProgress, SBUF_PROGRESS_TOPIC, self._buf_progress_cb,
+            QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST),
+            callback_group=cb_group)
+        self.buf = BufferClient(self._buf_send_chunk, self._buf_send_stop,
+                                fire=lambda on: self.suction_on() if on else self.suction_off(),
+                                name="hw-buf")
+
+    def _buf_send_chunk(self, seq: int, start: int, Q) -> None:
+        m = self._SampleChunk()
+        m.seq, m.start_index, m.n_joints, m.stop = int(seq), int(start), 6, False
+        m.positions = np.asarray(Q, float).ravel().tolist()
+        self._sbuf_pub.publish(m)
+
+    def _buf_send_stop(self, seq: int) -> None:
+        m = self._SampleChunk()
+        m.seq, m.start_index, m.n_joints, m.stop = int(seq), 0, 6, True
+        self._sbuf_pub.publish(m)
+
+    def _buf_progress_cb(self, msg) -> None:
+        # stamp = the controller_manager update() time (ROS clock = wall clock),
+        # mapped to monotonic: the exact tick time, independent of delivery delay.
+        t_stamp = msg.stamp.sec + msg.stamp.nanosec * 1e-9 - (time.time() - time.monotonic())
+        self.buf.on_progress(msg.index, time.monotonic(), msg.buffer_end, msg.holding,
+                             msg.last_seq, msg.last_result, command=list(msg.command),
+                             t_stamp=t_stamp)
+
+    def buf_switch(self, to_buffer: bool, timeout_sec: float = 5.0) -> bool:
+        """JGPC <-> SampleBufferController in one STRICT switch (same interfaces)."""
+        from controller_manager_msgs.srv import ListControllers, SwitchController
+
+        log = self._node.get_logger()
+        lc = self._node.create_client(ListControllers, "/controller_manager/list_controllers")
+        sc = self._node.create_client(SwitchController, "/controller_manager/switch_controller")
+        try:
+            if not (lc.wait_for_service(timeout_sec=timeout_sec)
+                    and sc.wait_for_service(timeout_sec=timeout_sec)):
+                log.error("[buf] controller_manager services not available")
+                return False
+            res = _wait_future(lc.call_async(ListControllers.Request()), timeout_sec)
+            states = {c.name: c.state for c in (res.controller if res is not None else [])}
+            if SBUF_NAME not in states:
+                log.error(f"[buf] {SBUF_NAME} is not loaded: start the bringup with "
+                          "sample_buffer:=true (GP8_SAMPLE_BUFFER=true)")
+                return False
+            on, off = (SBUF_NAME, JGPC_NAME) if to_buffer else (JGPC_NAME, SBUF_NAME)
+            req = SwitchController.Request()
+            req.activate_controllers = [] if states.get(on) == "active" else [on]
+            req.deactivate_controllers = [off] if states.get(off) == "active" else []
+            if not req.activate_controllers and not req.deactivate_controllers:
+                return True
+            req.strictness = SwitchController.Request.STRICT
+            req.activate_asap = True
+            r = _wait_future(sc.call_async(req), timeout_sec)
+            ok = bool(r is not None and r.ok)
+            log.warn(f"[buf] controller switch {'-> ' + on if ok else 'FAILED'} "
+                     f"(on {list(req.activate_controllers)}, off {list(req.deactivate_controllers)})")
+            if ok:
+                self._sbuf_switched = to_buffer
+            return ok
+        finally:
+            self._node.destroy_client(lc)
+            self._node.destroy_client(sc)
+
+    def buf_activate(self, timeout_sec: float = 5.0) -> bool:
+        """Switch the buffer in and wait for its progress (its tick restarts at 0
+        on every activation and it holds the current position)."""
+        if self.buf is None:
+            return False
+        n0 = self.buf.n_progress
+        if not self.buf_switch(True, timeout_sec):
+            return False
+        t_end = time.monotonic() + timeout_sec
+        while time.monotonic() < t_end:
+            if self.buf.n_progress > n0 + 5 and self.buf.ready():
+                return True
+            time.sleep(0.01)
+        self._node.get_logger().error(f"[buf] no progress on {SBUF_PROGRESS_TOPIC}")
+        return False
 
     # ------------------------------------------------------------------
     # RobotBackend primitives
@@ -461,6 +577,13 @@ class TrajectoryController(RobotBackend):
         if self._io_closed:
             return
         self._io_closed = True
+        if self._sbuf_switched:   # leave JGPC active, so the next (skills) run can move
+            try:
+                self.buf.stop()
+                time.sleep(0.05)
+                self.buf_switch(False, 2.0)
+            except Exception:     # noqa: BLE001
+                pass
         self._io_queue.put(None)
         self._io_thread.join(timeout=max(0.0, float(timeout_sec)))
         if self._io_thread.is_alive():

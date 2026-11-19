@@ -191,6 +191,26 @@ def generate_launch_description():
         default_value=EnvironmentVariable("GP8_FORCE_SKILL", default_value=""),
         description="Force ALL objects to one skill: throw|robust_throw|push (empty = class routing).",
     )
+    # Run mode: `mode:=cycle` hands the arm to the vendored grasp-and-throw
+    # cycle planner (cycle_throw/); default "skills" = per-object skill loop.
+    mode_arg = DeclareLaunchArgument(
+        "mode",
+        default_value=EnvironmentVariable("GP8_MODE", default_value="skills"),
+        description="skills (per-object skill loop) | cycle (grasp-and-throw cycle planner).",
+    )
+    # App command stream rate. 500 ONLY when the adv4ncr driver itself runs at
+    # 500 Hz (controllers.yaml update_rate: 500, control period 0.002 s);
+    # `mode:=cycle` requires it on hardware (utils/stream_rate.py).
+    sample_buffer_arg = DeclareLaunchArgument(
+        "sample_buffer",
+        default_value=EnvironmentVariable("GP8_SAMPLE_BUFFER", default_value="false"),
+        description="Also load SampleBufferController inactive (needed by mode:=cycle on hardware).",
+    )
+    stream_hz_arg = DeclareLaunchArgument(
+        "stream_hz",
+        default_value=EnvironmentVariable("GP8_STREAM_HZ", default_value="250"),
+        description="App joint-command stream rate: 250 | 500 (must match the driver).",
+    )
     rviz_arg = DeclareLaunchArgument(
         "rviz", default_value="true",
         description="Start RViz with live throw trajectory/release/ballistic markers. "
@@ -260,6 +280,9 @@ def generate_launch_description():
             "robot_ip": LaunchConfiguration("robot_ip"),
             "axis_increment_factor": LaunchConfiguration("axis_increment_factor"),
             "axis_acceleration_factor": LaunchConfiguration("axis_acceleration_factor"),
+            # Load SampleBufferController INACTIVE (driver feature/sample-buffer);
+            # cycle mode switches it in for JGPC. Ignored by older drivers.
+            "sample_buffer": LaunchConfiguration("sample_buffer"),
         }.items(),
     )
 
@@ -424,6 +447,9 @@ def generate_launch_description():
             "GP8_TRACK_LEAD_T": LaunchConfiguration("track_lead_t"),
             # Force-skill for this run: `skill:=` -> GP8_FORCE_SKILL ("" = routing).
             "GP8_FORCE_SKILL": LaunchConfiguration("skill"),
+            # Run mode / command stream rate: `mode:=`, `stream_hz:=`.
+            "GP8_MODE": LaunchConfiguration("mode"),
+            "GP8_STREAM_HZ": LaunchConfiguration("stream_hz"),
             # Visualization-only impact plane; never changes robot motion.
             "GP8_THROW_VIZ_IMPACT_Z": LaunchConfiguration("throw_viz_impact_z"),
             "GP8_THROW_GOAL_X": LaunchConfiguration("throw_goal_x"),
@@ -478,6 +504,9 @@ def generate_launch_description():
         skill_arg,
         app_arg,
         moveit_arg,
+        mode_arg,
+        stream_hz_arg,
+        sample_buffer_arg,
         rviz_arg,
         throw_viz_impact_z_arg,
         throw_goal_x_arg,

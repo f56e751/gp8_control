@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from gp8_control.skills.base import ManipulationSkill, SkillResult
+from gp8_control.skills.base import ManipulationSkill, MotionPiece, SkillResult
 from gp8_control.trajectory.trajectory_primitive import (
     trajectory,
     trajectory_3points,
@@ -159,6 +159,22 @@ PUSH_APPROACH_VIA_XY: float = 0.30
 # run's model check).
 PUSH_PERCEPTION_LAG: float = 0.28
 
+# Piece mode (plan_piece): the stroke is handed over as the command samples
+# the normal 2 ms stream sends, fired at the same time as here; the piece link
+# plans the arm's REALIZED motion as the identified controller filter applied
+# to them, i.e. what the real arm does with this push today. So the HW-tuned
+# fire lead applies unchanged. GP8_PIECE_PUSH_LAG overrides it (e.g. the MuJoCo
+# twin, whose perception has no lag).
+PIECE_PUSH_LAG: float = float(os.environ.get("GP8_PIECE_PUSH_LAG", PUSH_PERCEPTION_LAG))
+# Piece mode: where the scoop swing would make a wrist joint (mostly B, j5,
+# for cans far upstream) run into its speed limit, the whole stroke gets
+# stretched in time and hits slowly (x1.7 -> ~1.2 m/s). Rather keep the speed
+# and swing less: the stroke is rebuilt with these swing scales until the
+# stretch is at most PIECE_SWING_STRETCH_OK (the fastest one wins).
+PIECE_SWING_SCALES = tuple(float(x) for x in os.environ.get(
+    "GP8_PIECE_SWING_SCALES", "1.0,0.7,0.4,0.0").split(",") if x.strip())
+PIECE_SWING_STRETCH_OK: float = float(os.environ.get("GP8_PIECE_SWING_STRETCH_OK", "1.15"))
+
 # Safe transit height (m, absolute TCP Z) for the chain when it parks at the
 # NEXT push's backswing (a LOW pose). The chain is a JOINT-space
 # interpolation; between two belt-height endpoints its Cartesian Z sags
@@ -257,7 +273,7 @@ PUSH_DISTANCE: float = 0.3
 # PUSH_RETREAT_DISTANCE behind T_grasp — i.e. in the direction *opposite*
 # to the push.  This keeps TCP, object, and target collinear while giving
 # the arm room to accelerate into the push stroke.
-PUSH_RETREAT_DISTANCE: float = 0.2
+PUSH_RETREAT_DISTANCE: float = float(os.environ.get("GP8_PUSH_RETREAT", "0.2"))
 
 # Minimum TCP X position (m) after retreat.  If the full retreat would
 # place the TCP at X < PUSH_RETREAT_MIN_X, the retreat distance is scaled
@@ -523,7 +539,7 @@ class PushSkill(ManipulationSkill):
             - PUSH_RETREAT_DISTANCE * float(push_dir[1])
         )
         backswing_r = float(np.hypot(backswing_x, backswing_y))
-        max_reach = float(self.ctx.cfg.MAX_REACH)
+        max_reach = float(getattr(self.ctx.cfg, "PUSH_MAX_REACH", self.ctx.cfg.MAX_REACH))
         if backswing_r > max_reach:
             return (
                 f"backswing ({backswing_x:+.3f},{backswing_y:+.3f}) outside "
@@ -682,18 +698,16 @@ class PushSkill(ManipulationSkill):
     # ------------------------------------------------------------------
     # Skill entry point (ambush strategy)
     # ------------------------------------------------------------------
-    def execute(self, request: "PickRequest") -> SkillResult:
-        """Arm the motion, sleep to the fire time, then fire.
+    def _arm(self, request: "PickRequest", _t_exec0: float, piece: bool = False,
+             descent: bool = True):
+        """Build the fired push motion for ``request`` (execute's ARM step).
 
-        FLOW shape, MINIMAL timing: build approach + stroke + chain as ONE
-        trajectory (dispatch=False) with the full approach inside
-        ``t_contact``, WAIT — ``wait_for_arrival(offset = t_contact)``, the
-        built contact timestamp being the ENTIRE fire lead (no correction
-        terms) — then fire the whole motion. The stale-stroke guard runs
-        before firing; cleanup after.
+        Returns ``(traj, vel, ts, final_joint, t_contact, lead, T_grasp,
+        T_grasp_retreat, push_distance, push_dir, pipe_s)`` or a SkillResult
+        (abort). ``piece``: planning ahead for piece mode, touch no hardware.
+        ``descent=False``: the stroke alone, from the backswing at rest (t = 0).
         """
         ctx = self.ctx
-        _t_exec0 = ctx.clock.time()   # pipeline diagnostic (see the [pipeline] log)
         # Fresh cycle-log meta: build_push_trajectory replaces this dict wholesale,
         # but an abort BEFORE the build (no-bin) would otherwise log the PREVIOUS
         # cycle's values into its CSV row.
@@ -707,7 +721,10 @@ class PushSkill(ManipulationSkill):
         T_grasp = request.T_grasp
 
         # Push does NOT use suction — ensure it's off from any prior cycle.
-        ctx.traj_ctrl.suction_off()
+        # (Piece mode plans ahead while the arm may still hold a thrown
+        # object: there the suction belongs to the planned pieces.)
+        if not piece:
+            ctx.traj_ctrl.suction_off()
 
         # ---- Compute push target (fixed bin) early ----
         # We need the push direction *before* positioning so we can place
@@ -824,7 +841,7 @@ class PushSkill(ManipulationSkill):
             self.build_push_trajectory(
                 current_joint, grasp_retreat_joint, T_grasp_retreat,
                 T_aim2, next_grasp=next_grasp, append_chain=True,
-                append_descent=True, push_distance=push_distance,
+                append_descent=descent, push_distance=push_distance,
                 contact_offset=contact_offset, chain_park=chain_park,
                 approach_via=approach_via, dispatch=False,
             )
@@ -853,6 +870,82 @@ class PushSkill(ManipulationSkill):
             f"[pipeline] exec→wait {_pipe * 1000:.0f}ms "
             f"(build+plan; not modelled in the fire lead)"
         )
+        return (traj_push, vel_push, ts_push, final_joint, t_contact, lead, T_grasp,
+                T_grasp_retreat, push_distance, push_dir_exec, _pipe)
+
+    def plan_piece(self, request: "PickRequest", t_start: float):
+        """Piece mode: the stroke, as this skill would stream it, and its fire time.
+
+        The stroke starts at rest on the backswing (``Q[0]``); ``t0`` is when
+        that first command goes out, exactly as :meth:`execute` would fire it
+        (contact on the object's lag-corrected arrival). How the arm gets to the
+        backswing and where it goes after the stroke are the piece link's job
+        (``meta``: ``i_contact``, ``i_cut`` = stroke end, sample indices).
+        Declined when the fire time is before ``t_start``.
+        """
+        from gp8_control.backends.robot_base import resample_trajectory
+
+        ctx = self.ctx
+        target = request.target
+        saved = ctx.chain_target_override
+        ctx.chain_target_override = lambda from_joint, action_time: None
+        best = None                               # (stretch, swing scale, armed, meta)
+        try:
+            for sc in PIECE_SWING_SCALES or (1.0,):
+                self.swing_scale = sc
+                armed = self._arm(request, ctx.clock.time(), piece=True, descent=False)
+                if isinstance(armed, SkillResult):
+                    if best is None:
+                        return armed
+                    break
+                stretch = float(getattr(self, "_last_stroke_clamp", 1.0))
+                if best is None or stretch < best[0] - 1e-6:
+                    best = (stretch, sc, armed, dict(self._last_push_meta))
+                if stretch <= PIECE_SWING_STRETCH_OK:
+                    break
+        finally:
+            self.swing_scale = 1.0
+            ctx.chain_target_override = saved
+        stretch, sc, armed, self._last_push_meta = best
+        if sc < 1.0:
+            ctx.log.info(f"Push swing scaled to {sc:.0%} to keep the stroke speed "
+                         f"(time stretch x{stretch:.2f})")
+        traj, vel, ts, final_joint, t_contact, _lead, T_grasp, *_ = armed
+        dt = 0.002
+        _grid, U = resample_trajectory(traj, vel, ts, final_joint, dt)
+        now = ctx.clock.time()
+        v = max(float(ctx.conveyor.current), 1e-3)
+        y_now = ctx.object_y_now(target, now, v)
+        t_arrive = now + (y_now - float(T_grasp[1, 3])) / v
+        t0 = t_arrive - (t_contact + PIECE_PUSH_LAG)
+        if t0 < t_start:
+            return SkillResult(False, f"too late from this pose by {t_start - t0:.2f} s")
+        meta = self._last_push_meta
+        i_cut = int(round(float(meta.get("stroke_end_s", t_contact)) / dt))
+        return MotionPiece(kind="filtered", t0=t0, dt=dt, Q=U,
+                           meta={"i_contact": int(round(t_contact / dt)),
+                                 "i_cut": min(max(i_cut, int(round(t_contact / dt)) + 1), len(U) - 1)},
+                           detail=f"push {target.class_name} id={target.track_id}: contact "
+                                  f"{t_contact:.2f} s, stroke end {i_cut * dt:.2f} s after fire")
+
+    def execute(self, request: "PickRequest") -> SkillResult:
+        """Arm the motion, sleep to the fire time, then fire.
+
+        FLOW shape, MINIMAL timing: build approach + stroke + chain as ONE
+        trajectory (dispatch=False) with the full approach inside
+        ``t_contact``, WAIT — ``wait_for_arrival(offset = t_contact)``, the
+        built contact timestamp being the ENTIRE fire lead (no correction
+        terms) — then fire the whole motion. The stale-stroke guard runs
+        before firing; cleanup after.
+        """
+        ctx = self.ctx
+        _t_exec0 = ctx.clock.time()   # pipeline diagnostic (see the [pipeline] log)
+        target = request.target
+        armed = self._arm(request, _t_exec0)
+        if isinstance(armed, SkillResult):
+            return armed
+        (traj_push, vel_push, ts_push, final_joint, t_contact, lead, T_grasp,
+         T_grasp_retreat, push_distance, push_dir_exec, _pipe) = armed
         ctx.set_status("WAITING", target.class_name)
         ctx.wait_for_arrival(target, T_grasp[1, 3], offset=lead)
 
@@ -1315,6 +1408,7 @@ class PushSkill(ManipulationSkill):
             ts_stroke = ts_stroke[1:] + desc_end_t
             traj_stroke = traj_stroke[:, 1:]
             vel_stroke = vel_stroke[:, 1:]
+        stroke_end_s = float(ts_stroke[-1]) if len(ts_stroke) else desc_end_t
         # else: stroke IS the whole motion, starting at t=0 from the already-
         # parked push-start pose. Its first sample == the robot's current
         # position, which satisfies the queue code-204 check after
@@ -1592,6 +1686,7 @@ class PushSkill(ManipulationSkill):
             "stroke_clamp": getattr(self, "_last_stroke_clamp", 1.0),
             "t_contact": t_contact,
             "approach_s": desc_end_t,
+            "stroke_end_s": stroke_end_s,
             "theta": theta,
             "stroke_mode": PUSH_STROKE_MODE,
             "swing_mode": PUSH_SWING_MODE,
@@ -1752,8 +1847,11 @@ class PushSkill(ManipulationSkill):
             return np.array([1.0, 0.0, 0.0])
         return delta / norm
 
-    @staticmethod
-    def _swing_at(alpha: float, alpha_hit: "Optional[float]" = None) -> float:
+    #: Scale on the scoop swing amplitude (1 = SWING_ANGLE). plan_piece lowers
+    #: it when the wrist would otherwise slow the whole stroke down.
+    swing_scale: float = 1.0
+
+    def _swing_at(self, alpha: float, alpha_hit: "Optional[float]" = None) -> float:
         """Swing tilt (rad) at stroke progress ``alpha`` ∈ [0, 1].
 
         Behaviour depends on ``PUSH_SWING_MODE``:
@@ -1783,10 +1881,11 @@ class PushSkill(ManipulationSkill):
             return SWEEP_TILT
         if PUSH_SWING_MODE == "sweep":
             return SWEEP_TILT
-        back = SWING_BIAS - SWING_ANGLE
-        fwd = SWING_BIAS + SWING_ANGLE
+        amp = SWING_ANGLE * float(self.swing_scale)
+        back = SWING_BIAS - amp
+        fwd = SWING_BIAS + amp
         if alpha_hit is None or not (0.02 <= alpha_hit <= 0.98):
-            return SWING_BIAS + SWING_ANGLE * (2.0 * alpha - 1.0)
+            return SWING_BIAS + amp * (2.0 * alpha - 1.0)
         if alpha <= alpha_hit:
             return back * (1.0 - alpha / alpha_hit)
         return fwd * (alpha - alpha_hit) / (1.0 - alpha_hit)

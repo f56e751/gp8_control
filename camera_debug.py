@@ -140,14 +140,27 @@ class CameraDebugNode(Node):
         self._belt_mps = float(msg.data)
 
     def _run_stream(self) -> None:
+        # The thread must outlive any error: when it dies, the last snapshot
+        # stays published and the robot waits for objects that never come.
+        while rclpy.ok():
+            try:
+                stream_detections(
+                    self._stream_url, self._on_record_safe,
+                    reconnect_delay=RECONNECT_DELAY,
+                    skip_initial_record=True,
+                )
+            except Exception as e:
+                self.get_logger().error(
+                    f"perception stream thread error: {e!r}; restarting in "
+                    f"{RECONNECT_DELAY}s")
+                time.sleep(RECONNECT_DELAY)
+
+    def _on_record_safe(self, record: dict) -> None:
+        """One bad record (or a logging error) costs that record only."""
         try:
-            stream_detections(
-                self._stream_url, self._on_record,
-                reconnect_delay=RECONNECT_DELAY,
-                skip_initial_record=True,
-            )
+            self._on_record(record)
         except Exception as e:
-            self.get_logger().error(f"perception stream thread crashed: {e}")
+            self.get_logger().error(f"perception record dropped: {e!r}")
 
     def _on_record(self, record: dict) -> None:
         """One incoming NDJSON record from the camera PC → corrected snapshot."""
@@ -207,7 +220,7 @@ class CameraDebugNode(Node):
             if measured_total_age is None:
                 # The stream sends its cached record once on reconnect. Never
                 # turn an old cached detection into a fresh one via fallback.
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "dropping stale/invalid timestamped perception record"
                 )
                 return
@@ -260,7 +273,7 @@ class CameraDebugNode(Node):
             try:
                 cam_bbox = as_bbox(box)
             except (TypeError, ValueError) as exc:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"ignoring malformed perception bounding box: {exc}"
                 )
                 continue
@@ -330,11 +343,15 @@ class CameraDebugNode(Node):
         direction = self._direction.status()
         if direction["state"] != self._direction_state:
             self._direction_state = direction["state"]
-            log = (self.get_logger().info if direction["state"] in ("OK", "NO DATA", "BELT STOPPED")
-                   else self.get_logger().warn)
-            log(f"[direction] {direction['state']}: {direction['message']} "
-                f"(GP8_CAM_SIGN_CX={extrinsics.SIGN_CX_TO_BASE_X:+g}, "
-                f"GP8_CAM_SIGN_CY={extrinsics.SIGN_CY_TO_BASE_Y:+g})")
+            msg = (f"[direction] {direction['state']}: {direction['message']} "
+                   f"(GP8_CAM_SIGN_CX={extrinsics.SIGN_CX_TO_BASE_X:+g}, "
+                   f"GP8_CAM_SIGN_CY={extrinsics.SIGN_CY_TO_BASE_Y:+g})")
+            # One call site per severity: rclpy raises "Logger severity cannot
+            # be changed between calls" when one line logs at two severities.
+            if direction["state"] in ("OK", "NO DATA", "BELT STOPPED"):
+                self.get_logger().info(msg)
+            else:
+                self.get_logger().warning(msg)
 
         snap = {
             "receipt_time": receipt,
@@ -382,7 +399,7 @@ class CameraDebugNode(Node):
         try:
             self._pub.publish(String(data=json.dumps(snap)))
         except Exception as e:
-            self.get_logger().warn(f"publish failed: {e}")
+            self.get_logger().warning(f"publish failed: {e}")
         self._render(snap)
 
     def _render_empty(self) -> None:

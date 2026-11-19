@@ -238,7 +238,10 @@ class SkillContext:
         # position_and_prime() do.
         v_obj = v
         obj_y = self.object_y_now(target, now, v)
-        denom = cfg.MAX_REACH ** 2 - x ** 2
+        reach = float(cfg.MAX_REACH)
+        if skill is not None and getattr(skill, "name", "") == "push":
+            reach = float(getattr(cfg, "PUSH_MAX_REACH", reach))
+        denom = reach ** 2 - x ** 2
         if denom <= 0.0:
             return None                          # lane laterally out of reach (degenerate)
         y_b = float(np.sqrt(denom))

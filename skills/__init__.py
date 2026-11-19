@@ -8,13 +8,14 @@ skill. All shared robot resources and motion helpers live on the injected
 touching ``app.py``.
 """
 
-from gp8_control.skills.base import ManipulationSkill, SkillResult
+from gp8_control.skills.base import ManipulationSkill, MotionPiece, SkillResult
 from gp8_control.skills.context import SkillContext, PickRequest
 from gp8_control.skills.throw_skill import ThrowSkill
 from gp8_control.skills.push_skill import PushSkill
 
 __all__ = [
     "ManipulationSkill",
+    "MotionPiece",
     "SkillResult",
     "SkillContext",
     "PickRequest",

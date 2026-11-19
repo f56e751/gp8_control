@@ -1,6 +1,6 @@
 #!/bin/bash
 # Add short commands for THIS workspace to ~/.bashrc (idempotent):
-#   gp8_env  gp8_build  gp8_robot  gp8_app  gp8_camera  gp8_s2r
+#   gp8_env  gp8_build  gp8_robot  gp8_app  gp8_camera  gp8_s2r  gp8_cycle
 D="$(cd "$(dirname "$0")" && pwd)"
 MARK="# >>> gp8_control aliases >>>"
 if grep -qF "$MARK" ~/.bashrc; then
@@ -14,6 +14,7 @@ alias gp8_robot='$D/robot.sh'
 alias gp8_app='$D/app.sh'
 alias gp8_camera='$D/camera.sh'
 alias gp8_s2r='$D/s2r_run.sh'
+alias gp8_cycle='$D/cycle_demo.sh'
 # <<< gp8_control aliases <<<
 EOT
 echo "added gp8_* aliases for $D — open a new terminal or: source ~/.bashrc"

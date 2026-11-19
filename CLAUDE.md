@@ -131,6 +131,101 @@ and `track_z_speed:=0` restores the old parked `WAIT_AT_GRASP` pick.
 to `PRESS_Z` on arrival, *then* belt-follow for `PICK_TIME`) — the two are
 deliberately separate.
 
+### Cycle-throw mode (`GP8_MODE=cycle`, `cycle_throw/`)
+
+A second run mode beside the skill loop. In this mode the vendored,
+HW-validated grasp-and-throw cycle planner (`third_party/grasp_and_throw/`)
+owns the arm and the whole object stream. **Keep the vendored tree unchanged.**
+Integration lives only in `cycle_throw/`:
+
+* `planner_link.py` runs in a **child process** (cwd = vendored `planner/`,
+  its `env.sh` sourced). It calls `rt_cont.run` unchanged, the same way the
+  vendored `rt_dry.py` does. It must not import our `gp8_control`, because
+  the planner ships its own `gp8_control` fork that has to win the import. It
+  talks JSON lines to the app (`now`/`cands`/`commit`/`suction`, README sec. 6
+  of the vendored folder). Its stdin reader starts only **after**
+  `rt_inv.pool()` forks: a fork while a thread blocks in `stdin.readline`
+  deadlocks every pool worker.
+* `runner.py::CycleThrowRunner` (app process) feeds tracked objects
+  (`y0 = y + 0.12·t`) and streams the committed 2 ms samples through
+  `RobotBackend._emit_sample` at `t0 + k·2 ms`, holding the last sample in gaps.
+  It applies the vendored 2 ms increment-window guard (CODE 112) and fires
+  suction on the sample clock. The planner's "robot sign" equals our joint
+  convention (its home pose FKs to TCP (0.40, 0, 0.12) in `robots/gp8.py`).
+* The planner pre-distorts its commands for the identified controller filter
+  (40 ms dead time + 200/80 ms moving averages). The twin therefore runs cycle
+  mode with `SimConfig.servo_filter="box200_80"` (`cycle_sim_config()`).
+  Without the filter every throw misses.
+* Push-routed objects (`ActionSelector`, metal by default) are never shown to
+  the planner. They run in **push slots** (`runner._push_slot`,
+  `push_slot.make_push_handler`). The runner hides all objects so the planner
+  ends its segment at its wait point. It waits until the end piece has arrived
+  (the "segment ends" log line comes before the command thread commits it),
+  pauses the 2 ms stream, and runs the normal `PushSkill` with no chain move.
+  It then returns to the exact last planner command and holds it
+  ≥ `GP8_CYCLE_SETTLE_S` (> the 0.32 s filter) before resuming. Splicing
+  anywhere else breaks the planner's command-history assumption.
+* Object top height: the planner defaults to 0.02 m, but our stack's belt sits
+  higher (`GRASP_Z` 0.042, `PUSH_HEIGHT` 0.03 = paddle on belt). The twin keeps
+  our belt and passes the real top (`sim_object_top`). On hardware, check the
+  top height (`GP8_CYCLE_TOP_Z`) before running.
+* Command output on hardware goes through the **controller buffer**
+  (`motoman_controllers/SampleBuffer`, driver branch `feature/sample-buffer`,
+  loaded inactive with `sample_buffer:=true` / `GP8_SAMPLE_BUFFER=true`).
+  `runner._BufferOutput` writes whole pieces by controller tick via
+  `TrajectoryController.buf` (the teammate's `controllers/sample_buffer.py`
+  `BufferClient`; the topics are created at construction when `GP8_MODE=cycle`).
+  The controller puts out sample k at its tick k, so no Python loop paces the
+  stream. Mapping: planner k = tick + `shift`, re-mapped after each
+  activation (the tick restarts at 0). The MuJoCo twin and
+  `GP8_CYCLE_OUTPUT=stream` keep the 2 ms Python stream.
+  `tools/cycle_dry_check` checks both paths without the robot (fake buffer
+  with the C++ rules, or `--ros` on mock hardware, domain 77).
+* The planner normally runs on robot6 (`GP8_CYCLE_PLANNER_HOST=robot6-planner`)
+  over ssh; `planner_link` maps its clock onto the app's by ping/pong.
+* Hardware needs a 500 Hz driver plus `GP8_STREAM_HZ=500`
+  (`utils/stream_rate.py`; default 250; the robot PC driver runs 500 Hz since 11-19). The NN
+  comes in model sets per belt speed / bin distance (`GT_BELT` 0.10–0.20,
+  `GT_BIN_X` 1.10 / 1.35 / 1.60; bins at z −0.11). The runner reads the same
+  variables (y0 extrapolation, sim bins) and forwards them to the planner,
+  whose `env.sh` refuses a combination without a set. Git holds only the
+  default set (`zm011_z`, 100 MB via LFS); the other seven live untracked in
+  the robot6 checkout (`/PublicSSD/iitp/demo/gp8_control`).
+
+### Piece mode (`GP8_MODE=pieces`, `cycle_throw/piece_runner.py`)
+
+A third run mode: skills return a `MotionPiece` (`skills/base.py`) from
+`plan_piece()` instead of moving the arm. `PieceRunner` sends the steps due
+next (`throw` held object, pushes, `pick` of the next throw object) as ONE
+`plan` request to `cycle_throw/piece_link.py` (robot6, vendored planner dir),
+which plans them as one planned REALIZED motion and fits the commands once
+with the vendored `rt_inv` (split only at contact keys). Throw = `rn2` cycle
+(`skills/planner_throw_skill.py` says what/which bin); push =
+`PushSkill.plan_piece`: the stroke commands from the backswing + fire time,
+planned as F(U) = the identified controller filter applied to them (what the
+real arm does with that push today). Moves between steps are vendored `p2p`
+from the current moving state, so there is no rest hand-off, settle hold,
+controller switch or command smoothing. Buffer write lead comes from the
+measured write round trip (`runner._BufferOutput.lead_ticks`). Routing stays
+`ctx.skill_for` (the RL seam); the vendored tree is unchanged. Details, flags,
+twin results: `cycle_throw/PIECES.md`. `gp8_cycle` runs it with
+`GP8_DEMO_MODE=pieces`.
+
+Planning rules that keep the arm moving (do not regress them): the safe
+default (rt_cont's end at the fixed wait point) is queued as lazy chunks right
+after `rn2`, and a better plan replaces it only while its first chunk is
+unsent; a plan that ends at rest keeps its end open, and the next request
+carries on from it at `b + L`; the app never fills buffer gaps (the controller
+holds). Env for the link must start with `GP8_PIECE_`/`RT_` to be forwarded.
+
+**Running with robot6** (operator steps in README section C): the robot PC
+runs driver + app + camera_debug, robot6 (`iitp@147.46.175.15`, checkout
+`/PublicSSD/iitp/demo/gp8_control` with its own `.venv`) runs the planner
+link over ssh (`GP8_CYCLE_PLANNER_HOST=robot6-planner`) and the vision docker.
+Deploy = `git pull` on BOTH machines; rebuild on the robot PC with the motoman
+driver workspace sourced first. One command: `GP8_DEMO_MODE=pieces gp8_cycle`
+(`GP8_DEMO_CHECK_ONLY=1` = robot-free check).
+
 ### Two-process bridge — `bridge.py` is mandatory
 
 MotoROS2 names joints `joint_1..6`; everything else (URDF/SRDF/MoveIt/GUI/
@@ -174,7 +269,9 @@ This branch runs the **adv4ncr 250 Hz stream** driver: the base-class engine
 resamples each trajectory onto a 4 ms grid and `TrajectoryController` publishes
 each sample to `/JointGroupPositionController/commands` (Float64MultiArray),
 driving suction via a Simple-Message TCP call (port 50242) on a dedicated IO
-worker thread. A `jtc` fallback backend (`GP8_ADV4NCR_BACKEND=jtc`, FJT action)
+worker thread. The rate is `GP8_STREAM_HZ` (`utils/stream_rate.py`, 250 or 500).
+The YRC1000micro interpolates every 2 ms, so at 250 Hz the RT speed ceiling in
+`robots/gp8.py` is half the datasheet. Use 500 only with a 500 Hz driver. A `jtc` fallback backend (`GP8_ADV4NCR_BACKEND=jtc`, FJT action)
 stays hardware-only inside this file. There is **no MotoROS2 Point Queue Mode**:
 `enter_queue_mode`/`exit_queue_mode`/`pq_*` remain only as no-op lifecycle
 shims (in the base class). Skills just dispatch trajectories. (The prior
