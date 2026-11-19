@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **`sim_experiment` branch (shared server robot17):** before doing anything,
+> read `sim_experiment/README.md` (server layout, env install, run commands)
+> and `sim_experiment/TODO.md` (goals, decisions, experiment queue, findings —
+> the running work log). Update `TODO.md` whenever a decision is made or an
+> experiment finishes. Answer the team in Korean.
+
 `README.md` is the authoritative operator guide (launch order, pendant state,
 debug tools, topology) and is largely in Korean. Read it for *how to run*; this
 file covers *how the code is shaped* and the non-obvious cross-file contracts.
