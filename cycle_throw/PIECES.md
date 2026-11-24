@@ -116,6 +116,67 @@ push 뒤 벨트에 남은 물체가 하류에서 다시 잡힌 추적은 `spawn`
   - 결과: 앱 CPU 대기 33~47 %, 물체 16 개 몰림 40~50 %, 쓰기 왕복 95 % 12 ms (183 ms 였음), 엔코더 대 필터 모델
     0.42° RMS (이전에 본 최대 29° 는 바쁜 앱이 받은 시각을 찍은 측정 오류).
 
+## RL 학습 환경: 조각 모드 (`rl/piece_env.py`, 2026-11-24)
+
+skill 모드 RL 시뮬레이터 (`rl/gym_env.py`) 에 실기에서 확인한 컨트롤러 필터를 켜면 skill 모드 던지기가 무너진다
+(규칙 정책 진단, seed 10 개: throw transparent 0.83 → 0.14~0.24, 현행 규칙 보상 60.8 → 11~15). skill 모드 궤적은
+필터 지연을 모르기 때문. 조각 모드는 필터를 계산에 넣어 실기와 맞았으므로, RL 이 고른 행동을 조각 모드로 실행하는
+환경을 따로 둔다 (`GP8PieceEnv`, 관찰·행동은 `GP8RecyclingEnv` 와 같음: `[슬롯, 스킬]`, 슬롯 6 = 건너뛰기).
+
+- **결정 시점**: 조각 모드가 다음 단계를 정할 때 (들고 있는 물체 던지기 `RT_AHEAD` 3 s 전, 또는 팔이 비었을 때) 러너
+  스레드가 에이전트에게 묻고 `step()` 을 기다린다 (`PieceRunner(decide_fn=...)`). push 를 고르면 같은 요청 안에서
+  그 push 가 끝나는 시각 기준으로 한 번 더 묻는다 (규칙처럼 push 최대 2 개 + 집기 1 개를 한 요청에 묶음).
+- **가상 시간** (`backends/sim_tick.py`): 플래너 링크가 계산하는 동안은 실제 시간과 같이 흐르고 (계획 지연이 실기와
+  같은 비용), 아니면 `GP8_PIECE_WARP_S` (0.05 s) 씩 건너뛴다. 건너뛰기 전에 링크가 그 사이 보낼 명령 조각을 모두
+  보내고 응답한다 (`warp` / `warped`, `GP8_PIECE_VIRTUAL=1`). 명령은 트윈의 틱 버퍼 (`SimTickBuffer`, 실기
+  SampleBuffer 규칙) 로 들어가 물리 스텝마다 꺼내 쓴다.
+- **보상**: 트윈의 물체 결과. 던진 물체는 클래스 통, push 한 물체는 `push_<클래스>` 통이 정답.
+- **검증**: 같은 물체 흐름 (19 개) 에서 규칙 정책 + 가상 시간 = 실시간 조각 모드 트윈과 19/19 같은 행동, 석션 85 % /
+  91 %, push 명중 57 % / 57 %. 속도는 실시간의 약 2 배 (남은 시간은 대부분 플래너의 실제 계산). 로봇 없는 버퍼 점검과
+  `sim_smoke` 통과 (실기 경로는 시계가 `time.monotonic` 그대로).
+- 실행: `python -m gp8_control.rl.piece_env --seconds 120 --policy heuristic|random`,
+  학습: `python -m gp8_control.tools.train_ppo_smoke --env piece ...` (MaskablePPO, 짧은 학습 확인함).
+  링크는 env 마다 로컬 자식 프로세스 (`GP8_CYCLE_PLANNER_HOST` 비움), reset 마다 새로 뜬다 (몇 초).
+
+### 실기에서 정책 통로 확인 (2026-11-24, 브랜치 feat/rl-piece-sim)
+`GP8_PIECE_POLICY=heuristic` (규칙을 정책 통로로) 과 정책 없음 (지금 규칙) 을 같은 가상 물체 12 개 (페트·캔 2 s 간격) 로
+실기에서: 12/12 같은 행동, 계획 11 번·석션 8 번·push 4 번 모두 같고 거부·늦은 조각·오류 0. 결정 한 번 0.1 ms.
+같은 물체 흐름을 `GP8PieceEnv` (가상 시간, 같은 결정 코드) 에 넣으면 12/12 같은 행동, 페트 집기 접촉 시각 0.03 s 이내,
+push 는 4 개 중 2 개 0.07 s 이내·2 개 0.3~0.6 s, push 거절 후 던진 캔 2 개는 트윈이 1.3 s 늦게 집음. env 는 실기
+push 설정 (도달 0.70, 가속 24) 을 기본으로 쓴다 (이것이 없으면 push 시각이 0.5 s 어긋남). 정책은
+`GP8_PIECE_POLICY=<MaskablePPO .zip>` 으로 실기에 넣는다 (`rl/piece_policy.py`; `remaining_time_frac` 는 실행 시작부터
+`GP8_PIECE_POLICY_EPISODE_S` 240 s 주기).
+
+### 구조: 한 규칙은 한 곳 (2026-11-24 리팩토링)
+| 무엇 | 한 곳 | 쓰는 곳 |
+|---|---|---|
+| 조각 모드 조립 (스킬, 스킬별 클래스, 결정기, 실행기) | `cycle_throw/piece_stack.py` `PieceStack` | `AppPieceStack` (실기 앱), `TwinPieceStack` (트윈: RL env, `tools/piece_twin.py`) |
+| 결정 (관찰, 마스크, 정책) | `rl/piece_policy.py` `PieceDecider` | 위 둘 |
+| SampleBuffer 규칙 (파이썬) | `controllers/sample_buffer_rules.py` `SampleBufferRules` | 트윈 `SimTickBuffer`, 로봇 없는 점검의 가짜 버퍼 (실기는 C++) |
+| 조각 모드 제어 설정 | `config/piece_mode.env` (push 도달 0.70, 가속 24) | `gp8_cycle`, `piece_settings.apply()` (트윈) |
+| 석션 밸브 지연 | `runner.VALVE_S` 0.2 s | 실기: OFF 를 그만큼 일찍 / 트윈: 밸브가 그만큼 늦게 놓음 |
+
+로봇 PC `.env` 에는 현장 보정값만 둔다 (물체 윗면 높이, 실제 벨트 위 push 높이, 카메라 부호). 정책이 보는 칸은 조각 모드가
+이미 맡은 물체를 뺀 추적 물체다 (리팩토링 중 발견: 맡은 물체가 칸을 채워 정책이 후보를 못 보던 문제).
+트윈 시험 (같은 19 개): 실시간 규칙 = 가상 시간 규칙 = 가상 시간 정책 통로(heuristic), 19/19 같은 행동.
+
+### 실기 = 시뮬레이터 확인 (2026-11-24, 리팩토링 후)
+실기 (가상 물체 16 개, 페트·캔 1.4 s 간격) 3 번: 규칙 / `GP8_PIECE_POLICY=heuristic` / `upstream` (시험 정책, 상류 먼저).
+모두 거부·늦은 조각·오류 0, 설정은 `config/piece_mode.env` 에서 (로그: push reach 0.70 accel 24, release lead 0.2).
+- 실기 규칙 vs 실기 정책 통로: 16/16 같은 행동.
+- 각 실기 물체 흐름을 `tools/piece_twin.py` (가상 시간, 같은 정책) 로 재생: heuristic 16/16, upstream 16/16 같은 행동
+  (건너뛴 물체 포함), 계획 접촉 시각 모두 0.15 s 이내.
+- 맞추는 과정에서 고친 트윈 차이: 카메라 시야 제한을 끄면 빗나간 push 뒤 벨트에 남은 캔이 로봇 앞에서 다시 잡혀 정책이
+  다시 치러 감 (실기 카메라는 못 봄) → 시야 제한 유지; 상자 12 개가 모자라 촘촘한 흐름의 13~15 번째가 안 나옴 → 24 개.
+
+### 학습된 모델이 실기를 움직이는지 (2026-11-24)
+짧게 학습한 MaskablePPO 모델 (32 스텝, 시험용) 을 `GP8_PIECE_POLICY=<.zip>` 으로 실기에 (가상 물체 16 개, 1.4 s):
+결정 49 번 (건너뛰기 38), 물체를 고른 11 번 모두 실행 (고른 그대로 계획·링크가 받음 10, push 거절 → 던지기 1),
+거부·늦은 조각·오류 0, 결정 1~9 ms. 같은 흐름을 트윈에 같은 모델로: 16/16 같은 행동 (건너뛴 물체 포함), 결정 감사
+(`[policy] result: ...`, `PieceRunner.decision_summary`) 도 같은 수. 학습 서버 (numpy 2.x) 에서 저장한 모델은 로봇 앱
+(numpy 1.26) 에서 공간·학습 상태 피클이 안 풀린다 → `load_policy` 가 우리 공간을 넘기고 가중치만 읽는다.
+로봇 PC `.venv` 에는 stable-baselines3 / sb3-contrib 2.9.0 이 이미 있다.
+
 ## 검증 (2026-11-19)
 
 MuJoCo 트윈 (실시간, 필터 `box200_80`), 페트+캔 1.6 s 간격, 60 s:

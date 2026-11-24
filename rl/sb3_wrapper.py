@@ -54,8 +54,11 @@ class FlatMaskedActionWrapper(gym.ActionWrapper if gym is not None else object):
 
     def action_masks(self) -> np.ndarray:
         mask = None
+        own = getattr(self.unwrapped, "action_mask", None)   # GP8PieceEnv
         runner = getattr(self.unwrapped, "_runner", None)
-        if runner is not None:
+        if callable(own):
+            mask = own()
+        elif runner is not None:
             mask = runner.action_mask()
         if mask is None:
             return np.ones(self.action_space.n, dtype=bool)

@@ -797,25 +797,20 @@ class GP8App:
                 return
             if self.cfg.MODE == "pieces":
                 # Skills plan pieces; the teammate's planner parts (robot6) turn
-                # every piece into commands on one command path
-                # (cycle_throw/piece_runner.py). Same stop as cycle mode.
+                # every piece into commands on one command path. The wiring
+                # (skills, class rules, policy decider, runner) is
+                # cycle_throw/piece_stack.py, shared with the twin and the RL env;
+                # GP8_PIECE_POLICY lets a policy decide. Same stop as cycle mode.
                 import signal
 
-                from gp8_control.cycle_throw.piece_runner import PieceRunner
-                from gp8_control.skills.planner_throw_skill import PlannerThrowSkill
+                from gp8_control.cycle_throw.piece_stack import AppPieceStack
 
-                top_z = None
-                if self.cfg.BACKEND == "mujoco":
-                    from gp8_control.cycle_throw.runner import sim_object_top
-                    top_z = sim_object_top(self.world._core.cfg)
                 wind_down = threading.Event()
                 signal.signal(signal.SIGUSR1, lambda *_: wind_down.set())
-                PieceRunner(
-                    self, ctx=self.ctx, skill_for=self.ctx.skill_for, top_z=top_z,
-                    skills={"throw": PlannerThrowSkill(self.ctx), "push": self.push_skill},
-                ).run(intake=self._cycle_intake,
-                      ok=lambda: (rclpy.ok() and not self._spinner_dead
-                                  and not wind_down.is_set()))
+                stack = AppPieceStack(self)
+                stack.run(intake=self._cycle_intake, policy_spec=stack.policy_spec,
+                          ok=lambda: (rclpy.ok() and not self._spinner_dead
+                                      and not wind_down.is_set()))
                 self._node.get_logger().info("[pieces] wound down: arm at rest, back to JGPC next")
                 return
             while rclpy.ok() and not self._spinner_dead:

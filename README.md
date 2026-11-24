@@ -56,6 +56,9 @@ GP8_DEMO_MODE=pieces gp8_cycle                         # 실기. Ctrl+C 한 번 
 ```
 실기에서 쓰는 값의 예: `GP8_DEMO_MODE=pieces GP8_PUSH_HEIGHT=0.00 GP8_PUSH_ACCEL=24 GP8_CYCLE_TOP_Z=-0.01 GP8_CAM_SIGN_CX=-1 GP8_CAM_SIGN_CY=+1 gp8_cycle`
 
+**RL 정책으로 결정**: `GP8_PIECE_POLICY=heuristic|<model.zip> GP8_DEMO_MODE=pieces gp8_cycle`. 학습·평가·실기 적용 방법은
+[`docs/RL_PIECE_TRAINING.md`](docs/RL_PIECE_TRAINING.md). 물체 없이 시험: `GP8_DEMO_NO_CAMERA=1` + `tools/fake_detections.py`.
+
 **robot6 준비 (2026-11 완료, 새로 깔 때만)**
 - 체크아웃 `/PublicSSD/iitp/demo/gp8_control` (이 레포 main) + `.venv` (numpy 1.26, scipy, casadi). 앱이 ssh 로 조각 서버
   (`cycle_throw/piece_link.py`) 를 띄운다. 코드를 바꾸면 **로봇 PC 와 robot6 둘 다** `git pull` (robot6 은 git-lfs 가 없어

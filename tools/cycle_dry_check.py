@@ -42,9 +42,13 @@ from gp8_control.cycle_throw import runner as R
 from gp8_control.robots.gp8 import GP8
 from gp8_control.tracking.object_queue import TrackedObject, TrackedObjectQueue
 
-TS = 0.002
-V_MAX = np.array([7.9412480966, 6.7195176202, 9.0757121104, 9.5993108860, 9.5993108860,
-                  17.4532925199])          # sample_buffer.yaml
+from gp8_control.controllers.sample_buffer_rules import (  # noqa: E402  (one copy of the C++ rules)
+    A_FACTOR,
+    MIN_LEAD,
+    TOL,
+    TS,
+    SampleBufferRules,
+)
 
 
 class _Log:
@@ -62,27 +66,22 @@ class _Log:
     def debug(self, m): pass
 
 
-class _FakeSampleBuffer:
-    """motoman_controllers/SampleBuffer (sample_buffer.cpp) on this PC's clock."""
+class _FakeSampleBuffer(SampleBufferRules):
+    """motoman_controllers/SampleBuffer on this PC's clock: the controller's
+    rules (inherited, controllers/sample_buffer_rules.py) on a 2 ms wall tick."""
 
-    def __init__(self, q0, a_factor=20.0, tol=0.02, min_lead=3):
-        self.dq = V_MAX * TS * (1 + tol)
-        self.ddq = a_factor * V_MAX * TS * TS * (1 + tol)
-        self.min_lead = min_lead
+    def __init__(self, q0, a_factor=A_FACTOR, tol=TOL, min_lead=MIN_LEAD):
+        super().__init__(q0, min_lead=min_lead, a_factor=a_factor, tol=tol)
         self.lock = threading.Lock()
         self.client = None
         self.out: dict[int, np.ndarray] = {}      # tick -> commanded (this activation)
-        self.n_acc = self.n_rej = 0
-        self.rejects = []
         self.activate(np.asarray(q0, float))
         threading.Thread(target=self._loop, daemon=True).start()
 
     def activate(self, hold) -> None:
         with self.lock:
-            self.t_act, self.k, self.end = time.monotonic(), 0, 0
-            self.ring: dict[int, np.ndarray] = {}
-            self.last = np.asarray(hold, float).copy()
-            self.prev = self.last.copy()
+            self.t_act = time.monotonic()
+            self.reset(hold, k=0)
             self.pending, self.last_seq, self.last_res = [], 0, 0
             self.out = {}
 
@@ -94,41 +93,16 @@ class _FakeSampleBuffer:
         with self.lock:
             self.pending.append((int(seq), 0, None, True))
 
-    def _value_at(self, i):
-        if i < self.k:
-            return self.last if i == self.k - 1 else self.prev
-        if i < self.end:
-            return self.ring[i]
-        return self.ring[self.end - 1] if self.end > self.k else self.last
-
     def _merge(self, seq, s, Q, stop):
         self.last_seq = seq
         if stop:
-            self.end = self.k
+            self.stop_now()
             self.last_res = 0
             return
-        if s < self.k + self.min_lead:
-            self.last_res, self.n_rej = 1, self.n_rej + 1
-            self.rejects.append((seq, "too late"))
-            return
-        q2, q1 = self._value_at(s - 2), self._value_at(s - 1)
-        for r, q in enumerate(Q):
-            dq, ddq = q - q1, q - 2 * q1 + q2
-            if np.any(np.abs(dq) > self.dq) or np.any(np.abs(ddq) > self.ddq):
-                self.last_res, self.n_rej = 2, self.n_rej + 1
-                self.rejects.append((seq, f"limit at tick {s + r}"))
-                return
-            q2, q1 = q1, q
-        e = max(self.end, self.k)
-        hold = self._value_at(e)
-        for i in range(e, s):
-            self.ring[i] = hold
-        for r, q in enumerate(Q):
-            self.ring[s + r] = q
-        for i in [i for i in self.ring if i >= s + len(Q)]:
-            del self.ring[i]
-        self.end = s + len(Q)
-        self.last_res, self.n_acc = 0, self.n_acc + 1
+        res, why = self.merge(s, Q)
+        self.last_res = res
+        if why is not None:
+            self.rejects[-1] = (seq, why)
 
     def _loop(self):
         while True:
@@ -141,13 +115,8 @@ class _FakeSampleBuffer:
                 for c in self.pending:
                     self._merge(*c)
                 self.pending = []
-                holding = self.k >= self.end
-                cmd = self.ring[self.k] if not holding else self.last
-                self.prev, self.last = self.last, cmd
-                idx = self.k
+                idx, cmd, holding = self.output()
                 self.out[idx] = cmd
-                self.ring.pop(idx - 3, None)
-                self.k += 1
                 args = (idx, time.monotonic(), self.end, holding, self.last_seq, self.last_res,
                         cmd.tolist(), self.t_act + idx * TS)
             if self.client is not None:

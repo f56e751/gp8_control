@@ -15,6 +15,8 @@
 #   GP8_DEMO_CHECK_ONLY=1 gp8_cycle        (vision + robot6 check + robot-free planner check, no robot)
 #   GP8_DEMO_MODE=pieces gp8_cycle         (piece mode: push and throw on one command path)
 #   GP8_RUN_RECORD=0 gp8_cycle             (no real-to-sim recording; default on, <log>/record)
+#   GP8_PIECE_POLICY=heuristic|<model.zip> GP8_DEMO_MODE=pieces gp8_cycle  (a policy decides; docs/RL_PIECE_TRAINING.md)
+#   GP8_DEMO_NO_CAMERA=1 gp8_cycle         (no camera_debug: virtual objects via tools/fake_detections.py)
 # Details: cycle_throw/RUN_HW.md
 D="$(cd "$(dirname "$0")" && pwd)"
 PKG="$(cd "$D/.." && pwd)"
@@ -79,12 +81,19 @@ fi
 # 3. camera_debug ---------------------------------------------------------------
 # Own process group too: a backgrounded `ros2 run` ignores SIGINT, so it is
 # stopped by SIGTERM to its whole group (ros2 run + the node it starts).
-setsid "$D/camera.sh" > "$LOG/camera_debug.log" 2>&1 &
-CAM=$!
+# GP8_DEMO_NO_CAMERA=1: no camera_debug (virtual objects come from
+# tools/fake_detections.py, started by hand once the arm is at rest).
+CAM=""
+if [ "${GP8_DEMO_NO_CAMERA:-0}" != 1 ]; then
+  setsid "$D/camera.sh" > "$LOG/camera_debug.log" 2>&1 &
+  CAM=$!
+fi
 cleanup() {
-  kill -TERM -- -"$CAM" 2>/dev/null
-  for _ in 1 2 3 4 5; do pgrep -g "$CAM" >/dev/null || break; sleep 1; done
-  pgrep -g "$CAM" >/dev/null && kill -KILL -- -"$CAM" 2>/dev/null
+  if [ -n "$CAM" ]; then
+    kill -TERM -- -"$CAM" 2>/dev/null
+    for _ in 1 2 3 4 5; do pgrep -g "$CAM" >/dev/null || break; sleep 1; done
+    pgrep -g "$CAM" >/dev/null && kill -KILL -- -"$CAM" 2>/dev/null
+  fi
   if [ "${GP8_DEMO_STOP_VISION:-0}" = 1 ]; then
     "${SSH[@]}" "docker stop iitp_local" >/dev/null 2>&1 && say "vision stopped"
   fi
@@ -98,8 +107,12 @@ cleanup() {
 }
 trap cleanup EXIT
 sleep 3
-pgrep -g "$CAM" >/dev/null || { say "camera_debug exited — see $LOG/camera_debug.log"; exit 1; }
-say "camera_debug running (log $LOG/camera_debug.log)"
+if [ -n "$CAM" ]; then
+  pgrep -g "$CAM" >/dev/null || { say "camera_debug exited — see $LOG/camera_debug.log"; exit 1; }
+  say "camera_debug running (log $LOG/camera_debug.log)"
+else
+  say "no camera_debug (GP8_DEMO_NO_CAMERA=1): start tools/fake_detections.py once the arm is at rest"
+fi
 
 # 4. driver + app in cycle mode --------------------------------------------------
 # cycle = push slots between planner segments (HW-run); pieces = piece mode
@@ -108,18 +121,22 @@ case "${GP8_DEMO_MODE:-cycle}" in
   *) say "GP8_DEMO_MODE=${GP8_DEMO_MODE}: expected cycle or pieces"; exit 1 ;;
 esac
 export GP8_STREAM_HZ="${GP8_STREAM_HZ:-500}"
-# Piece mode meets cans earlier upstream (twin: mean wait at the backswing
-# 0.54 -> 0.31 s, fewer refused pushes); skills mode keeps MAX_REACH (0.65).
-[ "$GP8_MODE" = pieces ] && export GP8_PUSH_MAX_REACH="${GP8_PUSH_MAX_REACH:-0.70}"
+# Piece-mode control settings: config/piece_mode.env, the same file the twin /
+# RL env read (cycle_throw/piece_settings.py); shell or .env values win.
+if [ "$GP8_MODE" = pieces ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in ''|\#*) continue ;; esac
+    [ -z "${!k+x}" ] && export "$k=$v"
+  done < "$PKG/config/piece_mode.env"
+fi
 export GP8_SAMPLE_BUFFER="${GP8_SAMPLE_BUFFER:-true}"
 # Real-to-sim recording (utils/run_record.py, read with tools/real2sim.py):
 # joints, commands, link messages, detections, tracks. GP8_RUN_RECORD=0 = off.
 [ "${GP8_RUN_RECORD:-1}" = 1 ] && export GP8_RUN_RECORD_DIR="${GP8_RUN_RECORD_DIR:-$LOG/record}"
 export GP8_CYCLE_PLANNER_HOST="$H"
-export GP8_CYCLE_RELEASE_LEAD="${GP8_CYCLE_RELEASE_LEAD:-0.2}"
 export GP8_CYCLE_TOP_Z="${GP8_CYCLE_TOP_Z:-0.042}"
 say "app: $GP8_MODE mode, skill routing ${GP8_FORCE_SKILL:-by class (metal push, transparent throw)}," \
-    "belt ${GT_BELT:-0.12} m/s, bins x ${GT_BIN_X:-1.35} m, release lead $GP8_CYCLE_RELEASE_LEAD s, top z $GP8_CYCLE_TOP_Z m"
+    "belt ${GT_BELT:-0.12} m/s, bins x ${GT_BIN_X:-1.35} m, release lead ${GP8_CYCLE_RELEASE_LEAD:-0.2 (VALVE_S)} s, top z $GP8_CYCLE_TOP_Z m, push reach ${GP8_PUSH_MAX_REACH:-0.65} accel ${GP8_PUSH_ACCEL:-12}"
 
 # Encoder feedback (pos_fdb on /dynamic_joint_states) for the recording: the C++
 # bag recorder in its own process group (inside the Python app a 500 Hz

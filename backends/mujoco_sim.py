@@ -511,6 +511,11 @@ class SimConfig:
     # height, its bottom stays on the belt, and the weld engages only when the
     # cup stops descending — so the box never goes through the belt.
     grab_gap: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_GAP", 0.008))
+    # Suction OFF takes effect this long after the command (the real valve and
+    # vacuum decay; the robot fires OFF that much early, GP8_CYCLE_RELEASE_LEAD).
+    # 0 = instant (the skill-mode twin); cycle_sim_config sets the robot's.
+    suction_off_delay: float = field(default_factory=lambda: max(
+        0.0, _env_float("GP8_SIM_SUCTION_OFF_DELAY", 0.0)))
     grab_xy_margin: float = field(default_factory=lambda: _env_float("GP8_SIM_GRAB_XY_MARGIN", 0.01))
     crush_min_frac: float = field(default_factory=lambda: _env_float("GP8_SIM_CRUSH_MIN", 0.4))
     # Suction success probability per class (unlisted classes: "*" or 1.0); randomized
@@ -1107,16 +1112,28 @@ class SimCore:
             return
         self.advance_until(self.sim_time() + duration)
 
+    def set_tick_source(self, src) -> None:
+        """Controller-tick command source (backends/sim_tick.SimTickBuffer): every
+        physics step takes its command and suction events from ``src.at_tick(k)``,
+        k = sim time / dt (non-realtime stepping only)."""
+        self._tick_source = src
+
     def advance_steps(self, n: int = 1) -> None:
         n = max(0, int(n))
         if n <= 0:
             return
         det_period = 1.0 / max(1.0, self.cfg.det_hz)
         pend = self._pending_ctrl
+        src = getattr(self, "_tick_source", None)
         for _ in range(n):
             suction_events = []
             with self.lock:
                 t_sub = float(self.data.time)
+                if src is not None:
+                    q, fire = src.at_tick(int(round(t_sub / self._dt)))
+                    if q is not None:
+                        self._ctrl_target = np.asarray(q, dtype=float)
+                    suction_events.extend(fire)
                 while pend and pend[0][0] <= t_sub:
                     _, kind, payload = pend.popleft()
                     if kind == "ctrl":
@@ -1210,6 +1227,11 @@ class SimCore:
         free-joint qvel already carries the true throw velocity — it flies
         ballistically with no synthesized fling.
         """
+        if not on and self.cfg.suction_off_delay > 0.0:
+            # the valve: the vacuum lets go suction_off_delay later (_step_once_locked)
+            self._release_at = float(self.data.time) + float(self.cfg.suction_off_delay)
+            return
+        self._release_at = None
         self._vacuum_on = bool(on)
         if on:
             self._suction_attempt_ok = None
@@ -1884,6 +1906,13 @@ class SimCore:
         return taps[::-1] @ self._servo_hist
 
     def _step_once_locked(self) -> None:
+        rel = getattr(self, "_release_at", None)
+        if rel is not None and float(self.data.time) >= rel:
+            self._release_at = None
+            self._vacuum_on = False
+            self._suction_attempt_ok = None
+            self._pressing = None
+            self._release_grabbed()
         self.data.ctrl[self._act_ids] = self._servo_command()
         self._apply_belt_velocity()
         mujoco.mj_step(self.model, self.data)

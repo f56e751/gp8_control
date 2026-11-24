@@ -69,6 +69,10 @@ from gp8_control.utils.stream_rate import STREAM_HZ
 # forwarded to the planner process, which refuses a combination it has no set
 # for (env.sh). Defaults = the 11-19 real-robot setting.
 PLANNER_DT = 0.002                    # command sample period [s]
+#: suction valve + vacuum decay [s]: the robot fires suction OFF this early
+#: (GP8_CYCLE_RELEASE_LEAD overrides; vendored README: "실물 실행은 0.2 s
+#: 앞당긴다"), and the cycle/piece twin's valve releases this late.
+VALVE_S = 0.2
 PLANNER_BELT_SPEED = float(os.environ.get("GT_BELT", "") or 0.12)   # plan belt speed [m/s]
 CYCLE_BIN_X = float(os.environ.get("GT_BIN_X", "") or 1.35)        # bin distance [m]
 CYCLE_BIN_Z = float(os.environ.get("GT_BIN_Z", "") or -0.11)       # bin opening height [m]
@@ -137,6 +141,10 @@ def cycle_sim_config(cfg=None):
     sim_cfg = SimConfig(
         bins=tuple(bins),
         servo_filter=os.environ.get("GP8_SIM_SERVO_FILTER", "box200_80"),
+        suction_off_delay=_env_float("GP8_SIM_SUCTION_OFF_DELAY", VALVE_S),
+        # enough box bodies for a dense real stream (12 ran out: thrown boxes
+        # sit in the bins until recycled); GP8_SIM_BOX_COUNT overrides
+        box_count=int(_env_float("GP8_SIM_BOX_COUNT", 24)),
         kp=_env_float("GP8_SIM_KP", 120000.0),
         kv=_env_float("GP8_SIM_KV", 700.0),
     )
@@ -249,7 +257,7 @@ class _BufferOutput:
         now = self.buf.now_index()
         # now_index() trusts the last progress message only so far ahead; when
         # progress runs late, the controller is further on than it says.
-        now += max(0, int(math.floor(self.buf.index_at(time.monotonic()))) - now)
+        now += max(0, int(math.floor(self.buf.index_at(r.mono()))) - now)
         kn = now + self.lead_ticks                                 # first tick safely writable
         start = k + self.shift
         if start < kn:
@@ -309,7 +317,7 @@ class _BufferOutput:
         end = self.buf.buffer_end
         if not self.buf.holding or end is None:
             return False
-        return time.monotonic() >= self.buf.tick_mono(end) + settle_s
+        return self.r.mono() >= self.buf.tick_mono(end) + settle_s
 
     def last_command(self) -> np.ndarray | None:
         c = self.buf.command
@@ -329,7 +337,7 @@ class CycleThrowRunner:
     LINK = "planner_link.py"
 
     def __init__(self, app, *, skill_for=None, push_handler=None,
-                 top_z: float | None = None) -> None:
+                 top_z: float | None = None, vtime=None) -> None:
         """``skill_for(obj) -> "throw" | "push" | ...`` routes objects (None =
         every object with a planner bin is thrown). ``push_handler(obj) -> str``
         runs one push with the arm at rest and returns a short result; it is
@@ -340,11 +348,16 @@ class CycleThrowRunner:
         self.cfg = app.cfg
         self.backend = app.traj_ctrl
         self.log = app._node.get_logger()
-        if getattr(self.backend, "clock", WALL_CLOCK) is not WALL_CLOCK:
+        # Virtual time (backends/sim_tick.VirtualTime, RL twin): planner time and
+        # every wait follow it; the sim is stepped to it. None = the wall clock.
+        self.vt = vtime
+        self.mono = vtime.mono if vtime is not None else time.monotonic
+        self._sleep = vtime.sleep if vtime is not None else time.sleep
+        if vtime is None and getattr(self.backend, "clock", WALL_CLOCK) is not WALL_CLOCK:
             raise RuntimeError("cycle mode needs a wall-clock backend (sim: GP8_SIM_REALTIME=1)")
 
         self.planner_dir = find_planner_dir()
-        self.release_lead = _env_float("GP8_CYCLE_RELEASE_LEAD", self.cfg.RELEASE_LEAD)
+        self.release_lead = _env_float("GP8_CYCLE_RELEASE_LEAD", VALVE_S)
         self.vis_y = (_env_float("GP8_CYCLE_VIS_Y_MIN", DEFAULT_VIS_Y[0]),
                       _env_float("GP8_CYCLE_VIS_Y_MAX", DEFAULT_VIS_Y[1]))
         # Object top height sent to the planner: unset = planner default 0.02 m
@@ -390,6 +403,8 @@ class CycleThrowRunner:
             planner_dt=PLANNER_DT, planner_belt=PLANNER_BELT_SPEED,
             bin_x=CYCLE_BIN_X, bin_z=CYCLE_BIN_Z, home=list(CYCLE_HOME),
             servo_filter=os.environ.get("GP8_SIM_SERVO_FILTER", ""))
+        if self.rec is not None and vtime is not None:
+            self.rec.clock = vtime.mono
         if self.rec is not None:
             prev = getattr(self.backend, "joint_state_listener", None)
             rec = self.rec
@@ -443,7 +458,7 @@ class CycleThrowRunner:
 
     # ------------------------------------------------------------------
     def now(self) -> float:
-        return time.monotonic() - float(self.t0)
+        return self.mono() - float(self.t0)
 
     def run(self, intake=None, ok=None) -> None:
         """Blocking: move to the planner's rest pose, start the planner, stream.
@@ -490,6 +505,8 @@ class CycleThrowRunner:
                 "motoman_hardware control period 0.002 s)")
         self._check_belt_speed()
         self._move_home()
+        if self.vt is not None:
+            self.vt.rebase()              # the home move stepped the sim on its own clock
         self._spawn_child()
         t_ready = time.monotonic() + _env_float("GP8_CYCLE_READY_TIMEOUT", 180.0)
         while not self._ready.wait(timeout=0.2):
@@ -500,6 +517,8 @@ class CycleThrowRunner:
                     "cycle planner " + ("exited" if exited else "did not become ready")
                     + "; its last stderr lines:\n  " + "\n  ".join(self._stderr_tail))
 
+        if self.vt is not None:
+            self.vt.rebase()              # the sim stood still while the link started up
         if self.out is not None:
             if not self.backend.buf_activate(5.0):
                 raise RuntimeError("SampleBufferController did not start (bringup with "
@@ -533,18 +552,18 @@ class CycleThrowRunner:
         # Same rest condition as a push slot: the planner has ended its segment
         # (throwing what it holds), its end piece has arrived and played out,
         # and the command has been still for a moment.
-        t_stop = time.monotonic()
+        t_stop = self.mono()
         deadline = t_stop + _env_float("GP8_CYCLE_DRAIN_S", 12.0)
         rested = False
-        while time.monotonic() < deadline and self._fault is None:
+        while self.mono() < deadline and self._fault is None:
             with self._lock:
                 idle = not self._seg_active
                 if idle and self._seg_end_t is not None:
                     idle = self._k_last_cmd * PLANNER_DT >= self._seg_end_t + 0.25
-            if idle and time.monotonic() - t_stop >= 1.0 and self._out_idle(0.2):
+            if idle and self.mono() - t_stop >= 1.0 and self._out_idle(0.2):
                 rested = True
                 break
-            time.sleep(0.05)
+            self._sleep(0.05)
         if not rested and self._fault is None:
             self.log.warn("[cycle] stop: the planner did not come to rest in time; holding where the arm is")
         self._teardown()
@@ -588,10 +607,10 @@ class CycleThrowRunner:
     def _move_home(self) -> None:
         """Move (with the normal stream) to the planner's rest pose."""
         while self.backend.current_joints is None:
-            time.sleep(0.05)
+            self._sleep(0.05)
         self._move_to(self.home)
         self.backend.suction_off()
-        time.sleep(0.5)
+        self._sleep(0.5)
 
     def _move_to(self, q_goal: np.ndarray) -> None:
         """Rest-to-rest joint move with the normal stream; the last command
@@ -844,7 +863,7 @@ class CycleThrowRunner:
                 else:
                     self.rec.event("rx", msg=msg)
             if kind == "ping":                       # clock sync (planner_link)
-                self._send({"t": "pong", "c": msg["c"], "a": time.monotonic()})
+                self._send({"t": "pong", "c": msg["c"], "a": self.mono()})
             elif kind == "cmd":
                 self._on_commit(int(msg["k"]), msg["U"])
             elif kind == "suc" and self.out is not None:
