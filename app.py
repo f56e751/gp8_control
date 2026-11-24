@@ -810,10 +810,46 @@ class GP8App:
                     top_z = sim_object_top(self.world._core.cfg)
                 wind_down = threading.Event()
                 signal.signal(signal.SIGUSR1, lambda *_: wind_down.set())
-                PieceRunner(
+                throw_skill = PlannerThrowSkill(self.ctx)
+                # GP8_PIECE_POLICY: a policy decides what piece mode does next
+                # ("heuristic" = the app's rule through the policy path, or a
+                # MaskablePPO .zip trained on rl/piece_env.py), with the same
+                # observation / mask code as the RL twin (rl/piece_policy.py).
+                decider = None
+                policy_spec = os.environ.get("GP8_PIECE_POLICY", "").strip()
+                if policy_spec:
+                    from gp8_control.rl.piece_policy import (
+                        PieceDecider,
+                        episode_remaining,
+                        load_policy,
+                    )
+                    from gp8_control.skills.planner_throw_skill import PLANNER_BIN_INDEX
+
+                    holder = {}
+                    decider = PieceDecider(
+                        queue=self.queue, ctx=self.ctx, robot=self.robot,
+                        joints_fn=lambda: (None if self.traj_ctrl.current_joints is None
+                                           else np.asarray(self.traj_ctrl.current_joints, float)),
+                        conveyor=self.conveyor, clock=self.ctx.clock,
+                        can={"throw": lambda o: o.class_name in PLANNER_BIN_INDEX,
+                             "push": self.push_skill.can_handle},
+                        max_objects=int(os.environ.get("GP8_PIECE_POLICY_OBJECTS", "6")),
+                        bbox_observation=os.environ.get("GP8_RL_BBOX_OBSERVATION", "size"),
+                        policy=load_policy(policy_spec, int(os.environ.get(
+                            "GP8_PIECE_POLICY_OBJECTS", "6"))),
+                        remaining_fn=episode_remaining(
+                            lambda: holder["r"].now(),
+                            lambda: None if holder["r"].t0 is None else 0.0),
+                        log=self._node.get_logger().info)
+                    self._node.get_logger().info(f"[pieces] decisions by policy {policy_spec!r}")
+                runner = PieceRunner(
                     self, ctx=self.ctx, skill_for=self.ctx.skill_for, top_z=top_z,
-                    skills={"throw": PlannerThrowSkill(self.ctx), "push": self.push_skill},
-                ).run(intake=self._cycle_intake,
+                    skills={"throw": throw_skill, "push": self.push_skill},
+                    decide_fn=decider,
+                )
+                if decider is not None:
+                    holder["r"] = runner
+                runner.run(intake=self._cycle_intake,
                       ok=lambda: (rclpy.ok() and not self._spinner_dead
                                   and not wind_down.is_set()))
                 self._node.get_logger().info("[pieces] wound down: arm at rest, back to JGPC next")

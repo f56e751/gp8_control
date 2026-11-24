@@ -55,6 +55,7 @@ except ImportError:  # pragma: no cover
         spaces = None
 
 from gp8_control.rl.common import SKILL_NAMES, normalize_bbox_observation, observation_width
+from gp8_control.rl.piece_policy import heuristic_action
 
 _DONE = object()
 
@@ -185,6 +186,13 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
                 want = class_bin_name_for(o.class_name)
             sim.core.mark_manipulated(o.sim_object_id, skill, want)
 
+        from gp8_control.rl.piece_policy import PieceDecider
+
+        # The SAME observation / mask code the robot uses (GP8_PIECE_POLICY).
+        self._decider = PieceDecider(
+            queue=sim.queue, ctx=sim.ctx, robot=sim.robot, joints_fn=sim.current_joints,
+            conveyor=sim.conveyor, can=self._can, clock=sim.clock, max_objects=self.max_objects,
+            bbox_observation=self.bbox_observation, remaining_fn=self._remaining)
         runner = PieceRunner(app, ctx=sim.ctx, skills={"throw": throw, "push": push},
                              skill_for=sim.ctx.skill_for, top_z=R.sim_object_top(sim.core.cfg),
                              on_execute=on_exec, vtime=vt, decide_fn=self._decide)
@@ -245,52 +253,29 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
         return float(np.clip(left / self.max_episode_seconds, 0.0, 1.0))
 
     def _observe(self):
-        return self._sim.observation(remaining_time_frac=self._remaining()).astype(np.float32)
-
-    def _mask(self, cands) -> np.ndarray:
-        ids = {it["o"]["id"] for it in cands}
-        mask = np.zeros((self.max_objects + 1, len(SKILL_NAMES)), dtype=np.uint8)
-        mask[self.max_objects, :] = 1
-        for slot, obj in enumerate(self._sim.ordered_objects()):
-            if int(obj.track_id) not in ids:
-                continue
-            for k, name in enumerate(SKILL_NAMES):
-                mask[slot, k] = int(self._can[name](obj))
-        return mask
+        # sim-only observation models (truth tracks, noise) first, then the shared encoder
+        self._sim._refresh_truth_tracks(self._sim.clock.time())
+        return self._decider.observation()
 
     def _decide(self, runner, cands, t_from):
         """decide_fn: hand the decision to the agent and wait for step()."""
         if self._stop:
             return None
-        mask = self._mask(cands)
+        obs = self._observe()
+        mask = self._decider.mask(cands)
         self._last_mask = mask
-        objs = self._sim.ordered_objects()
+        slots = [int(o.track_id) for o in self._decider.objects()]
         info = {"action_mask": mask, "t_from": float(t_from),
-                "sim_time": float(self._sim.core.sim_time()),
-                "slots": [int(o.track_id) for o in objs]}
+                "sim_time": float(self._sim.core.sim_time()), "slots": slots}
         self._sim.core.step_index = self._step_count
-        self._to_agent.put((self._observe(), info))
+        self._to_agent.put((obs, info))
         a = self._from_agent.get()
         if a is None or self._stop:
             return None
-        slot, skill = int(a[0]), int(a[1])
-        if slot >= len(objs) or slot >= self.max_objects or not mask[slot, skill]:
-            return None                              # skip / invalid = wait
-        tid = int(objs[slot].track_id)
-        it = next((c for c in cands if c["o"]["id"] == tid), None)
-        return None if it is None else (it, SKILL_NAMES[skill])
+        return self._decider.to_choice(a, cands, mask, slots)
 
 
 # ----------------------------------------------------------------------------
-def heuristic_action(mask: np.ndarray, slots_cls: list, max_objects: int) -> np.ndarray:
-    """The app's rule: first (most downstream) feasible slot, push if allowed, else throw."""
-    for slot in range(max_objects):
-        if mask[slot].any():
-            skill = 1 if mask[slot, 1] else 0
-            return np.array([slot, skill])
-    return np.array([max_objects, 0])
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--episodes", type=int, default=1)
@@ -308,7 +293,7 @@ def main(argv=None) -> int:
         while True:
             mask = info["action_mask"]
             if args.policy == "heuristic":
-                a = heuristic_action(mask, [], env.max_objects)
+                a = heuristic_action(mask, env.max_objects)
             else:
                 valid = np.argwhere(mask)
                 a = valid[rng.integers(len(valid))]
