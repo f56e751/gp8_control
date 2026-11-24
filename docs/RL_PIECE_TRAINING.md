@@ -119,11 +119,16 @@ $PY -m gp8_control.tools.piece_twin --seconds 240 --policy heuristic
 
 ```bash
 python -m gp8_control.tools.real2sim spawn RECORD -o objects.json          # 실기 물체 흐름 -> 트윈 스크립트
-python -m gp8_control.tools.piece_twin --seconds 80 --spawn-script objects.json \
+python -m gp8_control.tools.piece_twin --seconds <마지막 물체 + 20> --spawn-script objects.json \
        --policy <같은 정책> --record TWIN
 python -m gp8_control.tools.real2sim compare RECORD TWIN                   # 물체별 행동·접촉 시각
 python -m gp8_control.tools.real2sim track RECORD                          # 실제 팔 vs 컨트롤러 필터 모델
 ```
+
+- `--seconds` 는 **실기 기록의 마지막 물체 시각 + 약 20 s** 로 잡는다. `compare` 표의 `t(y=0)` (플래너 시간) 가 가장 큰 값을
+  보면 된다. 짧으면 마지막 물체들이 트윈 실행 종료와 겹쳐 다르게 나온다 (예: 마지막 물체 79 s 인 실행을 80 s 로 재생하면
+  16 개 중 14 개만 같고, 100 s 로 하면 16/16).
+- 정책은 실기와 같은 것을 준다 (`heuristic`, 같은 `.zip` 등). 정책 없이 재생하면 지금 규칙으로 결정한다.
 
 ## 9. 바꿀 때: 한 규칙은 한 곳
 
