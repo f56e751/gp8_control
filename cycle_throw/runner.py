@@ -69,6 +69,10 @@ from gp8_control.utils.stream_rate import STREAM_HZ
 # forwarded to the planner process, which refuses a combination it has no set
 # for (env.sh). Defaults = the 11-19 real-robot setting.
 PLANNER_DT = 0.002                    # command sample period [s]
+#: suction valve + vacuum decay [s]: the robot fires suction OFF this early
+#: (GP8_CYCLE_RELEASE_LEAD overrides; vendored README: "실물 실행은 0.2 s
+#: 앞당긴다"), and the cycle/piece twin's valve releases this late.
+VALVE_S = 0.2
 PLANNER_BELT_SPEED = float(os.environ.get("GT_BELT", "") or 0.12)   # plan belt speed [m/s]
 CYCLE_BIN_X = float(os.environ.get("GT_BIN_X", "") or 1.35)        # bin distance [m]
 CYCLE_BIN_Z = float(os.environ.get("GT_BIN_Z", "") or -0.11)       # bin opening height [m]
@@ -137,6 +141,7 @@ def cycle_sim_config(cfg=None):
     sim_cfg = SimConfig(
         bins=tuple(bins),
         servo_filter=os.environ.get("GP8_SIM_SERVO_FILTER", "box200_80"),
+        suction_off_delay=_env_float("GP8_SIM_SUCTION_OFF_DELAY", VALVE_S),
         kp=_env_float("GP8_SIM_KP", 120000.0),
         kv=_env_float("GP8_SIM_KV", 700.0),
     )
@@ -349,7 +354,7 @@ class CycleThrowRunner:
             raise RuntimeError("cycle mode needs a wall-clock backend (sim: GP8_SIM_REALTIME=1)")
 
         self.planner_dir = find_planner_dir()
-        self.release_lead = _env_float("GP8_CYCLE_RELEASE_LEAD", self.cfg.RELEASE_LEAD)
+        self.release_lead = _env_float("GP8_CYCLE_RELEASE_LEAD", VALVE_S)
         self.vis_y = (_env_float("GP8_CYCLE_VIS_Y_MIN", DEFAULT_VIS_Y[0]),
                       _env_float("GP8_CYCLE_VIS_Y_MAX", DEFAULT_VIS_Y[1]))
         # Object top height sent to the planner: unset = planner default 0.02 m

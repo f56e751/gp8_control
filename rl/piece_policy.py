@@ -7,14 +7,15 @@ in both places (``rl.common.build_observation`` over the tracked queue, the
 measured joints, the belt speed) so a policy trained in the twin sees on the
 robot what it saw in training, and maps ``[slot, skill]`` back to the object:
 
-* slot ``i`` < max_objects: the i-th object of the tracked queue (most
-  downstream first); valid if piece mode offers it now (``candidates``) and
+* slot ``i`` < max_objects: the i-th tracked object piece mode has not taken
+  yet (most downstream first); valid if piece mode offers it now (``candidates``) and
   the skill takes its class (throw: a planner bin; push: ``PushSkill``);
 * slot ``max_objects``: skip (nothing now; asked again shortly).
 
 Policies (``GP8_PIECE_POLICY``): ``heuristic`` (the app's rule: first valid
-slot, push if allowed, else throw) or the path of a MaskablePPO ``.zip``
-(deterministic). ``remaining_time_frac`` (an episode feature in training)
+slot, push if allowed, else throw), ``upstream`` (a deterministic test policy:
+most upstream valid slot, throw if allowed) or the path of a MaskablePPO
+``.zip`` (deterministic). ``remaining_time_frac`` (an episode feature in training)
 runs over ``GP8_PIECE_POLICY_EPISODE_S`` (240 s) from the run start and
 wraps around on the robot.
 """
@@ -41,7 +42,7 @@ def heuristic_action(mask: np.ndarray, max_objects: int) -> np.ndarray:
 class PieceDecider:
     def __init__(self, *, queue, ctx, robot, joints_fn, conveyor, can: dict, clock,
                  max_objects: int = 6, bbox_observation: str = "size", policy=None,
-                 remaining_fn=None, log=None) -> None:
+                 remaining_fn=None, log=None, taken_fn=None) -> None:
         self.queue, self.ctx, self.robot = queue, ctx, robot
         self.joints_fn, self.conveyor, self.can, self.clock = joints_fn, conveyor, can, clock
         self.max_objects = int(max_objects)
@@ -49,12 +50,16 @@ class PieceDecider:
         self.policy = policy                  # (obs, mask) -> [slot, skill]; None = external
         self.remaining_fn = remaining_fn or (lambda: 1.0)
         self.log = log
+        # objects piece mode has already taken (held, thrown, pushed) are not
+        # offered: they would fill the slots while still in the tracked queue
+        self.taken_fn = taken_fn or (lambda o: False)
         self.n = 0
         self.last = None                      # (obs, mask, slots, action)
 
     # ------------------------------------------------------------------
     def objects(self) -> list:
-        return list(self.queue._objects)[: self.max_objects]
+        """The observed slots: tracked objects piece mode has not taken, most downstream first."""
+        return [o for o in self.queue._objects if not self.taken_fn(o)][: self.max_objects]
 
     def observation(self) -> np.ndarray:
         joints = self.joints_fn()
@@ -107,11 +112,22 @@ class PieceDecider:
         return choice
 
 
+def upstream_action(mask: np.ndarray, max_objects: int) -> np.ndarray:
+    """A test policy unlike the rule: the LAST (most upstream) valid slot, throw if allowed."""
+    for slot in reversed(range(max_objects)):
+        if mask[slot].any():
+            return np.array([slot, 0 if mask[slot, 0] else 1])
+    return np.array([max_objects, 0])
+
+
 def load_policy(spec: str, max_objects: int):
-    """``heuristic`` or a MaskablePPO .zip -> (obs, mask) -> [slot, skill]."""
+    """``heuristic``, ``upstream`` (a test policy) or a MaskablePPO .zip ->
+    (obs, mask) -> [slot, skill]."""
     spec = (spec or "").strip()
     if spec in ("", "heuristic", "rule"):
         return lambda obs, mask: heuristic_action(mask, max_objects)
+    if spec == "upstream":
+        return lambda obs, mask: upstream_action(mask, max_objects)
     from sb3_contrib import MaskablePPO
 
     model = MaskablePPO.load(spec, device="cpu")

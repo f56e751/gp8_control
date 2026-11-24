@@ -147,6 +147,19 @@ push 설정 (도달 0.70, 가속 24) 을 기본으로 쓴다 (이것이 없으�
 `GP8_PIECE_POLICY=<MaskablePPO .zip>` 으로 실기에 넣는다 (`rl/piece_policy.py`; `remaining_time_frac` 는 실행 시작부터
 `GP8_PIECE_POLICY_EPISODE_S` 240 s 주기).
 
+### 구조: 한 규칙은 한 곳 (2026-11-24 리팩토링)
+| 무엇 | 한 곳 | 쓰는 곳 |
+|---|---|---|
+| 조각 모드 조립 (스킬, 스킬별 클래스, 결정기, 실행기) | `cycle_throw/piece_stack.py` `PieceStack` | `AppPieceStack` (실기 앱), `TwinPieceStack` (트윈: RL env, `tools/piece_twin.py`) |
+| 결정 (관찰, 마스크, 정책) | `rl/piece_policy.py` `PieceDecider` | 위 둘 |
+| SampleBuffer 규칙 (파이썬) | `controllers/sample_buffer_rules.py` `SampleBufferRules` | 트윈 `SimTickBuffer`, 로봇 없는 점검의 가짜 버퍼 (실기는 C++) |
+| 조각 모드 제어 설정 | `config/piece_mode.env` (push 도달 0.70, 가속 24) | `gp8_cycle`, `piece_settings.apply()` (트윈) |
+| 석션 밸브 지연 | `runner.VALVE_S` 0.2 s | 실기: OFF 를 그만큼 일찍 / 트윈: 밸브가 그만큼 늦게 놓음 |
+
+로봇 PC `.env` 에는 현장 보정값만 둔다 (물체 윗면 높이, 실제 벨트 위 push 높이, 카메라 부호). 정책이 보는 칸은 조각 모드가
+이미 맡은 물체를 뺀 추적 물체다 (리팩토링 중 발견: 맡은 물체가 칸을 채워 정책이 후보를 못 보던 문제).
+트윈 시험 (같은 19 개): 실시간 규칙 = 가상 시간 규칙 = 가상 시간 정책 통로(heuristic), 19/19 같은 행동.
+
 ## 검증 (2026-11-19)
 
 MuJoCo 트윈 (실시간, 필터 `box200_80`), 페트+캔 1.6 s 간격, 60 s:

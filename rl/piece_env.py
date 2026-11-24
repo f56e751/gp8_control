@@ -38,7 +38,6 @@ import os
 import queue
 import threading
 import time
-import types
 from typing import Any
 
 import numpy as np
@@ -81,6 +80,7 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
             shape=(observation_width(self.max_objects, False, self.bbox_observation, False),))
         self.action_space = spaces.MultiDiscrete([self.max_objects + 1, len(SKILL_NAMES)])
         self._sim = None
+        self._stack = None
         self._runner = None
         self._thread = None
         self._to_agent: queue.Queue = queue.Queue()
@@ -137,71 +137,17 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
 
     # ------------------------------------------------------------------
     def _build(self, seed) -> None:
-        os.environ["GP8_SIM_REALTIME"] = "0"
-        os.environ["GP8_PIECE_VIRTUAL"] = "1"
-        os.environ["GP8_CYCLE_PLANNER_HOST"] = ""
-        # The robot's piece-mode push settings (gp8_cycle: reach 0.70 in piece
-        # mode; .env: accel 24). Push height stays the twin's (its belt is
-        # ~5 cm higher than the real one in the robot frame).
-        os.environ.setdefault("GP8_PUSH_MAX_REACH", "0.70")
-        os.environ.setdefault("GP8_PUSH_ACCEL", "24")
-        from gp8_control.backends.mujoco_sim import class_bin_name_for
-        from gp8_control.backends.sim_tick import SimTickBuffer, VirtualTime
-        from gp8_control.config import Config
-        from gp8_control.cycle_throw import runner as R
-        from gp8_control.cycle_throw.piece_runner import PieceRunner
-        from gp8_control.rl.sim_runner import SimRlRunner
-        from gp8_control.skills.planner_throw_skill import PLANNER_BIN_INDEX, PlannerThrowSkill
+        from gp8_control.cycle_throw.piece_stack import TwinPieceStack
 
-        from gp8_control.rl.sim_profile import apply_sim_profile
-
-        apply_sim_profile()                   # a GP8_SIM_PROFILE fills env defaults first
-        cfg = self.cfg or Config()
-        cfg.BACKEND = "mujoco"
-        sim_cfg = R.cycle_sim_config(cfg)
-        if seed is not None:
-            sim_cfg.seed = int(seed)
-        sim = SimRlRunner(cfg, sim_cfg=sim_cfg, realtime=False, max_objects=self.max_objects,
-                          bbox_observation=self.bbox_observation, sim_seed=seed)
-        sim.start()
-        vt = VirtualTime(sim.core)
-        backend = sim.traj_ctrl
-        buf = SimTickBuffer(vt, sim.core._ctrl_target)
-        sim.core.set_tick_source(buf)
-        backend.buf = buf
-        # the controller holds the last COMMAND when the buffer takes over
-        backend.buf_activate = lambda timeout=5.0: buf.activate(sim.core._ctrl_target)
-        app = types.SimpleNamespace(cfg=sim.cfg, robot=sim.robot, traj_ctrl=backend,
-                                    conveyor=sim.conveyor, queue=sim.queue, _node=sim.node,
-                                    _spinner_dead=False, M1=sim.M1, M2=sim.M2,
-                                    world=types.SimpleNamespace(_core=sim.core))
-        throw = PlannerThrowSkill(sim.ctx)
-        push = sim.skills["push"]
-        self._can = {"throw": lambda o: o.class_name in PLANNER_BIN_INDEX,
-                     "push": lambda o: push.can_handle(o)}
-
-        bin_names = {b.name for b in sim.core.bins}
-
-        def on_exec(o, skill):
-            # The piece twin's bins: the planner's class bins (thrown) and the
-            # push bins "push_<class>" (cycle_sim_config); the right one depends
-            # on the skill that handled the object.
-            want = f"push_{o.class_name}" if skill == "push" else o.class_name
-            if want not in bin_names:
-                want = class_bin_name_for(o.class_name)
-            sim.core.mark_manipulated(o.sim_object_id, skill, want)
-
-        from gp8_control.rl.piece_policy import PieceDecider
-
-        # The SAME observation / mask code the robot uses (GP8_PIECE_POLICY).
-        self._decider = PieceDecider(
-            queue=sim.queue, ctx=sim.ctx, robot=sim.robot, joints_fn=sim.current_joints,
-            conveyor=sim.conveyor, can=self._can, clock=sim.clock, max_objects=self.max_objects,
-            bbox_observation=self.bbox_observation, remaining_fn=self._remaining)
-        runner = PieceRunner(app, ctx=sim.ctx, skills={"throw": throw, "push": push},
-                             skill_for=sim.ctx.skill_for, top_z=R.sim_object_top(sim.core.cfg),
-                             on_execute=on_exec, vtime=vt, decide_fn=self._decide)
-        self._sim, self._runner, self._vt, self._buf = sim, runner, vt, buf
+        # The twin, its virtual time, the robot's piece-mode settings and the
+        # piece wiring all come from TwinPieceStack (shared with the robot app).
+        stack = TwinPieceStack(virtual=True, seed=seed, cfg=self.cfg,
+                               max_objects=self.max_objects,
+                               bbox_observation=self.bbox_observation)
+        stack.make_decider(remaining_fn=self._remaining)
+        runner = stack.build(decide_fn=self._decide)
+        self._stack, self._sim, self._runner = stack, stack.sim, runner
+        self._vt, self._buf = stack.vt, stack.buf
         self._stop = False
         self._to_agent = queue.Queue()
         self._from_agent = queue.Queue()
@@ -220,14 +166,15 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
             w0 = time.monotonic()
             err = None
             try:
-                runner.run(intake=sim.ingest, ok=ok)
+                runner.run(intake=stack.intake, ok=ok)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
             self._pending_obs = self._observe()
             self.last_result = dict(error=err, stats=dict(runner.stats),
-                                    sim_s=round(sim.core.sim_time(), 1),
+                                    sim_s=round(self._sim.core.sim_time(), 1),
                                     wall_s=round(time.monotonic() - w0, 1),
-                                    warped_s=round(vt.warped_s, 1), buf_rejects=buf.rejects[:5])
+                                    warped_s=round(self._vt.warped_s, 1),
+                                    buf_rejects=self._buf.rejects[:5])
             self._to_agent.put(_DONE)
 
         self._thread = threading.Thread(target=run, name="piece_env", daemon=True)
@@ -241,10 +188,11 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
             self._thread = None
         if self._sim is not None:
             try:
-                self._sim.close()
+                self._stack.close()
             except Exception:  # noqa: BLE001
                 pass
             self._sim = None
+            self._stack = None
             self._runner = None
             gc.collect()
 
@@ -258,18 +206,16 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
         return float(np.clip(left / self.max_episode_seconds, 0.0, 1.0))
 
     def _observe(self):
-        # sim-only observation models (truth tracks, noise) first, then the shared encoder
-        self._sim._refresh_truth_tracks(self._sim.clock.time())
-        return self._decider.observation()
+        return self._stack.observe()
 
     def _decide(self, runner, cands, t_from):
         """decide_fn: hand the decision to the agent and wait for step()."""
         if self._stop:
             return None
         obs = self._observe()
-        mask = self._decider.mask(cands)
+        mask = self._stack.decider.mask(cands)
         self._last_mask = mask
-        slots = [int(o.track_id) for o in self._decider.objects()]
+        slots = [int(o.track_id) for o in self._stack.decider.objects()]
         info = {"action_mask": mask, "t_from": float(t_from),
                 "sim_time": float(self._sim.core.sim_time()), "slots": slots}
         self._sim.core.step_index = self._step_count
@@ -277,7 +223,7 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
         a = self._from_agent.get()
         if a is None or self._stop:
             return None
-        return self._decider.to_choice(a, cands, mask, slots)
+        return self._stack.decider.to_choice(a, cands, mask, slots)
 
 
 # ----------------------------------------------------------------------------

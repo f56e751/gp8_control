@@ -227,6 +227,21 @@ summarizes, compares measured joints with the filter model (`--fit`), turns a
 run's object stream into a twin spawn script (`GP8_SIM_SPAWN_SCRIPT`, started
 at planner t0) and compares two runs object by object.
 
+**One place per piece-mode rule** (keep it so): `cycle_throw/piece_stack.py`
+`PieceStack` assembles piece mode (skills, which classes each skill takes, the
+policy decider, the runner); `AppPieceStack` (app, robot) and `TwinPieceStack`
+(MuJoCo twin without ROS: RL env, `tools/piece_twin.py`) only add what
+differs. The decision (observation, mask, policy) is `rl/piece_policy.py`
+`PieceDecider`. The SampleBuffer rules in Python are
+`controllers/sample_buffer_rules.py` `SampleBufferRules` (the twin's
+`SimTickBuffer` and the dry check's fake inherit them; C++ on the robot).
+Piece-mode control settings live in `config/piece_mode.env` (read by
+`gp8_cycle` and by `cycle_throw/piece_settings.py` for the twin); robot-site
+calibration (object top, push height on the real belt, camera signs) stays in
+the robot PC's `.env`. The suction valve delay is `runner.VALVE_S` (0.2 s): the
+robot fires OFF that early, the cycle/piece twin's valve releases that late
+(`GP8_SIM_SUCTION_OFF_DELAY`).
+
 **RL on piece mode** (`rl/piece_env.py`, `train_ppo_smoke --env piece`): the
 policy picks the next object/skill whenever piece mode asks
 (`PieceRunner(decide_fn=...)`); the twin runs on virtual time

@@ -108,18 +108,22 @@ case "${GP8_DEMO_MODE:-cycle}" in
   *) say "GP8_DEMO_MODE=${GP8_DEMO_MODE}: expected cycle or pieces"; exit 1 ;;
 esac
 export GP8_STREAM_HZ="${GP8_STREAM_HZ:-500}"
-# Piece mode meets cans earlier upstream (twin: mean wait at the backswing
-# 0.54 -> 0.31 s, fewer refused pushes); skills mode keeps MAX_REACH (0.65).
-[ "$GP8_MODE" = pieces ] && export GP8_PUSH_MAX_REACH="${GP8_PUSH_MAX_REACH:-0.70}"
+# Piece-mode control settings: config/piece_mode.env, the same file the twin /
+# RL env read (cycle_throw/piece_settings.py); shell or .env values win.
+if [ "$GP8_MODE" = pieces ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in ''|\#*) continue ;; esac
+    [ -z "${!k+x}" ] && export "$k=$v"
+  done < "$PKG/config/piece_mode.env"
+fi
 export GP8_SAMPLE_BUFFER="${GP8_SAMPLE_BUFFER:-true}"
 # Real-to-sim recording (utils/run_record.py, read with tools/real2sim.py):
 # joints, commands, link messages, detections, tracks. GP8_RUN_RECORD=0 = off.
 [ "${GP8_RUN_RECORD:-1}" = 1 ] && export GP8_RUN_RECORD_DIR="${GP8_RUN_RECORD_DIR:-$LOG/record}"
 export GP8_CYCLE_PLANNER_HOST="$H"
-export GP8_CYCLE_RELEASE_LEAD="${GP8_CYCLE_RELEASE_LEAD:-0.2}"
 export GP8_CYCLE_TOP_Z="${GP8_CYCLE_TOP_Z:-0.042}"
 say "app: $GP8_MODE mode, skill routing ${GP8_FORCE_SKILL:-by class (metal push, transparent throw)}," \
-    "belt ${GT_BELT:-0.12} m/s, bins x ${GT_BIN_X:-1.35} m, release lead $GP8_CYCLE_RELEASE_LEAD s, top z $GP8_CYCLE_TOP_Z m"
+    "belt ${GT_BELT:-0.12} m/s, bins x ${GT_BIN_X:-1.35} m, release lead ${GP8_CYCLE_RELEASE_LEAD:-0.2 (VALVE_S)} s, top z $GP8_CYCLE_TOP_Z m, push reach ${GP8_PUSH_MAX_REACH:-0.65} accel ${GP8_PUSH_ACCEL:-12}"
 
 # Encoder feedback (pos_fdb on /dynamic_joint_states) for the recording: the C++
 # bag recorder in its own process group (inside the Python app a 500 Hz
