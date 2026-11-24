@@ -129,9 +129,16 @@ def cycle_sim_config(cfg=None):
             xyz = PUSH_BIN_TARGET_MAP.get(cls)
             if (cfg.FORCE_SKILL or skill) == "push" and xyz is not None:
                 bins.append(SimBin(f"push_{cls}", "push", *map(float, xyz), 0.20))
+    # Servo gains: the position servo lags a moving command by about
+    # (kv + joint damping) / kp (12000/220: 17 ms). The real arm's encoder
+    # follows the filter model with no extra lag (2026-11-24 HW recording:
+    # 0.26 deg RMS, best extra delay -4 ms), so the twin runs stiffer here:
+    # 120000/700 = 4 ms, 0.42 deg RMS against the model. GP8_SIM_KP/KV override.
     sim_cfg = SimConfig(
         bins=tuple(bins),
         servo_filter=os.environ.get("GP8_SIM_SERVO_FILTER", "box200_80"),
+        kp=_env_float("GP8_SIM_KP", 120000.0),
+        kv=_env_float("GP8_SIM_KV", 700.0),
     )
     if not os.environ.get("GP8_SIM_BELT_SPEED"):
         sim_cfg.belt_speed = PLANNER_BELT_SPEED
@@ -387,8 +394,11 @@ class CycleThrowRunner:
             prev = getattr(self.backend, "joint_state_listener", None)
             rec = self.rec
 
+            backend = self.backend
+
             def _on_joints(q, _prev=prev):
-                rec.joints(q)
+                # the twin stamps its joints with their sim time; hardware: receipt
+                rec.joints(q, getattr(backend, "current_joints_stamp", None))
                 if _prev is not None:
                     _prev(q)
             self.backend.joint_state_listener = _on_joints

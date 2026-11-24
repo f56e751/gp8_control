@@ -1917,6 +1917,10 @@ class SimCore:
         self.belt._push(now, self._encoder_distance)
         b = self._backend
         if b is not None:
+            # When these joints were true (realtime: sim time on the monotonic
+            # clock; the stepper runs batches, so "now" can be several ms later).
+            t0m = getattr(self, "_mono_t0", None)
+            b.current_joints_stamp = None if t0m is None else t0m + float(self.data.time)
             b.current_joints = pos
             b.current_jointvels = vel
         if self._recorder is not None:
@@ -1993,6 +1997,7 @@ class SimCore:
                 self._viewer = None   # no GL — run headless
 
         t0 = time.monotonic()
+        self._mono_t0 = t0                  # sim time 0 on the monotonic clock
         last_sync = 0.0
         det_period = 1.0 / max(1.0, self.cfg.det_hz)
         self._last_spawn = time.time()
