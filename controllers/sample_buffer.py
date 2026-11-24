@@ -27,7 +27,7 @@ import numpy as np
 TS = 0.002
 RES_OK, RES_LATE, RES_LIMIT, RES_MALFORMED, RES_OVERFLOW = 0, 1, 2, 3, 4
 RES_TIMEOUT = -1
-NOW_AHEAD_MAX = 5                         # now_index 가 마지막 진행보다 앞설 수 있는 틱 (진행 전달 지연 몫)
+NOW_AHEAD_MAX = 12                        # now_index 가 마지막 진행보다 앞설 수 있는 틱 (진행 전달 지연 몫; 진행은 5 틱마다 = progress_every)
 RES_NAMES = {RES_OK: "ok", RES_LATE: "too late", RES_LIMIT: "limit", RES_MALFORMED: "malformed", RES_OVERFLOW: "overflow",
              RES_TIMEOUT: "no ack"}
 
@@ -166,10 +166,19 @@ class BufferClient:
             self._cv.notify_all()
 
     def _ev_loop(self) -> None:
+        # 틱 시계로 쏜다 (base + k·TS, 진행 스탬프로 맞춘 컨트롤러 틱 시각): 진행이 5 틱마다 오거나 (progress_every)
+        # 앱이 바빠 늦게 받아도 석션 시각이 그만큼 밀리지 않는다. 진행이 이미 그 틱을 넘었으면 바로 쏜다.
         while True:
             with self._cv:
-                while not (self._events and self.index is not None and self._events[0][0] <= self.index):
-                    self._cv.wait(0.05)
+                while True:
+                    if self._events and self.index is not None and self.base is not None:
+                        k0 = self._events[0][0]
+                        rem = self.base + k0 * TS - time.monotonic()
+                        if rem <= 0.0 or k0 <= self.index:
+                            break
+                        self._cv.wait(min(rem, 0.05))
+                    else:
+                        self._cv.wait(0.05)
                 k, on = self._events.pop(0)
             try:
                 self._fire(on)

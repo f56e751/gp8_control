@@ -88,6 +88,11 @@ cleanup() {
   if [ "${GP8_DEMO_STOP_VISION:-0}" = 1 ]; then
     "${SSH[@]}" "docker stop iitp_local" >/dev/null 2>&1 && say "vision stopped"
   fi
+  if [ -n "${BAG:-}" ]; then          # encoder bag: stop it, then into the recording
+    kill -INT -- -"$BAG" 2>/dev/null
+    for _ in $(seq 1 10); do pgrep -g "$BAG" >/dev/null || break; sleep 1; done
+    python3 -m gp8_control.tools.bag_fb "$GP8_RUN_RECORD_DIR" 2>&1 | tail -2
+  fi
   say "logs: $LOG"
   [ -n "${GP8_RUN_RECORD_DIR:-}" ] && say "recording: $GP8_RUN_RECORD_DIR (python -m gp8_control.tools.real2sim summary <dir>)"
 }
@@ -115,6 +120,16 @@ export GP8_CYCLE_RELEASE_LEAD="${GP8_CYCLE_RELEASE_LEAD:-0.2}"
 export GP8_CYCLE_TOP_Z="${GP8_CYCLE_TOP_Z:-0.042}"
 say "app: $GP8_MODE mode, skill routing ${GP8_FORCE_SKILL:-by class (metal push, transparent throw)}," \
     "belt ${GT_BELT:-0.12} m/s, bins x ${GT_BIN_X:-1.35} m, release lead $GP8_CYCLE_RELEASE_LEAD s, top z $GP8_CYCLE_TOP_Z m"
+
+# Encoder feedback (pos_fdb on /dynamic_joint_states) for the recording: the C++
+# bag recorder in its own process group (inside the Python app a 500 Hz
+# subscription cost ~20 % of a core). tools/bag_fb.py merges it at the end.
+BAG=""
+if [ -n "${GP8_RUN_RECORD_DIR:-}" ]; then
+  mkdir -p "$GP8_RUN_RECORD_DIR"
+  setsid ros2 bag record -o "$GP8_RUN_RECORD_DIR/fb_bag" /dynamic_joint_states > "$LOG/fb_bag.log" 2>&1 < /dev/null &
+  BAG=$!
+fi
 
 # The driver + app run in their OWN process group, so Ctrl+C (or kill -INT of
 # this script) reaches only this script, which then stops things in order:

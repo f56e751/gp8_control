@@ -1925,6 +1925,31 @@ class SimCore:
             b.current_jointvels = vel
         if self._recorder is not None:
             self._recorder.maybe_capture()
+        self._record_truth()
+
+    def _record_truth(self) -> None:
+        """Run recording (GP8_RUN_RECORD_DIR): the true box states and the
+        cup/paddle site, 50 Hz of sim time, for real-to-sim checks (push
+        contact timing, pick offsets)."""
+        rec = run_record.current()
+        if rec is None:
+            return
+        t = float(self.data.time)
+        if t - getattr(self, "_t_truth", -1.0) < 0.02:
+            return
+        self._t_truth = t
+        with self.lock:
+            boxes = []
+            for i, jnt in enumerate(self._box_joints):
+                if self._box_state[i] == self._FREE:
+                    continue
+                b = self._to_base(jnt.qpos[0:3])
+                boxes.append([int(self._box_serial[i]), self._box_state[i],
+                              *[round(float(v), 4) for v in b],
+                              *[round(float(v), 4) for v in jnt.qvel[0:3]]])
+            tcp = [round(float(v), 4) for v in self._to_base(self.data.site(self._grip_id).xpos)]
+        t0m = getattr(self, "_mono_t0", None)
+        rec.event("truth", ts=None if t0m is None else t0m + t, tcp=tcp, boxes=boxes)
 
     def warp_seconds(self, duration: float) -> None:
         """Fast-forward idle kinematic-belt waits without integrating every step."""

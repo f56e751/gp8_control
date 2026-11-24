@@ -403,7 +403,6 @@ class CycleThrowRunner:
                 if _prev is not None:
                     _prev(q)
             self.backend.joint_state_listener = _on_joints
-            self._record_feedback()
 
         # --- push slots ---
         # Start draining when a push object is this close (s) to entering reach.
@@ -477,36 +476,6 @@ class CycleThrowRunner:
             self.close()
         if self._fault:
             raise RuntimeError(f"cycle mode stopped: {self._fault}")
-
-    def _record_feedback(self) -> None:
-        """Hardware: record the encoder feedback (``pos_fdb``) as well. The
-        motoman driver's /joint_states position is ``pos_set`` (the accepted
-        set point, i.e. the command); the realized motion behind the
-        controller filter is only on /dynamic_joint_states."""
-        node = getattr(self.app, "_node", None)
-        if self.cfg.BACKEND != "hw" or node is None or not hasattr(node, "create_subscription"):
-            return
-        try:
-            from control_msgs.msg import DynamicJointState
-
-            from gp8_control.controllers.trajectory_controller import JOINT_NAMES, stamp_to_mono
-        except ImportError as e:
-            self.log.warn(f"[record] no encoder feedback recording: {e!r}")
-            return
-        rec = self.rec
-
-        def _on_dyn(msg) -> None:
-            vals = {}
-            for name, iv in zip(msg.joint_names, msg.interface_values):
-                for k, v in zip(iv.interface_names, iv.values):
-                    if k == "pos_fdb":
-                        vals[name] = v
-            if all(j in vals for j in JOINT_NAMES):
-                # the broadcaster's stamp, not the (load-dependent) receipt time
-                rec.stream_row("joints_fb", [vals[j] for j in JOINT_NAMES],
-                               stamp_to_mono(msg.header.stamp))
-
-        self._dyn_sub = node.create_subscription(DynamicJointState, "/dynamic_joint_states", _on_dyn, 50)
 
     def _record_tracks(self) -> None:
         if self.rec is not None:
