@@ -157,7 +157,11 @@ PUSH_APPROACH_VIA_XY: float = 0.30
 # until it lands, batch-FIRST objects carry a +~250 ms entry-edge anchor drift
 # and are PREDICTED to now miss ~5–11 cm AHEAD (that prediction is the next
 # run's model check).
-PUSH_PERCEPTION_LAG: float = 0.28
+# sim_experiment: GP8_PUSH_PERCEPTION_LAG overrides it. The RL sim feeds the
+# TRUE object position (no pipeline lag; sim_profile's obs noise is zero-mean),
+# so the HW 0.28 s makes the paddle arrive 0.28 s EARLY there (3-8 cm ahead
+# of the object at 0.10-0.30 m/s). Default stays the HW value.
+PUSH_PERCEPTION_LAG: float = float(os.environ.get("GP8_PUSH_PERCEPTION_LAG", "0.28"))
 
 # Piece mode (plan_piece): the stroke is handed over as the command samples
 # the normal 2 ms stream sends, fired at the same time as here; the piece link
@@ -307,6 +311,15 @@ PUSH_RETREAT_MIN_X: float = 0.25
 # to test the CLAMPED run-up against 0.167 m directly instead of tuning this
 # constant — see _stroke_accel()/PUSH_SPEED, which already know the mode.
 PUSH_EXEC_MIN_BACKSWING_X: float = 0.24
+
+# sim_experiment: the two X limits above (PUSH_RETREAT_MIN_X clamp +
+# PUSH_EXEC_MIN_BACKSWING_X veto) are the code-side stand-in for the belt's
+# far-side guard (the one opposite the bins) blocking the backswing. The sim
+# has NO guard geometry, so these limits are the only place the guard exists.
+# GP8_PUSH_GUARD=0 turns BOTH off (no selection veto, no run-up clamp); the
+# reach-disc veto and the IK-fail no-runup fallback stay. Default 1 = unchanged.
+PUSH_GUARD_ENABLED: bool = os.environ.get("GP8_PUSH_GUARD", "1").strip().lower() not in (
+    "0", "false", "no", "off")
 
 # 6th joint angle (rad) for all push keyframes.  π/2 ≈ 90° clockwise
 # (viewed from above) so the TCP faces the push direction.
@@ -529,7 +542,7 @@ class PushSkill(ManipulationSkill):
             float(intercept.T_grasp[0, 3])
             - PUSH_RETREAT_DISTANCE * float(push_dir[0])
         )
-        if backswing_x < PUSH_EXEC_MIN_BACKSWING_X:
+        if PUSH_GUARD_ENABLED and backswing_x < PUSH_EXEC_MIN_BACKSWING_X:
             return (
                 f"backswing x={backswing_x:+.3f} < "
                 f"{PUSH_EXEC_MIN_BACKSWING_X:.2f} (run-up squeezed near base)"
@@ -1083,7 +1096,7 @@ class PushSkill(ManipulationSkill):
         dy = PUSH_RETREAT_DISTANCE * push_dir[1]
 
         # Clamp so X doesn't go below PUSH_RETREAT_MIN_X.
-        if T_grasp[0, 3] - dx < PUSH_RETREAT_MIN_X and dx > 0:
+        if PUSH_GUARD_ENABLED and T_grasp[0, 3] - dx < PUSH_RETREAT_MIN_X and dx > 0:
             available = max(0.0, T_grasp[0, 3] - PUSH_RETREAT_MIN_X)
             if available <= 0:
                 # No run-up possible at all — push from the object itself.

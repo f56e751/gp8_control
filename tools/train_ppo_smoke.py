@@ -46,6 +46,10 @@ SIM_ENV_KEYS = (
     "GP8_SIM_PROFILE",
     "GP8_RL_OBS_NOISE",
     "GP8_RL_DECISION_LATENCY",
+    "GP8_PUSH_GUARD",
+    "GP8_PUSH_PERCEPTION_LAG",
+    "GP8_SIM_PERCEPTION_LAG",
+    "GP8_TRACK_LEAD_T",
 )
 
 
@@ -336,13 +340,20 @@ def train(args) -> int:
         )
         model_path = out_dir / "ppo_smoke.zip"
         model.save(str(model_path))
-        mean_reward, std_reward = evaluate_policy(
-            model,
-            env,
-            n_eval_episodes=args.eval_episodes,
-            deterministic=True,
-            warn=False,
-        )
+        learn_wall_s = float(time.time() - t0)
+        # sim_experiment: --eval-episodes 0 skips this post-training eval (the
+        # status doc says not to trust it; it re-runs full 240 s episodes on
+        # the training vec env and can take longer than the learning itself).
+        if int(args.eval_episodes) > 0:
+            mean_reward, std_reward = evaluate_policy(
+                model,
+                env,
+                n_eval_episodes=args.eval_episodes,
+                deterministic=True,
+                warn=False,
+            )
+        else:
+            mean_reward, std_reward = float("nan"), float("nan")
         summary = {
             "total_timesteps": int(args.timesteps),
             "start_timesteps": start_timesteps,
@@ -370,6 +381,7 @@ def train(args) -> int:
             "mean_reward": float(mean_reward),
             "std_reward": float(std_reward),
             "elapsed_wall_s": float(time.time() - t0),
+            "learn_wall_s": learn_wall_s,
             "model_path": str(model_path),
             "sim_config": _sim_config_summary(args),
         }
