@@ -142,6 +142,9 @@ def cycle_sim_config(cfg=None):
         bins=tuple(bins),
         servo_filter=os.environ.get("GP8_SIM_SERVO_FILTER", "box200_80"),
         suction_off_delay=_env_float("GP8_SIM_SUCTION_OFF_DELAY", VALVE_S),
+        # enough box bodies for a dense real stream (12 ran out: thrown boxes
+        # sit in the bins until recycled); GP8_SIM_BOX_COUNT overrides
+        box_count=int(_env_float("GP8_SIM_BOX_COUNT", 24)),
         kp=_env_float("GP8_SIM_KP", 120000.0),
         kv=_env_float("GP8_SIM_KV", 700.0),
     )

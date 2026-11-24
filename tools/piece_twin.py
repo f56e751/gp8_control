@@ -36,10 +36,12 @@ def main(argv=None) -> int:
         os.environ["GP8_SIM_SPAWN_SCRIPT"] = args.spawn_script
     if args.record:
         os.environ["GP8_RUN_RECORD_DIR"] = args.record
+    # The real camera's field of view stays on (the twin's default): with it
+    # off, a can left on the belt after a missed push is detected again in
+    # front of the robot -- which the real camera can never see -- and a
+    # policy goes after it again.
     os.environ.setdefault("GP8_SIM_CLASSES", "transparent,metal")
     os.environ.setdefault("GP8_SIM_SPAWN_INTERVAL", "1.6")
-    os.environ.setdefault("GP8_SIM_SPAWN_Y", "1.70")
-    os.environ.setdefault("GP8_SIM_CAM_FOV_GATE", "0")
 
     from gp8_control.cycle_throw.piece_stack import TwinPieceStack
 
