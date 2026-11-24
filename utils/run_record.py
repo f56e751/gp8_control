@@ -12,6 +12,10 @@ Opt-in: ``GP8_RUN_RECORD_DIR=<dir>`` (``scripts/cycle_demo.sh`` sets it to
 * ``joints.f64``    float64 rows ``[monotonic, q1..q6]``: every measured joint
   state the backend received (``/joint_states`` on hardware, the stepper in
   the twin).
+* ``joints_fb.f64`` (hardware) the driver's encoder feedback ``pos_fdb``
+  from ``/dynamic_joint_states``. ``/joint_states`` (``joints.f64``) carries
+  ``pos_set``, the set point the controller accepted (= the command, ~6 ms
+  later), NOT the realized motion behind the controller filter.
 * ``cmd.f64``       float64 rows ``[monotonic due, q1..q6]``: every command
   sample the arm was given, at the time it takes effect (buffer: the tick's
   time; 2 ms stream: the send time). Gaps are held by the controller.
@@ -79,8 +83,7 @@ class RunRecorder:
         self._closed = False
         self._t_tracks = 0.0
         self._ev = open(self.dir / "events.jsonl", "a", encoding="utf-8")
-        self._bin = {"joints": open(self.dir / "joints.f64", "ab"),
-                     "cmd": open(self.dir / "cmd.f64", "ab")}
+        self._bin: dict = {}
         self._rows: dict[str, list] = {"joints": [], "cmd": []}
         self._rows_lock = threading.Lock()
         env = {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)}
@@ -100,6 +103,14 @@ class RunRecorder:
         row = [time.monotonic() if t_mono is None else float(t_mono), *map(float, q)]
         with self._rows_lock:
             self._rows["joints"].append(row)
+
+    def stream_row(self, name: str, q, t_mono: float | None = None) -> None:
+        """One row ``[t, q...]`` of another float64 stream (``<name>.f64``)."""
+        if self._closed or q is None:
+            return
+        row = [time.monotonic() if t_mono is None else float(t_mono), *map(float, q)]
+        with self._rows_lock:
+            self._rows.setdefault(name, []).append(row)
 
     def cmd_rows(self, t_first: float, dt: float, U) -> None:
         """Command samples U[i] taking effect at ``t_first + i*dt`` (monotonic)."""
@@ -149,10 +160,12 @@ class RunRecorder:
     # ------------------------------------------------------------------
     def _flush_rows(self) -> None:
         with self._rows_lock:
-            rows, self._rows = self._rows, {"joints": [], "cmd": []}
+            rows, self._rows = self._rows, {k: [] for k in self._rows}
         for name, rr in rows.items():
             if not rr:
                 continue
+            if name not in self._bin:
+                self._bin[name] = open(self.dir / f"{name}.f64", "ab")
             parts = [np.atleast_2d(np.asarray(r, float)) for r in rr]
             np.vstack(parts).astype("<f8").tofile(self._bin[name])
             self._bin[name].flush()
@@ -200,7 +213,7 @@ def load(run_dir) -> dict:
                 except ValueError:
                     pass                          # a torn last line
     out = {"events": events}
-    for name in ("joints", "cmd"):
+    for name in sorted({"joints", "cmd"} | {p.stem for p in d.glob("*.f64")}):
         p = d / f"{name}.f64"
         a = np.fromfile(p, dtype="<f8") if p.exists() else np.zeros(0)
         a = a[: len(a) // 7 * 7].reshape(-1, 7)

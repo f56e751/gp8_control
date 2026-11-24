@@ -84,9 +84,9 @@ def _apply(h, U: np.ndarray) -> np.ndarray:
     return np.column_stack([np.convolve(X[:, j], h, mode="valid") for j in range(U.shape[1])])
 
 
-def _grid(rec, t_start=None, t_end=None):
+def _grid(rec, t_start=None, t_end=None, source="joints"):
     """Commands (hold between samples) and measured joints on one 2 ms grid."""
-    cmd, jnt = rec["cmd"], rec["joints"]
+    cmd, jnt = rec["cmd"], rec[source]
     if not len(cmd) or not len(jnt):
         raise SystemExit("recording has no commands or no joint states")
     a = max(cmd[0, 0], jnt[0, 0]) if t_start is None else t_start
@@ -205,7 +205,15 @@ def _err_stats(t, U, Q, near, h, mask=None):
 def cmd_track(args) -> None:
     rec = load(args.run)
     t0 = _t0(rec) or rec["cmd"][0, 0]
-    t, U, Q, near = _grid(rec)
+    source = args.source
+    if source == "auto":
+        source = "joints_fb" if len(rec.get("joints_fb", ())) else "joints"
+    hw = (_events(rec, "meta") or [{}])[0].get("backend") == "hw"
+    note = ("  (encoder feedback pos_fdb)" if source == "joints_fb" else
+            "  (/joint_states = the driver's pos_set, the accepted command; NOT the realized "
+            "motion: record joints_fb)" if hw else "  (twin joints)")
+    print(f"measured = {source}{note}")
+    t, U, Q, near = _grid(rec, source=source)
     mov = _moving(U, Q)
     print(f"{len(t)} samples ({t[-1] - t[0]:.1f} s), moving {mov.mean() * 100:.0f} %, "
           f"joint data present {near.mean() * 100:.0f} %")
@@ -446,6 +454,8 @@ def main(argv=None) -> None:
     p.add_argument("--filter", default="box200_80")
     p.add_argument("--fit", action="store_true")
     p.add_argument("--worst", type=int, default=8)
+    p.add_argument("--source", default="auto", choices=("auto", "joints", "joints_fb"),
+                   help="measured stream (auto: encoder feedback when recorded)")
     p = sub.add_parser("spawn")
     p.add_argument("run")
     p.add_argument("-o", "--out", required=True)
