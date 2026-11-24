@@ -2,12 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **`sim_experiment` branch (shared server robot17):** before doing anything,
-> read `sim_experiment/README.md` (server layout, env install, run commands)
-> and `sim_experiment/TODO.md` (goals, decisions, experiment queue, findings —
-> the running work log). Update `TODO.md` whenever a decision is made or an
-> experiment finishes. Answer the team in Korean.
-
 `README.md` is the authoritative operator guide (launch order, pendant state,
 debug tools, topology) and is largely in Korean. Read it for *how to run*; this
 file covers *how the code is shaped* and the non-obvious cross-file contracts.
@@ -224,6 +218,15 @@ unsent; a plan that ends at rest keeps its end open, and the next request
 carries on from it at `b + L`; the app never fills buffer gaps (the controller
 holds). Env for the link must start with `GP8_PIECE_`/`RT_` to be forwarded.
 
+**Real-to-sim recording**: `GP8_RUN_RECORD_DIR` (on by default in
+`gp8_cycle`, `<log>/record`) makes the cycle/piece runner record joints,
+commands as played, link messages, detections and tracks
+(`utils/run_record.py`, recorder thread; encode with C json, never per-float
+Python, or the link's planning deadlines slip). `tools/real2sim.py`
+summarizes, compares measured joints with the filter model (`--fit`), turns a
+run's object stream into a twin spawn script (`GP8_SIM_SPAWN_SCRIPT`, started
+at planner t0) and compares two runs object by object.
+
 **Running with robot6** (operator steps in README section C): the robot PC
 runs driver + app + camera_debug, robot6 (`iitp@147.46.175.15`, checkout
 `/PublicSSD/iitp/demo/gp8_control` with its own `.venv`) runs the planner
@@ -314,6 +317,16 @@ re-poses the vendored `d435i` body/`<camera>` and only boxes it can see are
 reported (belt Y ≈ 2.15–2.79 m), so the app's belt dead reckoning carries every
 object from the camera to the pick exactly as on hardware. Boxes spawn just
 past the view's upstream edge (`spawn_y` nan → derived).
+
+Perception lag in the twin: `GP8_SIM_PERCEPTION_LAG` [s] (default 0) makes
+`SimCore` report every belt object `belt_speed x lag` upstream, in the camera
+snapshot AND `truth_detection_for` (the RL path), stamped fresh. The hardware
+push fires `PUSH_PERCEPTION_LAG` (0.28 s, `GP8_PUSH_PERCEPTION_LAG`) early to
+cover that lag, so a zero-lag twin with the HW correction pushes 3-8 cm ahead
+of the object (`sim_experiment/`, push analysis 2026-11-18). Either run the
+twin with lag 0.28 or set the correction to 0; never mix. `GP8_PUSH_GUARD=0`
+drops the far-side guard limits (sim experiments only; the guard is real).
+`sim_experiment/` holds that analysis's tools (README/TODO inside; robot17).
 
 ### Throw trajectory (`skills/throw_skill.py` + `trajectory/`)
 

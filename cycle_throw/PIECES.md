@@ -58,7 +58,7 @@ GP8_DEMO_MODE=pieces gp8_cycle                         # 실기 (나머지 설�
 
 | 변수 | 기본 | 뜻 |
 |---|---|---|
-| `GP8_PIECE_PUSH_LAG` | 0.28 (= `PUSH_PERCEPTION_LAG`) | push 발사 지연 보정. 트윈은 인식 지연이 0 이다 |
+| `GP8_PIECE_PUSH_LAG` | 0.28 (= `PUSH_PERCEPTION_LAG`, `GP8_PUSH_PERCEPTION_LAG`) | push 발사 지연 보정. 트윈은 기본 인식 지연 0 이라 0 으로 맞추거나, 트윈에 `GP8_SIM_PERCEPTION_LAG=0.28` 을 줘 실기와 같은 설정으로 돈다 |
 | `GP8_PIECE_PUSH_MAX` | 2 | 한 요청에 넣는 push 수. 다음 요청이 열린 끝에서 이어 붙이므로 상한이 아니다 |
 | `GP8_PIECE_PUSH_FALLBACK` | throw | push 거절 (백스윙 자리 없음, 두 번 늦음) 시 금속은 던짐 (+0.33 통). `none` = 안 함 |
 | `GP8_PIECE_MOVE_WORKERS` | 6 | 이동 (p2p) 을 병렬로 푸는 프로세스 수 |
@@ -68,6 +68,26 @@ GP8_DEMO_MODE=pieces gp8_cycle                         # 실기 (나머지 설�
 | `GP8_PIECE_REACH_HI` | 0.65 (reach_r.json) | 집기 도달 반경. 트윈 0.70: 페트 23/23, 접촉 6.7 cm 상류. 팀원 모델은 0.65 안에서 학습됨 — 실기 확인 전 |
 | `GP8_PIECE_SWING_SCALES` / `_SWING_STRETCH_OK` | 1.0,0.7,0.4,0.0 / 1.15 | 손목 (주로 B, j5; 상류 쪽 캔) 이 속도 한계에 걸려 스트로크 전체가 느려지면 (×1.7 → 약 1.2 m/s), 스윙을 줄여 다시 만들고 가장 빠른 것을 쓴다. 트윈: 가장 약한 push 의 실제 접촉 속도 1.14 → 1.37 m/s |
 | `RT_AHEAD` | 3.0 s | 들고 있는 물체의 던지기 사이클 시작 이만큼 전에 다음 단계를 정함 (rt_cont 와 같음) |
+
+## real-to-sim 기록과 재생
+
+`gp8_cycle` 은 실행마다 `~/gp8_logs/cycle_demo/<시각>/record/` 에 기록한다 (`GP8_RUN_RECORD=0` 이면 끔; 다른 실행은
+`GP8_RUN_RECORD_DIR=<dir>`). cycle·조각 모드, 실기·트윈 모두 같은 형식 (`utils/run_record.py`):
+`events.jsonl` (링크 송수신, 버퍼 쓰기, 석션, 검출 원본, 추적 10 Hz, 트윈은 스폰·착지), `joints.f64` (실제 관절),
+`cmd.f64` (팔에 준 명령, 효력 시각 기준). 읽기는 `tools/real2sim.py` (rclpy·mujoco 없이):
+
+```bash
+python -m gp8_control.tools.real2sim summary RUN          # 한 일: 계획, push/던짐, 늦은·거부된 조각, 석션, 관절 Hz
+python -m gp8_control.tools.real2sim track RUN --fit      # 실제 관절 vs 명령·필터 모델 (오차, 최적 지연, 최악 순간, 필터 맞춤)
+python -m gp8_control.tools.real2sim spawn RUN -o obj.json  # 추적된 물체 흐름 -> 트윈 스폰 스크립트
+GP8_SIM_SPAWN_SCRIPT=obj.json GP8_SIM_BELT_SPEED=<출력값> ...   # 트윈이 같은 물체를 같은 플래너 시각에 받음
+python -m gp8_control.tools.real2sim compare REAL TWIN    # 물체별 행동 (push/던짐/없음)·계획 접촉 시각 비교
+```
+
+로컬 검증 (2026-11-24, 트윈 30 s 섞어서): 기록 켬/끔 처리 결과 같은 수준 (계획 시간 부족 건너뜀 1~2), 재생 트윈이
+원본과 **19/19 같은 행동, 접촉 시각 차 0.02 s 이내**. 로봇 없는 버퍼 점검 PASS (명령 10251 샘플 = 틱).
+트윈 자신의 추종: `box200_80` 대비 관절 RMS 1.3°, 최적 추가 지연 +20 ms (MuJoCo PD) 에서 0.15° — 실기 값과 비교할 기준.
+push 뒤 벨트에 남은 물체가 하류에서 다시 잡힌 추적은 `spawn` 이 버린다 (처음 보인 위치가 0.3 m 이상 하류).
 
 ## 검증 (2026-11-19)
 

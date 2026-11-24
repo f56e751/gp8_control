@@ -86,6 +86,7 @@
   - `GP8_PUSH_PERCEPTION_LAG=0`은 원인 확인용 지름길이고, sim과 실기가 다른 설정으로 도는 문제가 남는다.
   - 3번 업무(실기 제약 sim 반영)에 해당한다.
 - [x] `GP8_SIM_PERCEPTION_LAG` (sim 인식 지연, 기본 0) 구현: `rl/sim_runner.py` 실제 위치 갱신에서 물체 위치를 지연×벨트속도만큼 상류로 밀어 준다.
+  - (2026-11-24, main 으로 합칠 때) 이 지연은 `SimCore` 로 옮겼다 (`SimConfig.perception_lag`): 카메라 모사 스냅샷과 `truth_detection_for` 가 같은 지연을 준다. 앱 트윈·조각 모드 트윈도 같은 옵션을 쓴다. 값·뜻은 같다.
   - 확인(seed 4, 벨트 0.29 m/s, push 우선, 120 s): sim 지연 0.28 + 보정 0.28 → 26/37, sim 지연 0 + 보정 0.28 → 8/38, 둘 다 0 → 24/34.
 - [x] **E4 sim 지연 sweep** → `runs/E4_simlag_sweep_1118/report.md`.
   - 결과(실기 보정 push 0.28 / throw 0.12, seed 10개). sim 지연 0.12/0.20/0.28일 때 push metal 71/78/75%, push transparent 78/89/90%, throw transparent 91/90/88%, throw metal 46/48/45%.

@@ -60,6 +60,7 @@ import numpy as np
 
 from gp8_control.tracking.object_queue import is_established
 from gp8_control.trajectory.trajectory_primitive import trajectory
+from gp8_control.utils import run_record
 from gp8_control.utils.clock import WALL_CLOCK
 from gp8_control.utils.stream_rate import STREAM_HZ
 
@@ -202,6 +203,8 @@ class _BufferOutput:
         """After a re-activation (its tick restarted at 0): map planner time again."""
         k_now = self.buf.now_index() + 1
         self.shift = k_now - int(round((self.buf.tick_mono(k_now) - t0) / PLANNER_DT))
+        if self.r.rec is not None:
+            self.r.rec.event("rebase", shift=self.shift)
         self.k_written, self.pending_ev = None, []
 
     @property
@@ -245,6 +248,8 @@ class _BufferOutput:
         if start < kn:
             late = kn - start
             r.stats["late_pieces"] += 1
+            if r.rec is not None:
+                r.rec.event("buf_late", k=k, tick=start, late=late, n=len(U))
             r.log.warn(f"[cycle] late command piece: first {late} of {len(U)} samples "
                        f"({late * PLANNER_DT * 1e3:.0f} ms) already past; cut")
             if r.stop_on_late:
@@ -263,11 +268,17 @@ class _BufferOutput:
             self._rtts.append(time.monotonic() - t_w)
         if res != 0:
             from gp8_control.controllers.sample_buffer import RES_NAMES
+            if r.rec is not None:
+                r.rec.event("buf_refused", k=k, tick=first, n=len(Q), res=int(res),
+                            why=str(RES_NAMES.get(res, res)))
             r._fault = r._fault or (f"controller refused the piece at tick {first}: "
                                     f"{RES_NAMES.get(res, res)}; buffer stopped")
             self.stop()
             return
         lead = (first - now) * PLANNER_DT
+        if r.rec is not None:
+            r.rec.cmd_rows(self.buf.tick_mono(first), PLANNER_DT, Q)
+            r.rec.event("buf", k=k, tick=first, n=len(Q), lead=lead, rtt=self._rtts[-1])
         self.min_lead_s = lead if self.min_lead_s is None else min(self.min_lead_s, lead)
         self.k_written = k + len(U) - 1
         self.last_row = np.asarray(U[-1], float).copy()
@@ -277,6 +288,9 @@ class _BufferOutput:
         tick = int(round(t_plan / PLANNER_DT)) + self.shift
         now = self.buf.now_index()
         self.pending_ev = [e for e in self.pending_ev if e[0] > now] + [(tick, bool(on))]
+        if self.r.rec is not None:
+            self.r.rec.event("suc", src="buf", t_plan=t_plan, tick=tick,
+                             t_due=self.buf.tick_mono(tick), on=bool(on))
         self.buf.set_events(now + 1, self.pending_ev)
 
     # state -------------------------------------------------------------
@@ -362,6 +376,22 @@ class CycleThrowRunner:
         self._done = threading.Event()
         self.stats = collections.Counter()
         self.max_lag = 0.0
+        # Real-to-sim recording (GP8_RUN_RECORD_DIR; utils/run_record.py).
+        self.rec = run_record.start_from_env(
+            runner=type(self).__name__, link=self.LINK,
+            mode=getattr(self.cfg, "MODE", ""), backend=getattr(self.cfg, "BACKEND", ""),
+            planner_dt=PLANNER_DT, planner_belt=PLANNER_BELT_SPEED,
+            bin_x=CYCLE_BIN_X, bin_z=CYCLE_BIN_Z, home=list(CYCLE_HOME),
+            servo_filter=os.environ.get("GP8_SIM_SERVO_FILTER", ""))
+        if self.rec is not None:
+            prev = getattr(self.backend, "joint_state_listener", None)
+            rec = self.rec
+
+            def _on_joints(q, _prev=prev):
+                rec.joints(q)
+                if _prev is not None:
+                    _prev(q)
+            self.backend.joint_state_listener = _on_joints
 
         # --- push slots ---
         # Start draining when a push object is this close (s) to entering reach.
@@ -422,6 +452,7 @@ class CycleThrowRunner:
             while ok() and self._fault is None and not self._done.is_set():
                 if intake is not None:
                     intake()
+                self._record_tracks()
                 if self.push_handler is not None and self._push_due():
                     self._push_slot(intake)
                     continue
@@ -434,6 +465,10 @@ class CycleThrowRunner:
             self.close()
         if self._fault:
             raise RuntimeError(f"cycle mode stopped: {self._fault}")
+
+    def _record_tracks(self) -> None:
+        if self.rec is not None:
+            self.rec.tracks(self.app.queue, self.app.conveyor)
 
     def _start_planner(self) -> None:
         """Home, child process up, command output started, "start" sent."""
@@ -463,6 +498,14 @@ class CycleThrowRunner:
             self.t0 = time.monotonic()
             emitter = threading.Thread(target=self._emit_loop, name="cycle_emit", daemon=True)
             emitter.start()
+        core = getattr(getattr(self.app, "world", None), "_core", None)
+        if core is not None and hasattr(core, "start_spawn_script"):
+            core.start_spawn_script()            # twin replay of a recorded stream
+        if self.rec is not None:
+            self.rec.event("start", t0=self.t0, link=self.LINK,
+                           output="buffer" if self.out is not None else "stream",
+                           shift=self.out.shift if self.out is not None else None,
+                           ready=self._ready_msg)
         self._send({"t": "start", "t0": self.t0, "home": self.home.tolist(), "run_s": 1e9})
         self.log.info(f"[cycle] model set: belt {PLANNER_BELT_SPEED} m/s, bins x {CYCLE_BIN_X} "
                       f"z {CYCLE_BIN_Z} m")
@@ -519,6 +562,9 @@ class CycleThrowRunner:
         extra = (f"min write lead {self.out.min_lead_s:.3f} s" if self.out is not None
                  and self.out.min_lead_s is not None else f"max lag {1e3 * self.max_lag:.1f} ms")
         self.log.info(f"[cycle] stopped: {dict(self.stats)} {extra}")
+        if self.rec is not None:
+            self.rec.event("stopped", fault=self._fault, stats=dict(self.stats))
+            self.rec.close()
 
     # ------------------------------------------------------------------
     def _check_belt_speed(self) -> None:
@@ -749,6 +795,8 @@ class CycleThrowRunner:
         child = self._child
         if child is None or child.stdin is None:
             return
+        if self.rec is not None and msg.get("t") != "pong":
+            self.rec.event("tx", msg=msg)
         try:
             with self._send_lock:
                 child.stdin.write(json.dumps(msg) + "\n")
@@ -778,6 +826,12 @@ class CycleThrowRunner:
             except ValueError:
                 continue
             kind = msg.get("t")
+            if self.rec is not None and kind != "ping":
+                if kind == "cmd":       # the samples themselves go to cmd.f64 as played
+                    self.rec.event("rx", msg={"t": "cmd", "k": msg.get("k"),
+                                              "n": len(msg.get("U") or ())})
+                else:
+                    self.rec.event("rx", msg=msg)
             if kind == "ping":                       # clock sync (planner_link)
                 self._send({"t": "pong", "c": msg["c"], "a": time.monotonic()})
             elif kind == "cmd":
@@ -920,6 +974,8 @@ class CycleThrowRunner:
                 t_now = time.monotonic()
                 self.max_lag = max(self.max_lag, t_now - due)
                 self.backend._emit_sample(last.tolist())
+                if self.rec is not None:
+                    self.rec.cmd_sample(t_now, last)
                 hist.append((t_now, last))
                 if not np.array_equal(last, self._last_sent):
                     self._t_last_change = t_now
@@ -929,6 +985,8 @@ class CycleThrowRunner:
                 for on in fire:
                     (self.backend.suction_on if on else self.backend.suction_off)()
                     self.stats["suction_on" if on else "suction_off"] += 1
+                    if self.rec is not None:
+                        self.rec.event("suc", src="stream", k=k, t_due=t_now, on=bool(on))
                 k += 1
         except Exception as e:  # noqa: BLE001 - a dead stream must stop the run
             self._fault = f"command stream failed: {e!r}"

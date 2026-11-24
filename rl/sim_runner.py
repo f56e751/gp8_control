@@ -214,9 +214,9 @@ class SimRlRunner:
         # GP8_RL_DECISION_LATENCY or a profile turns them on).
         self._obs_noise = ObsNoiseModel.from_env()
         self._latency = DecisionLatencyModel.from_env()
-        # sim_experiment: perception-map lag [s] applied to truth tracks
-        # (0 = the original zero-latency sim). See _refresh_truth_tracks.
-        self._perception_lag = max(0.0, float(os.environ.get("GP8_SIM_PERCEPTION_LAG", "0") or 0.0))
+        # GP8_SIM_PERCEPTION_LAG (perception lag) is applied by the twin itself
+        # (SimCore: camera snapshot and truth_detection_for alike), so every
+        # path sees the same lag; nothing to shift here.
         self._noise_rng = np.random.default_rng(
             None if sim_seed is None else int(sim_seed) + 7_000_003)
         self._obj_bias: dict[int, tuple[float, float, float, float]] = {}
@@ -357,17 +357,6 @@ class SimRlRunner:
                 bbox_grasp = _shift_bbox(bbox_grasp, bx + ox + jx, by + oy + jy)
                 bbox_aim = _shift_bbox(bbox_aim, bx + ox + jx, by + oy + jy)
                 conf = noise.confidence(self._noise_rng)
-            if self._perception_lag > 0.0:
-                # sim_experiment: the HW perception map TRAILS the real object
-                # (push_skill.PUSH_PERCEPTION_LAG block). Reproduce it: report
-                # where the object was `lag` s ago — upstream, since the belt
-                # travels -Y — while still stamping the update as fresh.
-                dy = float(self.conveyor.current) * self._perception_lag
-                grasp = grasp.copy(); aim = aim.copy()
-                grasp[1] += dy
-                aim[1] += dy
-                bbox_grasp = _shift_bbox(bbox_grasp, 0.0, dy)
-                bbox_aim = _shift_bbox(bbox_aim, 0.0, dy)
             obj.T_grasp_base[:3, 3] = grasp[:3]
             obj.T_aim_base[:3, 3] = aim[:3]
             obj.detect_time = now

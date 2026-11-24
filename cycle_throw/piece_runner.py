@@ -94,6 +94,7 @@ class PieceRunner(CycleThrowRunner):
             while ok() and self._fault is None and not self._done.is_set():
                 if intake is not None:
                     intake()
+                self._record_tracks()
                 self._take_replies()
                 if self._pending is None:
                     self._decide()

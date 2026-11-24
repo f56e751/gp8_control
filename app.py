@@ -27,6 +27,7 @@ from gp8_control.backends import RobotBackend, WorldSource
 from gp8_control.controllers.trajectory_controller import TrajectoryController
 from gp8_control.controllers.moveit_controller import MoveItController
 from gp8_control.perception.detection_intake import DetectionIntake
+from gp8_control.utils import run_record
 from gp8_control.trajectory.trajectory_primitive import trajectory
 from gp8_control.trajectory.predictor import TrajectoryPredictor
 from gp8_control.tracking import (
@@ -641,7 +642,10 @@ class GP8App:
         run with 12/23 tracks never pose-confirmed.
         """
         added = 0
+        rec = run_record.current()
         for snap in self.world.drain_snapshots():
+            if rec is not None:
+                rec.event("det", snap=snap)
             receipt_time = float(snap.get("receipt_time", now))
             belt_distance_at_detection = self.conveyor.distance_at(receipt_time)
             added += self.detection_intake.ingest(

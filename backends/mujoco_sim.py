@@ -48,6 +48,7 @@ import numpy as np
 from gp8_control.backends.robot_base import RobotBackend
 from gp8_control.backends.world_base import WorldSource
 from gp8_control.perception import extrinsics
+from gp8_control.utils import run_record
 from gp8_control.perception.bbox_geometry import bbox_to_base
 
 try:
@@ -482,6 +483,21 @@ class SimConfig:
     cam_fov_gate: bool = field(default_factory=lambda: os.environ.get(
         "GP8_SIM_CAM_FOV_GATE", "1").lower() not in ("0", "false", "no"))
     despawn_y: float = -0.8       # base-frame Y past which boxes are recycled
+    # Replay a recorded object stream instead of the interval spawner
+    # (tools/real2sim.py spawn): JSON {"t_ref", "belt", "objects": [{t, cls, x,
+    # half?, yaw?}]}; each box appears at spawn_y at its t. t_ref
+    # "planner_t0" = t counts from the cycle/piece runner's planner start
+    # (SimCore.start_spawn_script), "sim_start" = from the first sim step.
+    spawn_script: str = field(default_factory=lambda: os.environ.get(
+        "GP8_SIM_SPAWN_SCRIPT", "").strip())
+    # Perception lag [s]: detections (camera snapshot AND the RL truth tracks)
+    # report where a belt object was this long ago (upstream by belt speed x
+    # lag), stamped fresh, as the real pipeline is assumed to (push_skill's
+    # PUSH_PERCEPTION_LAG 0.28 compensates it on hardware). 0 = exact positions
+    # (the original twin). Push analysis 2026-11-18 (sim_experiment/): 0.28
+    # with the HW corrections unchanged = the HW-like setting.
+    perception_lag: float = field(default_factory=lambda: max(
+        0.0, _env_float("GP8_SIM_PERCEPTION_LAG", 0.0)))
     lane_x: float = field(default_factory=lambda: _env_float("GP8_SIM_LANE_X", 0.45))
     grasp_z: float = 0.042        # box CENTRE height in base frame (pass cfg.GRASP_Z)
     aim_dz: float = 0.08
@@ -879,6 +895,14 @@ class SimCore:
         self._suction_rng = np.random.default_rng(None if self.cfg.seed is None else int(self.cfg.seed) + 1_000_003)
         self._random_spawn_rate_hz = 0.0
         self._next_random_spawn_time = float("inf")
+        self._script: list[dict] | None = None
+        self._script_t0: float | None = None
+        self._script_start_req = False
+        if self.cfg.spawn_script:
+            with open(self.cfg.spawn_script, encoding="utf-8") as f:
+                spec = json.load(f)
+            self._script = list(spec.get("objects", []))
+            self._script_start_req = spec.get("t_ref", "sim_start") != "planner_t0"
         if self.cfg.randomize:
             self.cfg.belt_speed = float(self._rng.uniform(*self.cfg.belt_speed_range))
             self._random_spawn_rate_hz = float(self._rng.uniform(*self.cfg.spawn_rate_hz_range))
@@ -1391,16 +1415,47 @@ class SimCore:
         else:
             self._next_random_spawn_time = float("inf")
 
-    def _spawn_box(self) -> None:
+    def start_spawn_script(self) -> None:
+        """Start the spawn script's clock (t_ref "planner_t0"): the next step is t = 0."""
+        if self._script is not None and self._script_t0 is None:
+            self._script_start_req = True
+
+    def _spawn_scripted(self, now: float) -> None:
+        if self._script_start_req and self._script_t0 is None:
+            self._script_t0 = now
+            self._script.sort(key=self._script_time)    # spawn_y is known by now
+        if self._script_t0 is None:
+            return
+        while self._script and now - self._script_t0 >= self._script_time(self._script[0]):
+            self._spawn_box(self._script.pop(0))
+
+    def _script_time(self, spec: dict) -> float:
+        """Spawn time of a script entry: its ``t``, or the time that puts the
+        box (appearing at spawn_y) at ``y_obs`` at ``t_obs`` on this belt."""
+        if "t" in spec:
+            return float(spec["t"])
+        v = max(1e-3, float(self.cfg.belt_speed))
+        return float(spec["t_obs"]) - (float(self.cfg.spawn_y) - float(spec["y_obs"])) / v
+
+    def _spawn_box(self, spec: dict | None = None) -> None:
         idx = next((i for i, s in enumerate(self._box_state) if s == self._FREE), None)
         if idx is None:
+            if spec is not None:
+                print(f"[sim] spawn script: no free box for {spec}", flush=True)
             return
-        cls = self._sample_spawn_class()
-        half_size = self._sample_box_half_size()
-        yaw = float(self._rng.uniform(-math.pi, math.pi)) if (self.cfg.randomize and self.cfg.random_yaw) else 0.0
-        spawn_x = self._sample_spawn_base_x(half_size, yaw)
-        if spawn_x is None:
-            return
+        if spec is None:
+            cls = self._sample_spawn_class()
+            half_size = self._sample_box_half_size()
+            yaw = float(self._rng.uniform(-math.pi, math.pi)) if (self.cfg.randomize and self.cfg.random_yaw) else 0.0
+            spawn_x = self._sample_spawn_base_x(half_size, yaw)
+            if spawn_x is None:
+                return
+        else:
+            cls = str(spec["cls"])
+            half = list(spec.get("half") or (BOX_HALF_X, BOX_HALF_Y))
+            half_size = np.asarray((half + [float(self.cfg.object_half_z)])[:3], float)
+            yaw = float(spec.get("yaw", 0.0))
+            spawn_x = float(spec["x"])
         suction_p = self._sample_suction_p(cls)
         world = self._to_world([spawn_x, self.cfg.spawn_y, self._belt_top_w - self._base_p[2] + float(half_size[2])])
         self._activate_box(idx)
@@ -1422,6 +1477,11 @@ class SimCore:
         self._box_sealed[idx] = False
         self._box_reward_done[idx] = False
         self._box_cause_step[idx] = None
+        rec = run_record.current()
+        if rec is not None:
+            rec.event("spawn", serial=self._spawn_count, cls=cls, x=float(spawn_x),
+                      y=float(self.cfg.spawn_y), half=[float(h) for h in half_size],
+                      yaw=yaw, sim_time=float(self.data.time))
 
     def _park_box(self, i: int) -> None:
         """Retire box i: collisions off, gravity compensated, stashed below the floor."""
@@ -1544,6 +1604,9 @@ class SimCore:
             "collateral": bool(collateral),
             "cause_step": self._box_cause_step[i],
         })
+        rec = run_record.current()
+        if rec is not None:
+            rec.event("landing", **self._reward_events[-1])
 
     def _recycle_boxes(self) -> None:
         """Retire boxes off the belt end / on the floor; flag ones knocked off.
@@ -1578,6 +1641,14 @@ class SimCore:
     # ------------------------------------------------------------------
     # synthesized perception (schema-v2, through the real transform code)
     # ------------------------------------------------------------------
+    def _lagged(self, b, footprint):
+        """Base position and footprint as the (lagging) perception reports them."""
+        dy = float(self.cfg.belt_speed) * float(self.cfg.perception_lag)
+        if dy == 0.0:
+            return b, footprint
+        d = np.array([0.0, dy, 0.0])        # the belt runs toward -Y: lag = upstream
+        return np.asarray(b, float) + d, [np.asarray(c, float) + d for c in footprint]
+
     def _build_snapshot(self, now: float) -> dict:
         ref_x, ref_y, ref_z = (extrinsics.REFERENCE_X_BASE,
                                extrinsics.REFERENCE_Y_BASE,
@@ -1621,6 +1692,9 @@ class SimCore:
                     np.array([x1, y1, b[2]], dtype=float),
                     np.array([x1, y0, b[2]], dtype=float),
                 ]
+            b, footprint = self._lagged(b, footprint)
+            cx = (float(b[0]) - ref_x) / sx
+            cy = (float(b[1]) - ref_y) / sy
             cam_corners = []
             for corner_base in footprint:
                 cam_corners.append([
@@ -1715,6 +1789,9 @@ class SimCore:
                     np.array([x1, y1, b[2]], dtype=float),
                     np.array([x1, y0, b[2]], dtype=float),
                 ]
+            b, footprint = self._lagged(b, footprint)
+            cx = (float(b[0]) - ref_x) / sx
+            cy = (float(b[1]) - ref_y) / sy
             cam_bbox = np.array(
                 [
                     [
@@ -1826,7 +1903,9 @@ class SimCore:
     def _post_step_batch(self, n: int, now: float, det_period: float) -> None:
         with self.lock:
             self._encoder_distance += self.cfg.belt_speed * self._dt * int(n)
-            if not self.cfg.randomize and now - self._last_spawn >= self.cfg.spawn_interval:
+            if self._script is not None:
+                self._spawn_scripted(now)
+            elif not self.cfg.randomize and now - self._last_spawn >= self.cfg.spawn_interval:
                 self._spawn_box()
                 self._last_spawn = now
             self._recycle_boxes()

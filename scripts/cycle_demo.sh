@@ -14,6 +14,7 @@
 #   GT_BELT=0.14 gp8_cycle                 (another model set)
 #   GP8_DEMO_CHECK_ONLY=1 gp8_cycle        (vision + robot6 check + robot-free planner check, no robot)
 #   GP8_DEMO_MODE=pieces gp8_cycle         (piece mode: push and throw on one command path)
+#   GP8_RUN_RECORD=0 gp8_cycle             (no real-to-sim recording; default on, <log>/record)
 # Details: cycle_throw/RUN_HW.md
 D="$(cd "$(dirname "$0")" && pwd)"
 PKG="$(cd "$D/.." && pwd)"
@@ -88,6 +89,7 @@ cleanup() {
     "${SSH[@]}" "docker stop iitp_local" >/dev/null 2>&1 && say "vision stopped"
   fi
   say "logs: $LOG"
+  [ -n "${GP8_RUN_RECORD_DIR:-}" ] && say "recording: $GP8_RUN_RECORD_DIR (python -m gp8_control.tools.real2sim summary <dir>)"
 }
 trap cleanup EXIT
 sleep 3
@@ -105,6 +107,9 @@ export GP8_STREAM_HZ="${GP8_STREAM_HZ:-500}"
 # 0.54 -> 0.31 s, fewer refused pushes); skills mode keeps MAX_REACH (0.65).
 [ "$GP8_MODE" = pieces ] && export GP8_PUSH_MAX_REACH="${GP8_PUSH_MAX_REACH:-0.70}"
 export GP8_SAMPLE_BUFFER="${GP8_SAMPLE_BUFFER:-true}"
+# Real-to-sim recording (utils/run_record.py, read with tools/real2sim.py):
+# joints, commands, link messages, detections, tracks. GP8_RUN_RECORD=0 = off.
+[ "${GP8_RUN_RECORD:-1}" = 1 ] && export GP8_RUN_RECORD_DIR="${GP8_RUN_RECORD_DIR:-$LOG/record}"
 export GP8_CYCLE_PLANNER_HOST="$H"
 export GP8_CYCLE_RELEASE_LEAD="${GP8_CYCLE_RELEASE_LEAD:-0.2}"
 export GP8_CYCLE_TOP_Z="${GP8_CYCLE_TOP_Z:-0.042}"
