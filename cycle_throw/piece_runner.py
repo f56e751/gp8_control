@@ -82,6 +82,10 @@ class PieceRunner(CycleThrowRunner):
         # object per request; None = nothing now (asked again after DECIDE_WAIT).
         self.decide_fn = decide_fn
         self.decide_wait = _env_float("GP8_PIECE_DECIDE_WAIT", 0.2)
+        # Audit of every policy decision: what was chosen, what piece mode did
+        # with it (planned as chosen / the documented fallbacks), whether the
+        # link then took it. tools/piece_twin and the app log it.
+        self.decisions: list[dict] = []
         self._ask_after = 0.0
         # Virtual time: idle stretches are warped over in steps of WARP_S (the
         # link commits whatever falls due first); planning runs at wall speed.
@@ -185,6 +189,19 @@ class PieceRunner(CycleThrowRunner):
                 continue
             self._pending = None
             self.arm = msg["arm"]
+            taken_ids = {int(t) for t in msg.get("taken", [])}
+            if self.arm.get("kind") == "obj":
+                taken_ids.add(int(self.arm["id"]))
+            skipped_ids = {int(t): why for t, why in msg.get("skipped", [])}
+            for d in self.decisions:
+                if d.get("rid") == p["rid"] and d.get("result") in (
+                        "planned push", "planned throw", "push refused by the skill -> throw"):
+                    d["link"] = ("took it" if d["id"] in taken_ids
+                                 else f"skipped ({skipped_ids[d['id']]})" if d["id"] in skipped_ids
+                                 else "not taken")
+                    if self.decide_fn is not None and hasattr(self.decide_fn, "log") and self.decide_fn.log:
+                        self.decide_fn.log(f"[policy] result: {d['chose']} {d['id']} -> "
+                                           f"{d['result']}, link {d['link']}")
             for tid in msg.get("taken", []):
                 self._accept(int(tid), p["kinds"].get(int(tid), "throw"))
             for tid, why in msg.get("skipped", []):
@@ -360,20 +377,26 @@ class PieceRunner(CycleThrowRunner):
             it, skill = choice
             tid = it["o"]["id"]
             chosen.add(tid)
+            rec = {"n": len(self.decisions) + 1, "id": tid, "chose": skill, "rid": self._rid + 1}
+            self.decisions.append(rec)
             if skill == "push":
                 if n_push >= self.push_max:
+                    rec["result"] = "deferred: push limit of this request"
                     break                     # the next request takes it
                 r = self._push_step(it, t_est)
                 if r is None:
+                    rec["result"] = "push not possible now (asked again)"
                     continue                  # not possible now; ask again
                 if r != "throw":
                     step, t_est = r
                     steps.append(step)
                     kinds[tid] = "push"
                     desc.append(f"push {tid} (policy)")
+                    rec["result"] = "planned push"
                     n_push += 1
                     continue
                 self._reroute.add(tid)        # refused: thrown instead (as the rule does)
+                rec["result"] = "push refused by the skill -> throw"
             piece = self._piece(dict(it, skill="throw"), t_est)
             if piece is not None:
                 o = dict(it["o"])
@@ -381,8 +404,21 @@ class PieceRunner(CycleThrowRunner):
                 steps.append({"kind": "pick", "obj": o})
                 kinds[tid] = "throw"
                 desc.append(f"pick {tid} (policy)")
+                rec.setdefault("result", "planned throw")
+            else:
+                rec["result"] = "no throw piece"
             break
         return steps, kinds, desc
+
+    def decision_summary(self) -> dict:
+        """Counts over the policy decisions (see ``self.decisions``)."""
+        out: dict = {}
+        for d in self.decisions:
+            k = d.get("result", "?")
+            if "link" in d or k.startswith("planned"):
+                k = f"{k}, link: {d.get('link', 'no reply yet')}"
+            out[k] = out.get(k, 0) + 1
+        return dict(sorted(out.items()))
 
     def _piece(self, item: dict, t_start_p: float):
         """The throw skill's piece (planner request) for an object, or None."""

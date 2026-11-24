@@ -72,6 +72,7 @@ def main(argv=None) -> int:
                sim_s=round(stack.sim.core.sim_time(), 1), wall_s=round(time.monotonic() - w0, 1),
                warped_s=round(stack.vt.warped_s, 1) if stack.vt is not None else 0.0,
                decisions=getattr(decide, "n", None),
+               decision_audit=runner.decision_summary() if decide is not None else None,
                buf_rejects=stack.buf.rejects[:5] if stack.vt is not None else None)
     stack.close()
     rows: dict = {}

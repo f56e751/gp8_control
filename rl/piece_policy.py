@@ -130,8 +130,23 @@ def load_policy(spec: str, max_objects: int):
         return lambda obs, mask: upstream_action(mask, max_objects)
     from sb3_contrib import MaskablePPO
 
-    model = MaskablePPO.load(spec, device="cpu")
     n_sk = len(SKILL_NAMES)
+    try:
+        model = MaskablePPO.load(spec, device="cpu")
+    except (ModuleNotFoundError, AttributeError, ValueError):
+        # Saved under another numpy (e.g. 2.x on the training server, 1.26 in
+        # the robot app): the pickled spaces / schedules do not unpickle. They
+        # are ours anyway -- pass them and load only the network weights.
+        import gymnasium as gym
+
+        from gp8_control.rl.common import observation_width
+
+        bbox = os.environ.get("GP8_RL_BBOX_OBSERVATION", "size")
+        width = observation_width(max_objects, False, bbox, False)
+        model = MaskablePPO.load(spec, device="cpu", custom_objects={
+            "observation_space": gym.spaces.Box(-np.inf, np.inf, (width,), np.float32),
+            "action_space": gym.spaces.Discrete((max_objects + 1) * n_sk),
+            "lr_schedule": lambda _: 0.0, "learning_rate": 0.0, "clip_range": lambda _: 0.2})
 
     def act(obs, mask):
         flat, _ = model.predict(obs, action_masks=np.asarray(mask, bool).reshape(-1),
