@@ -112,6 +112,14 @@ def _seconds_to_duration(seconds: float) -> Duration:
     return Duration(sec=sec, nanosec=nanosec)
 
 
+def stamp_to_mono(stamp) -> float | None:
+    """A ROS header stamp (system clock) on time.monotonic(); None if unset."""
+    t = float(stamp.sec) + 1e-9 * float(stamp.nanosec)
+    if t <= 0.0:
+        return None
+    return t - (time.time() - time.monotonic())
+
+
 class TrajectoryController(RobotBackend):
     """Hardware backend: executes joint trajectories via the adv4ncr stream/JTC;
     suction I/O is a single seam (``_call_io``) over Simple-Message TCP."""
@@ -305,6 +313,10 @@ class TrajectoryController(RobotBackend):
         name_to_pos = dict(zip(msg.name, msg.position))
         name_to_vel = dict(zip(msg.name, msg.velocity)) if msg.velocity else {}
         if all(j in name_to_pos for j in JOINT_NAMES):
+            # When the broadcaster sampled these (its header stamp, on the
+            # monotonic clock): the receipt time runs late whenever this
+            # process is busy (tens of ms with many tracked objects).
+            self.current_joints_stamp = stamp_to_mono(msg.header.stamp)
             self.current_joints = [float(name_to_pos[j]) for j in JOINT_NAMES]
             self.current_jointvels = [float(name_to_vel.get(j, 0.0)) for j in JOINT_NAMES]
             self._motion_logger.on_sample(self.current_joints)

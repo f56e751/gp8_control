@@ -397,7 +397,8 @@ class CycleThrowRunner:
             backend = self.backend
 
             def _on_joints(q, _prev=prev):
-                # the twin stamps its joints with their sim time; hardware: receipt
+                # when the joints were true: the twin's sim time, hardware's
+                # broadcaster stamp (receipt time if neither is known)
                 rec.joints(q, getattr(backend, "current_joints_stamp", None))
                 if _prev is not None:
                     _prev(q)
@@ -488,7 +489,7 @@ class CycleThrowRunner:
         try:
             from control_msgs.msg import DynamicJointState
 
-            from gp8_control.controllers.trajectory_controller import JOINT_NAMES
+            from gp8_control.controllers.trajectory_controller import JOINT_NAMES, stamp_to_mono
         except ImportError as e:
             self.log.warn(f"[record] no encoder feedback recording: {e!r}")
             return
@@ -501,7 +502,9 @@ class CycleThrowRunner:
                     if k == "pos_fdb":
                         vals[name] = v
             if all(j in vals for j in JOINT_NAMES):
-                rec.stream_row("joints_fb", [vals[j] for j in JOINT_NAMES])
+                # the broadcaster's stamp, not the (load-dependent) receipt time
+                rec.stream_row("joints_fb", [vals[j] for j in JOINT_NAMES],
+                               stamp_to_mono(msg.header.stamp))
 
         self._dyn_sub = node.create_subscription(DynamicJointState, "/dynamic_joint_states", _on_dyn, 50)
 
