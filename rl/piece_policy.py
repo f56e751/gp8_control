@@ -146,7 +146,9 @@ def load_policy(spec: str, max_objects: int):
         model = MaskablePPO.load(spec, device="cpu", custom_objects={
             "observation_space": gym.spaces.Box(-np.inf, np.inf, (width,), np.float32),
             "action_space": gym.spaces.Discrete((max_objects + 1) * n_sk),
-            "lr_schedule": lambda _: 0.0, "learning_rate": 0.0, "clip_range": lambda _: 0.2})
+            "lr_schedule": lambda _: 0.0, "learning_rate": 0.0, "clip_range": lambda _: 0.2,
+            # training-time state, also pickled numpy (not needed to act)
+            "_last_obs": None, "_last_episode_starts": None, "_last_original_obs": None})
 
     def act(obs, mask):
         flat, _ = model.predict(obs, action_masks=np.asarray(mask, bool).reshape(-1),
