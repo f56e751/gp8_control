@@ -140,6 +140,11 @@ class GP8PieceEnv(gym.Env if gym is not None else object):
         os.environ["GP8_SIM_REALTIME"] = "0"
         os.environ["GP8_PIECE_VIRTUAL"] = "1"
         os.environ["GP8_CYCLE_PLANNER_HOST"] = ""
+        # The robot's piece-mode push settings (gp8_cycle: reach 0.70 in piece
+        # mode; .env: accel 24). Push height stays the twin's (its belt is
+        # ~5 cm higher than the real one in the robot frame).
+        os.environ.setdefault("GP8_PUSH_MAX_REACH", "0.70")
+        os.environ.setdefault("GP8_PUSH_ACCEL", "24")
         from gp8_control.backends.mujoco_sim import class_bin_name_for
         from gp8_control.backends.sim_tick import SimTickBuffer, VirtualTime
         from gp8_control.config import Config

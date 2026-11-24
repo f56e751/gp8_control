@@ -138,6 +138,15 @@ skill 모드 RL 시뮬레이터 (`rl/gym_env.py`) 에 실기에서 확인한 컨
   학습: `python -m gp8_control.tools.train_ppo_smoke --env piece ...` (MaskablePPO, 짧은 학습 확인함).
   링크는 env 마다 로컬 자식 프로세스 (`GP8_CYCLE_PLANNER_HOST` 비움), reset 마다 새로 뜬다 (몇 초).
 
+### 실기에서 정책 통로 확인 (2026-11-24, 브랜치 feat/rl-piece-sim)
+`GP8_PIECE_POLICY=heuristic` (규칙을 정책 통로로) 과 정책 없음 (지금 규칙) 을 같은 가상 물체 12 개 (페트·캔 2 s 간격) 로
+실기에서: 12/12 같은 행동, 계획 11 번·석션 8 번·push 4 번 모두 같고 거부·늦은 조각·오류 0. 결정 한 번 0.1 ms.
+같은 물체 흐름을 `GP8PieceEnv` (가상 시간, 같은 결정 코드) 에 넣으면 12/12 같은 행동, 페트 집기 접촉 시각 0.03 s 이내,
+push 는 4 개 중 2 개 0.07 s 이내·2 개 0.3~0.6 s, push 거절 후 던진 캔 2 개는 트윈이 1.3 s 늦게 집음. env 는 실기
+push 설정 (도달 0.70, 가속 24) 을 기본으로 쓴다 (이것이 없으면 push 시각이 0.5 s 어긋남). 정책은
+`GP8_PIECE_POLICY=<MaskablePPO .zip>` 으로 실기에 넣는다 (`rl/piece_policy.py`; `remaining_time_frac` 는 실행 시작부터
+`GP8_PIECE_POLICY_EPISODE_S` 240 s 주기).
+
 ## 검증 (2026-11-19)
 
 MuJoCo 트윈 (실시간, 필터 `box200_80`), 페트+캔 1.6 s 간격, 60 s:
