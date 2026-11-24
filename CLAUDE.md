@@ -242,7 +242,8 @@ the robot PC's `.env`. The suction valve delay is `runner.VALVE_S` (0.2 s): the
 robot fires OFF that early, the cycle/piece twin's valve releases that late
 (`GP8_SIM_SUCTION_OFF_DELAY`).
 
-**RL on piece mode** (`rl/piece_env.py`, `train_ppo_smoke --env piece`): the
+**RL on piece mode** (guide for trainers: `docs/RL_PIECE_TRAINING.md`;
+`rl/piece_env.py`, `train_ppo_smoke --env piece`): the
 policy picks the next object/skill whenever piece mode asks
 (`PieceRunner(decide_fn=...)`); the twin runs on virtual time
 (`backends/sim_tick.py`: wall speed while the link plans, warped otherwise; the

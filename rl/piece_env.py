@@ -21,9 +21,9 @@ How it runs:
   free) the runner thread asks the agent and blocks until ``step()`` gives
   the action. Actions and observations are those of ``GP8RecyclingEnv``
   (``[slot, skill]``, slot ``max_objects`` = skip; skill 0 throw, 1 push).
-* reward: the twin's object outcomes (+1 in its class bin, -0.3 wrong / floor;
-  ``GP8_RL_MISS_PENALTY`` for untouched objects as in the skill env), summed
-  over the time until the next decision.
+* reward: the twin's object outcomes (+1 in the bin of the skill used, -0.3
+  wrong bin / floor, 0 untouched; ``resolved_object_reward``), summed over the
+  time until the next decision.
 
 The planner link runs as a local child process per env (GP8_CYCLE_PLANNER_HOST
 is cleared); each reset starts a new twin and link (a few seconds).

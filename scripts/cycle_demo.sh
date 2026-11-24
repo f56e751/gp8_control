@@ -15,6 +15,8 @@
 #   GP8_DEMO_CHECK_ONLY=1 gp8_cycle        (vision + robot6 check + robot-free planner check, no robot)
 #   GP8_DEMO_MODE=pieces gp8_cycle         (piece mode: push and throw on one command path)
 #   GP8_RUN_RECORD=0 gp8_cycle             (no real-to-sim recording; default on, <log>/record)
+#   GP8_PIECE_POLICY=heuristic|<model.zip> GP8_DEMO_MODE=pieces gp8_cycle  (a policy decides; docs/RL_PIECE_TRAINING.md)
+#   GP8_DEMO_NO_CAMERA=1 gp8_cycle         (no camera_debug: virtual objects via tools/fake_detections.py)
 # Details: cycle_throw/RUN_HW.md
 D="$(cd "$(dirname "$0")" && pwd)"
 PKG="$(cd "$D/.." && pwd)"
@@ -79,12 +81,19 @@ fi
 # 3. camera_debug ---------------------------------------------------------------
 # Own process group too: a backgrounded `ros2 run` ignores SIGINT, so it is
 # stopped by SIGTERM to its whole group (ros2 run + the node it starts).
-setsid "$D/camera.sh" > "$LOG/camera_debug.log" 2>&1 &
-CAM=$!
+# GP8_DEMO_NO_CAMERA=1: no camera_debug (virtual objects come from
+# tools/fake_detections.py, started by hand once the arm is at rest).
+CAM=""
+if [ "${GP8_DEMO_NO_CAMERA:-0}" != 1 ]; then
+  setsid "$D/camera.sh" > "$LOG/camera_debug.log" 2>&1 &
+  CAM=$!
+fi
 cleanup() {
-  kill -TERM -- -"$CAM" 2>/dev/null
-  for _ in 1 2 3 4 5; do pgrep -g "$CAM" >/dev/null || break; sleep 1; done
-  pgrep -g "$CAM" >/dev/null && kill -KILL -- -"$CAM" 2>/dev/null
+  if [ -n "$CAM" ]; then
+    kill -TERM -- -"$CAM" 2>/dev/null
+    for _ in 1 2 3 4 5; do pgrep -g "$CAM" >/dev/null || break; sleep 1; done
+    pgrep -g "$CAM" >/dev/null && kill -KILL -- -"$CAM" 2>/dev/null
+  fi
   if [ "${GP8_DEMO_STOP_VISION:-0}" = 1 ]; then
     "${SSH[@]}" "docker stop iitp_local" >/dev/null 2>&1 && say "vision stopped"
   fi
@@ -98,8 +107,12 @@ cleanup() {
 }
 trap cleanup EXIT
 sleep 3
-pgrep -g "$CAM" >/dev/null || { say "camera_debug exited — see $LOG/camera_debug.log"; exit 1; }
-say "camera_debug running (log $LOG/camera_debug.log)"
+if [ -n "$CAM" ]; then
+  pgrep -g "$CAM" >/dev/null || { say "camera_debug exited — see $LOG/camera_debug.log"; exit 1; }
+  say "camera_debug running (log $LOG/camera_debug.log)"
+else
+  say "no camera_debug (GP8_DEMO_NO_CAMERA=1): start tools/fake_detections.py once the arm is at rest"
+fi
 
 # 4. driver + app in cycle mode --------------------------------------------------
 # cycle = push slots between planner segments (HW-run); pieces = piece mode

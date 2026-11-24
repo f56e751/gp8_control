@@ -128,6 +128,11 @@ class TwinPieceStack(PieceStack):
         sim_cfg = R.cycle_sim_config(cfg)
         if seed is not None:
             sim_cfg.seed = int(seed)
+        # The planner plans with ONE belt speed: its model set (GT_BELT). A
+        # randomizing profile (e.g. hw2026: 0.10-0.30 m/s) must not draw another.
+        self.belt_speed = float(R.PLANNER_BELT_SPEED)
+        sim_cfg.belt_speed = self.belt_speed
+        sim_cfg.belt_speed_range = (self.belt_speed, self.belt_speed)
         sim = SimRlRunner(cfg, sim_cfg=sim_cfg, realtime=not virtual, max_objects=max_objects,
                           bbox_observation=bbox_observation, sim_seed=seed)
         sim.start()
