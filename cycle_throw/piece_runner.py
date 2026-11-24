@@ -29,6 +29,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import threading
 import time
 
 import numpy as np
@@ -47,11 +48,11 @@ class PieceRunner(CycleThrowRunner):
     LINK = "piece_link.py"
 
     def __init__(self, app, *, ctx, skills: dict, skill_for, top_z: float | None = None,
-                 on_execute=None) -> None:
+                 on_execute=None, vtime=None, decide_fn=None) -> None:
         """``skills``: skill name -> skill with ``plan_piece`` ("throw" ->
         PlannerThrowSkill, "push" -> PushSkill). ``on_execute(obj, skill)`` runs
         when the link has planned ``obj`` (the sim marks it manipulated)."""
-        super().__init__(app, skill_for=skill_for, push_handler=None, top_z=top_z)
+        super().__init__(app, skill_for=skill_for, push_handler=None, top_z=top_z, vtime=vtime)
         self.ctx = ctx
         self.skills = dict(skills)
         self.on_execute = on_execute
@@ -76,6 +77,19 @@ class PieceRunner(CycleThrowRunner):
         self.vy = -PLANNER_BELT_SPEED
         self.r_reach = float(self.cfg.MAX_REACH)
         self.H = None                                  # the planner's travel height (link "ready")
+        # decide_fn(runner, candidates, t_from) -> (item, "throw" | "push") | None:
+        # what to do next, instead of the belt-order rule (an RL policy). One
+        # object per request; None = nothing now (asked again after DECIDE_WAIT).
+        self.decide_fn = decide_fn
+        self.decide_wait = _env_float("GP8_PIECE_DECIDE_WAIT", 0.2)
+        self._ask_after = 0.0
+        # Virtual time: idle stretches are warped over in steps of WARP_S (the
+        # link commits whatever falls due first); planning runs at wall speed.
+        self.warp_s = _env_float("GP8_PIECE_WARP_S", 0.05)
+        self._warp_seq = 0
+        self._warped = threading.Event()
+        self._warp_ack = -1
+        self._vready = False
 
     # ------------------------------------------------------------------
     def run(self, intake=None, ok=None) -> None:
@@ -89,7 +103,7 @@ class PieceRunner(CycleThrowRunner):
         self.H = float((self._ready_msg or {}).get("H", 0.12))
         self.arm = {"kind": "rest", "q": self.home.tolist(), "t_free": 0.3, "t_rest": 0.0}
         period = 1.0 / max(1.0, _env_float("GP8_PIECE_DECIDE_HZ", 50.0))
-        last_report = time.monotonic()
+        last_report = self.mono()
         try:
             while ok() and self._fault is None and not self._done.is_set():
                 if intake is not None:
@@ -98,10 +112,10 @@ class PieceRunner(CycleThrowRunner):
                 self._take_replies()
                 if self._pending is None:
                     self._decide()
-                if time.monotonic() - last_report > 10.0:
-                    last_report = time.monotonic()
+                if self.mono() - last_report > 10.0:
+                    last_report = self.mono()
                     self.log.info(f"[pieces] {dict(self.stats)} arm {self._arm_str()}")
-                time.sleep(period)
+                self._advance(period)
         finally:
             self.close()
         if self._fault:
@@ -112,12 +126,12 @@ class PieceRunner(CycleThrowRunner):
         if self._child is None:
             return
         self._send({"t": "stop"})
-        deadline = time.monotonic() + _env_float("GP8_CYCLE_DRAIN_S", 12.0)
-        while time.monotonic() < deadline and self._fault is None and not self._done.is_set():
+        deadline = self.mono() + _env_float("GP8_CYCLE_DRAIN_S", 12.0)
+        while self.mono() < deadline and self._fault is None and not self._done.is_set():
             self._take_replies()
-            time.sleep(0.05)
-        while time.monotonic() < deadline and self._fault is None and not self._out_idle(0.2):
-            time.sleep(0.05)
+            self._sleep(0.05)
+        while self.mono() < deadline and self._fault is None and not self._out_idle(0.2):
+            self._sleep(0.05)
         if not self._done.is_set() and self._fault is None:
             self.log.warn("[pieces] stop: the link did not finish in time; holding where the arm is")
         self._teardown()
@@ -128,6 +142,36 @@ class PieceRunner(CycleThrowRunner):
     def _on_msg(self, kind, msg: dict) -> None:
         if kind == "planned":
             self._replies.put(msg)
+        elif kind == "vready":
+            self._vready = True
+        elif kind == "warped":
+            self._warp_ack = int(msg.get("seq", -1))
+            self._warped.set()
+
+    # ------------------------------------------------------------------
+    # time
+    # ------------------------------------------------------------------
+    def _advance(self, period: float) -> None:
+        """Let ``period`` pass: wall time, or (virtual) a warp while the link
+        computes nothing for us."""
+        if self.vt is None or self._pending is not None or self.t0 is None or not self._vready:
+            self._sleep(period)
+            return
+        self._warp_seq += 1
+        seq = self._warp_seq
+        self._warped.clear()
+        self._send({"t": "warp", "dt": float(period), "seq": seq})
+        t_end = time.monotonic() + 10.0
+        while self._warp_ack < seq:
+            if self._fault is not None:
+                return
+            if not self._warped.wait(0.5) and time.monotonic() > t_end:
+                self._fault = "virtual time: the link did not ack a warp"
+                return
+            self._warped.clear()
+        if self.out is not None:
+            self.out._q.join()            # every command the link sent before the ack is written
+        self.vt.warp(period)
 
     def _take_replies(self) -> None:
         while True:
@@ -146,7 +190,7 @@ class PieceRunner(CycleThrowRunner):
             for tid, why in msg.get("skipped", []):
                 tid = int(tid)
                 self._skips[tid] = self._skips.get(tid, 0) + 1
-                self._retry_at[tid] = time.monotonic() + 0.5
+                self._retry_at[tid] = self.mono() + 0.5
                 self.stats["skipped"] += 1
                 self.log.info(f"[pieces] id={tid} skipped by the link: {why}")
                 if p["kinds"].get(tid) == "push" and self._skips[tid] >= 2:
@@ -159,7 +203,7 @@ class PieceRunner(CycleThrowRunner):
             self.log_rows.append(dict(t=round(self.now(), 3), ok=bool(msg.get("ok")),
                                       steps=p["desc"], taken=msg.get("taken"),
                                       skipped=msg.get("skipped"), arm=self.arm,
-                                      plan_s=round(time.monotonic() - p["t_sent"], 3)))
+                                      plan_s=round(self.mono() - p["t_sent"], 3)))
 
     def _find(self, track_id: int):
         return next((o for o in self.app.queue.snapshot() if int(o.track_id) == track_id), None)
@@ -188,11 +232,11 @@ class PieceRunner(CycleThrowRunner):
     # ------------------------------------------------------------------
     def _items(self) -> list[dict]:
         """Routed, established, untaken objects with their planner-frame dicts."""
-        tw = time.time()
+        tw = self._wall()
         tm = self.now()
         v = float(self.app.conveyor.current)
         dist = self.app.conveyor.distance_m
-        mono = time.monotonic()
+        mono = self.mono()
         out = []
         for obj in self.app.queue.snapshot():
             tid = int(obj.track_id)
@@ -244,6 +288,8 @@ class PieceRunner(CycleThrowRunner):
             return
         if not items:
             return
+        if self.decide_fn is not None and self.mono() < self._ask_after:
+            return
         # The link carries on from the unsent end of its last plan when it can
         # (t_open), else it starts from rest (t_free, plus its command lead).
         t_open = arm.get("t_open")
@@ -251,9 +297,13 @@ class PieceRunner(CycleThrowRunner):
         steps, kinds, desc = self._steps(items, t_from)
         if steps:
             self._request(steps, kinds, desc)
+        elif self.decide_fn is not None:
+            self._ask_after = self.mono() + self.decide_wait
 
     def _steps(self, items: list[dict], t_from: float, exclude: int | None = None):
         """Pushes due before the next throw object, then its pick (belt order)."""
+        if self.decide_fn is not None:
+            return self._steps_decided(items, t_from, exclude)
         steps, kinds, desc = [], {}, []
         t_est = t_from
         n_push = 0
@@ -293,6 +343,47 @@ class PieceRunner(CycleThrowRunner):
             t_est = t_after
         return steps, kinds, desc
 
+    def _steps_decided(self, items: list[dict], t_from: float, exclude: int | None = None):
+        """Steps chosen by ``decide_fn`` (an RL policy), one decision at a time,
+        bundled like the rule's: up to ``push_max`` pushes, then at most one
+        pick. After a push the policy is asked again from the time that push
+        frees the arm; a pick (or None) ends the request."""
+        steps, kinds, desc = [], {}, []
+        chosen = {exclude} if exclude is not None else set()
+        t_est = t_from
+        n_push = 0
+        while True:
+            cands = [c for c in self._in_order(items, t_est) if c["o"]["id"] not in chosen]
+            choice = self.decide_fn(self, cands, t_est) if cands else None
+            if choice is None:
+                break
+            it, skill = choice
+            tid = it["o"]["id"]
+            chosen.add(tid)
+            if skill == "push":
+                if n_push >= self.push_max:
+                    break                     # the next request takes it
+                r = self._push_step(it, t_est)
+                if r is None:
+                    continue                  # not possible now; ask again
+                if r != "throw":
+                    step, t_est = r
+                    steps.append(step)
+                    kinds[tid] = "push"
+                    desc.append(f"push {tid} (policy)")
+                    n_push += 1
+                    continue
+                self._reroute.add(tid)        # refused: thrown instead (as the rule does)
+            piece = self._piece(dict(it, skill="throw"), t_est)
+            if piece is not None:
+                o = dict(it["o"])
+                o["b"] = int(piece.request["bin"])
+                steps.append({"kind": "pick", "obj": o})
+                kinds[tid] = "throw"
+                desc.append(f"pick {tid} (policy)")
+            break
+        return steps, kinds, desc
+
     def _piece(self, item: dict, t_start_p: float):
         """The throw skill's piece (planner request) for an object, or None."""
         skill = self.skills["throw"]
@@ -300,7 +391,7 @@ class PieceRunner(CycleThrowRunner):
                           aim_joint=None, grasp_joint=None, secondary=None)
         piece = skill.plan_piece(req, self._to_wall(t_start_p))
         if not isinstance(piece, MotionPiece):
-            self._retry_at[item["o"]["id"]] = time.monotonic() + 1.0
+            self._retry_at[item["o"]["id"]] = self.mono() + 1.0
             return None
         return piece
 
@@ -325,7 +416,7 @@ class PieceRunner(CycleThrowRunner):
             self.stats["push_veto"] += 1
             if self._fallback(obj, f"push refused ({veto})"):
                 return "throw"
-            self._retry_at[tid] = time.monotonic() + 0.5
+            self._retry_at[tid] = self.mono() + 0.5
             return None
         req = PickRequest(target=obj, current_joint=q_from, T_aim=it.T_aim, T_grasp=it.T_grasp,
                           aim_joint=it.aim_joint, grasp_joint=it.grasp_joint, secondary=None)
@@ -335,7 +426,7 @@ class PieceRunner(CycleThrowRunner):
             why = getattr(piece, "detail", piece)
             if self._fallback(obj, f"push declined ({why})"):
                 return "throw"
-            self._retry_at[tid] = time.monotonic() + 0.3
+            self._retry_at[tid] = self.mono() + 0.3
             return None
         U = np.asarray(piece.Q, float)
         # Above the backswing and above the stroke end, at the planner's travel
@@ -347,7 +438,7 @@ class PieceRunner(CycleThrowRunner):
             self.stats["push_no_ik"] += 1
             if self._fallback(obj, "no pose above the backswing / stroke end"):
                 return "throw"
-            self._retry_at[tid] = time.monotonic() + 0.5
+            self._retry_at[tid] = self.mono() + 0.5
             return None
         t_f = self._to_planner(piece.t0)
         t_after = t_f + piece.meta["i_cut"] * piece.dt + 0.4
@@ -378,7 +469,7 @@ class PieceRunner(CycleThrowRunner):
     def _request(self, steps: list, kinds: dict, desc: list) -> None:
         self._rid += 1
         self._pending = {"rid": self._rid, "kinds": kinds, "desc": desc,
-                         "t_sent": time.monotonic()}
+                         "t_sent": self.mono()}
         self._send({"t": "plan", "rid": self._rid, "steps": steps})
 
     # planner time (monotonic - t0) <-> ctx clock (wall)

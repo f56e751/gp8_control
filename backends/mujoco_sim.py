@@ -1107,16 +1107,28 @@ class SimCore:
             return
         self.advance_until(self.sim_time() + duration)
 
+    def set_tick_source(self, src) -> None:
+        """Controller-tick command source (backends/sim_tick.SimTickBuffer): every
+        physics step takes its command and suction events from ``src.at_tick(k)``,
+        k = sim time / dt (non-realtime stepping only)."""
+        self._tick_source = src
+
     def advance_steps(self, n: int = 1) -> None:
         n = max(0, int(n))
         if n <= 0:
             return
         det_period = 1.0 / max(1.0, self.cfg.det_hz)
         pend = self._pending_ctrl
+        src = getattr(self, "_tick_source", None)
         for _ in range(n):
             suction_events = []
             with self.lock:
                 t_sub = float(self.data.time)
+                if src is not None:
+                    q, fire = src.at_tick(int(round(t_sub / self._dt)))
+                    if q is not None:
+                        self._ctrl_target = np.asarray(q, dtype=float)
+                    suction_events.extend(fire)
                 while pend and pend[0][0] <= t_sub:
                     _, kind, payload = pend.popleft()
                     if kind == "ctrl":

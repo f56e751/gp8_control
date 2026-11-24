@@ -82,6 +82,8 @@ class RunRecorder:
         self._q: "queue.Queue" = queue.Queue()
         self._closed = False
         self._t_tracks = 0.0
+        # Monotonic clock of the run (a virtual one in the RL twin: the runner sets it).
+        self.clock = time.monotonic
         self._ev = open(self.dir / "events.jsonl", "a", encoding="utf-8")
         self._bin: dict = {}
         self._rows: dict[str, list] = {"joints": [], "cmd": []}
@@ -95,12 +97,12 @@ class RunRecorder:
     def event(self, kind: str, **fields) -> None:
         if self._closed:
             return
-        self._q.put({**fields, "m": time.monotonic(), "w": time.time(), "ev": kind})
+        self._q.put({**fields, "m": self.clock(), "w": time.time(), "ev": kind})
 
     def joints(self, q, t_mono: float | None = None) -> None:
         if self._closed or q is None:
             return
-        row = [time.monotonic() if t_mono is None else float(t_mono), *map(float, q)]
+        row = [self.clock() if t_mono is None else float(t_mono), *map(float, q)]
         with self._rows_lock:
             self._rows["joints"].append(row)
 
@@ -108,7 +110,7 @@ class RunRecorder:
         """One row ``[t, q...]`` of another float64 stream (``<name>.f64``)."""
         if self._closed or q is None:
             return
-        row = [time.monotonic() if t_mono is None else float(t_mono), *map(float, q)]
+        row = [self.clock() if t_mono is None else float(t_mono), *map(float, q)]
         with self._rows_lock:
             self._rows.setdefault(name, []).append(row)
 
@@ -131,7 +133,7 @@ class RunRecorder:
 
     def tracks(self, queue_, conveyor, wall_now: float | None = None) -> None:
         """Snapshot of the tracked-object queue, at most every 0.1 s."""
-        mono = time.monotonic()
+        mono = self.clock()
         if self._closed or mono - self._t_tracks < self.TRACK_PERIOD_S:
             return
         self._t_tracks = mono

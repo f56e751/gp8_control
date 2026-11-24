@@ -99,6 +99,11 @@ def main():
     started = threading.Event()
     start = {}
     sync = {"samples": [], "offset": 0.0, "rtt": float("inf")}
+    # Virtual time (RL twin, backends/sim_tick.py): the app's clock jumps
+    # forward by "warp" messages while nothing is being planned. The clock is
+    # synced once; a warp moves the offset, commits what falls due and acks.
+    VIRTUAL = os.environ.get("GP8_PIECE_VIRTUAL", "0") not in ("0", "", "false", "no")
+    hooks = {}
     synced = threading.Event()
     stopped = threading.Event()
 
@@ -116,6 +121,8 @@ def main():
     def pinger():
         n = 0
         while not stopped.is_set():
+            if VIRTUAL and synced.is_set():
+                return                    # offsets move only by warps from here on
             send({"t": "ping", "c": time.monotonic()})
             n += 1
             time.sleep(0.05 if n < 20 else 1.0)
@@ -132,6 +139,8 @@ def main():
                 started.set()
             elif kind == "pong":
                 on_pong(msg)
+            elif kind == "warp" and "warp" in hooks:
+                hooks["warp"](msg)
             else:
                 requests.put(msg)
         requests.put({"t": "stop"})       # stdin closed: the app is gone
@@ -371,16 +380,33 @@ def main():
         with cq_lock:
             cq["jobs"] += [dict(j, lazy=lazy) for j in jobs]
 
+    def commit_due():
+        with cq_lock:
+            while cq["jobs"]:
+                j = cq["jobs"][0]
+                if j["lazy"] and j["ka"] * DT - now() > COMMIT_AHEAD:
+                    break
+                cq["jobs"].pop(0)
+                jq.put({k: v for k, v in j.items() if k != "lazy"})
+
     def committer():
         while not stopped.is_set() and "error" not in ev:
-            with cq_lock:
-                while cq["jobs"]:
-                    j = cq["jobs"][0]
-                    if j["lazy"] and j["ka"] * DT - now() > COMMIT_AHEAD:
-                        break
-                    cq["jobs"].pop(0)
-                    jq.put({k: v for k, v in j.items() if k != "lazy"})
+            commit_due()
             time.sleep(0.005)
+
+    def on_warp(msg):
+        """Virtual time: move the clock, then hand out (and fit) every chunk
+        that is due by then, so the app never steps past an unsent command."""
+        dt = float(msg.get("dt", 0.0))
+        with lock:
+            sync["offset"] += dt
+        commit_due()
+        jq.join()
+        send({"t": "warped", "seq": msg.get("seq")})
+
+    hooks["warp"] = on_warp
+    if VIRTUAL:
+        send({"t": "vready"})             # synced, warps are handled from here on
 
     def ensure_buf(ka, q_rest):
         if st["buf"] is None:

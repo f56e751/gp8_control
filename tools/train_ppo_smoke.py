@@ -104,6 +104,14 @@ def _worker_log_path(out_dir: str, rank: int) -> str:
 def _make_env(args, *, rank: int = 0) -> FlatMaskedActionWrapper:
     cfg = Config()
     cfg.PICK_LOG_CSV = _worker_log_path(args.out_dir, rank)
+    if getattr(args, "env", "skill") == "piece":
+        # Actions run through piece mode (the planner the real robot uses) on
+        # virtual time: rl/piece_env.py.
+        from gp8_control.rl.piece_env import GP8PieceEnv
+
+        return FlatMaskedActionWrapper(GP8PieceEnv(
+            max_objects=args.max_objects, max_episode_seconds=args.max_episode_seconds,
+            cfg=cfg, bbox_observation=args.bbox_observation))
     env = GP8RecyclingEnv(
         max_objects=args.max_objects,
         include_eta=args.include_eta,
@@ -521,6 +529,9 @@ def parse_args(argv=None):
     parser.add_argument("--eval-steps", type=int, default=8)
     parser.add_argument("--eval-episodes", type=int, default=2)
     parser.add_argument("--max-objects", type=int, default=6)
+    parser.add_argument("--env", choices=("skill", "piece"), default="skill",
+                        help="skill: skills move the arm (GP8RecyclingEnv); piece: piece mode "
+                             "(the planner the real robot runs) on virtual time (GP8PieceEnv)")
     parser.add_argument(
         "--max-steps",
         type=int,

@@ -227,6 +227,14 @@ summarizes, compares measured joints with the filter model (`--fit`), turns a
 run's object stream into a twin spawn script (`GP8_SIM_SPAWN_SCRIPT`, started
 at planner t0) and compares two runs object by object.
 
+**RL on piece mode** (`rl/piece_env.py`, `train_ppo_smoke --env piece`): the
+policy picks the next object/skill whenever piece mode asks
+(`PieceRunner(decide_fn=...)`); the twin runs on virtual time
+(`backends/sim_tick.py`: wall speed while the link plans, warped otherwise; the
+link moves its clock on `warp` after committing what falls due and acks
+`warped`; commands go through `SimTickBuffer`, the SampleBuffer rules on sim
+ticks). Runners take `vtime=`; without it every clock is `time.monotonic`.
+
 **Running with robot6** (operator steps in README section C): the robot PC
 runs driver + app + camera_debug, robot6 (`iitp@147.46.175.15`, checkout
 `/PublicSSD/iitp/demo/gp8_control` with its own `.venv`) runs the planner
