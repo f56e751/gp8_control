@@ -39,6 +39,7 @@ class VirtualTime:
         self.skew = 0.0
         self._lock = threading.Lock()
         self.warped_s = 0.0
+        self._frozen = None               # virtual now while paused (pause/resume)
         self.rebase()
 
     def rebase(self) -> None:
@@ -50,7 +51,20 @@ class VirtualTime:
             self.core._mono_t0 = self.c
 
     def mono(self) -> float:
-        return time.monotonic() + self.skew
+        f = self._frozen
+        return f if f is not None else time.monotonic() + self.skew
+
+    def pause(self) -> None:
+        """Stop the clock: an RL agent is deciding (vec envs step in lockstep,
+        so it can wait seconds; a policy on the robot answers in ms)."""
+        self._frozen = time.monotonic() + self.skew
+
+    def resume(self) -> float:
+        """Run the clock on from where it stood; returns how long it stood [s]."""
+        old = self.skew
+        self.skew = self._frozen - time.monotonic()
+        self._frozen = None
+        return old - self.skew
 
     def sim_target(self) -> float:
         return self.mono() - self.c
