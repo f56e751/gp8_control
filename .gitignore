@@ -20,4 +20,4 @@ log/
 tests/analyze_push_tracking.py
 
 # piece mode scratch files (cycle_throw/piece_link.py)
-third_party/grasp_and_throw/planner/logs/rt_tmp_pieces/
+third_party/grasp_and_throw/planner/logs/rt_tmp_pieces*/

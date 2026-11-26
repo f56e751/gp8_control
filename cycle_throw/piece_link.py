@@ -141,6 +141,8 @@ def main():
                 on_pong(msg)
             elif kind == "warp" and "warp" in hooks:
                 hooks["warp"](msg)
+            elif kind in ("pause", "resume") and kind in hooks:
+                hooks[kind](msg)
             else:
                 requests.put(msg)
         requests.put({"t": "stop"})       # stdin closed: the app is gone
@@ -169,6 +171,8 @@ def main():
 
     def now():
         with lock:
+            if sync.get("frozen") is not None:
+                return sync["frozen"]
             off = sync["offset"]
         return time.monotonic() + off - t0
 
@@ -192,7 +196,7 @@ def main():
     D, L = INV._C["D"], INV._C["L"]
     hk = np.asarray(INV._C["hk"], float)
     LAG_S = int(round(float(np.arange(L) @ hk)))          # filter group delay [samples]
-    tmp = os.path.join(C.HERE, "logs", "rt_tmp_pieces")
+    tmp = os.path.join(C.HERE, "logs", f"rt_tmp_pieces_{os.getpid()}")   # one per link: parallel RL envs share this planner dir
     os.makedirs(tmp, exist_ok=True)
     fn = lambda s: os.path.join(tmp, s)                                                # noqa: E731
     lim_s = os.environ.get("RT_LIM", "0.8,8,160")
@@ -404,7 +408,20 @@ def main():
         jq.join()
         send({"t": "warped", "seq": msg.get("seq")})
 
+    def on_pause(msg):
+        """Virtual time: the app's agent is deciding; the clock stands still."""
+        with lock:
+            sync["frozen"] = time.monotonic() + sync["offset"] - t0
+        send({"t": "paused"})             # the app stops this process tree next
+
+    def on_resume(msg):
+        """Run on from where the clock stood, moved back by the app's wait."""
+        with lock:
+            sync["offset"] -= float(msg.get("dt", 0.0))
+            sync["frozen"] = None
+
     hooks["warp"] = on_warp
+    hooks["pause"], hooks["resume"] = on_pause, on_resume
     if VIRTUAL:
         send({"t": "vready"})             # synced, warps are handled from here on
 

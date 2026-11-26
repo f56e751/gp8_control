@@ -26,9 +26,11 @@ Steps are decided ``RT_AHEAD`` s before the held object's throw cycle starts
 
 from __future__ import annotations
 
+import glob
 import math
 import os
 import queue
+import signal
 import threading
 import time
 
@@ -94,6 +96,7 @@ class PieceRunner(CycleThrowRunner):
         self._warped = threading.Event()
         self._warp_ack = -1
         self._vready = False
+        self._link_paused = threading.Event()
 
     # ------------------------------------------------------------------
     def run(self, intake=None, ok=None) -> None:
@@ -151,6 +154,8 @@ class PieceRunner(CycleThrowRunner):
         elif kind == "warped":
             self._warp_ack = int(msg.get("seq", -1))
             self._warped.set()
+        elif kind == "paused":
+            self._link_paused.set()
 
     # ------------------------------------------------------------------
     # time
@@ -371,7 +376,7 @@ class PieceRunner(CycleThrowRunner):
         n_push = 0
         while True:
             cands = [c for c in self._in_order(items, t_est) if c["o"]["id"] not in chosen]
-            choice = self.decide_fn(self, cands, t_est) if cands else None
+            choice = self._ask(cands, t_est) if cands else None
             if choice is None:
                 break
             it, skill = choice
@@ -409,6 +414,45 @@ class PieceRunner(CycleThrowRunner):
                 rec["result"] = "no throw piece"
             break
         return steps, kinds, desc
+
+    def _ask(self, cands, t_est):
+        """``decide_fn`` with virtual time standing still while it blocks: an RL
+        agent in a vec env waits for the other envs, a policy on the robot
+        answers in ms. The twin only moves when this thread drives it; the
+        link's clock is paused and moved back by the same wait, and the link's
+        process tree is stopped (SIGSTOP) so a solve in flight gains no time."""
+        if self.vt is None or not self._vready:
+            return self.decide_fn(self, cands, t_est)
+        self.vt.pause()
+        self._link_paused.clear()
+        self._send({"t": "pause"})
+        stopped = self._signal_planner(signal.SIGSTOP) if self._link_paused.wait(2.0) else []
+        try:
+            return self.decide_fn(self, cands, t_est)
+        finally:
+            self._send({"t": "resume", "dt": self.vt.resume()})
+            self._signal_planner(signal.SIGCONT, stopped)
+
+    def _signal_planner(self, sig, pids=None) -> list:
+        """Send ``sig`` to the link and every process under it (planner server,
+        worker pools; read from /proc); returns the pids signalled."""
+        if pids is None:
+            pids, todo = [], [self._child.pid]
+            while todo:
+                p = todo.pop()
+                pids.append(p)
+                for f in glob.glob(f"/proc/{p}/task/*/children"):
+                    try:
+                        with open(f) as fh:
+                            todo += [int(c) for c in fh.read().split()]
+                    except OSError:
+                        pass
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except ProcessLookupError:
+                pass
+        return pids
 
     def decision_summary(self) -> dict:
         """Counts over the policy decisions (see ``self.decisions``)."""

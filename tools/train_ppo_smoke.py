@@ -148,6 +148,18 @@ def _make_subproc_env(rank: int, args_dict: dict[str, Any]):
 
 
 def _make_training_env(args, Monitor, SubprocVecEnv, VecMonitor):
+    if args.async_rollout:
+        # Every env stepped on its own (rl/async_rollout.py); the algorithm
+        # sees one env whose rollout is n_steps x n_envs long.
+        from gp8_control.rl.async_rollout import AsyncEnvPool
+
+        args_dict = vars(args).copy()
+        monitor_path = Path(args.out_dir).expanduser().resolve() / "monitor_logs" / "vec_monitor.csv"
+        monitor_path.parent.mkdir(parents=True, exist_ok=True)
+        pool = AsyncEnvPool([_make_subproc_env(rank, args_dict) for rank in range(int(args.n_envs))],
+                            start_method=args.vec_start_method, seed=int(args.seed),
+                            monitor_path=monitor_path)
+        return pool.vec_env
     if int(args.n_envs) <= 1:
         return _make_monitored_env(args, Monitor, rank=0)
     args_dict = vars(args).copy()
@@ -323,12 +335,17 @@ def train(args) -> int:
                         episode_seconds=args.max_episode_seconds or 240.0,
                     ),
                 )
-            model = MaskablePPO(
+            algo, n_steps = MaskablePPO, args.n_steps
+            if args.async_rollout:
+                from gp8_control.rl.async_rollout import AsyncMaskablePPO
+
+                algo, n_steps = AsyncMaskablePPO, args.n_steps * args.n_envs
+            model = algo(
                 "MlpPolicy",
                 env,
                 policy_kwargs=policy_kwargs,
                 seed=args.seed,
-                n_steps=args.n_steps,
+                n_steps=n_steps,
                 batch_size=args.batch_size,
                 gamma=args.gamma,
                 ent_coef=args.ent_coef,
@@ -370,6 +387,7 @@ def train(args) -> int:
             "seed": int(args.seed),
             "n_envs": int(args.n_envs),
             "n_steps": int(args.n_steps),
+            "async_rollout": bool(args.async_rollout),
             "batch_size": int(args.batch_size),
             "max_objects": int(args.max_objects),
             "max_steps": int(args.max_steps),
@@ -565,6 +583,9 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--vec-start-method", default="fork")
+    parser.add_argument("--async-rollout", action="store_true",
+                        help="piece env only: step every env on its own instead of in lockstep "
+                             "(rl/async_rollout.py); not with --model or --eval-episodes > 0")
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--ent-coef", type=float, default=0.0)
     parser.add_argument(
@@ -598,6 +619,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.max_episode_seconds is not None and args.max_episode_seconds <= 0.0:
         args.max_episode_seconds = None
+    if args.async_rollout and (args.env != "piece" or args.model or args.eval_episodes > 0):
+        parser.error("--async-rollout needs --env piece, no --model and --eval-episodes 0")
     return args
 
 
