@@ -696,7 +696,9 @@ def main():
         # fixed wait point only if that cannot be reached.
         if taken and chained:
             return ("rest", np.asarray(state[0], float), t, r_free), taken, skipped
-        q_wp = q_lift(state[0]) if taken else q_hold(state[0])
+        # q_hold, not the bare planner IK: a push stroke can end ~0.75 m out
+        # (push reach 0.70) where the IK raises and the whole plan failed.
+        q_wp = q_hold(state[0])
         if q_wp is None:
             q_wp = M.ik(np.array([xw_end, yin(xw_end), H]))
         if out_of_time():
