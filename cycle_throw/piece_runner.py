@@ -82,6 +82,11 @@ class PieceRunner(CycleThrowRunner):
         # object per request; None = nothing now (asked again after DECIDE_WAIT).
         self.decide_fn = decide_fn
         self.decide_wait = _env_float("GP8_PIECE_DECIDE_WAIT", 0.2)
+        # After a policy's skip while holding: "hold" = stop where the throw ends
+        # (default), "wait" = the fixed upstream wait point (the rule's choice).
+        self.skip_rest = os.environ.get("GP8_PIECE_SKIP_REST", "hold").strip().lower()
+        if self.skip_rest not in ("hold", "wait"):
+            raise ValueError(f"GP8_PIECE_SKIP_REST={self.skip_rest!r}: expected hold or wait")
         # Audit of every policy decision: what was chosen, what piece mode did
         # with it (planned as chosen / the documented fallbacks), whether the
         # link then took it. tools/piece_twin and the app log it.
@@ -301,7 +306,11 @@ class PieceRunner(CycleThrowRunner):
             if tp < ts - self.ahead:
                 return
             steps, kinds, desc = self._steps(items, ts + 0.6, exclude=int(arm["id"]))
-            self._request([{"kind": "throw"}] + steps, kinds, ["throw"] + desc)
+            # A policy that chose nothing next (skip): after the throw the arm
+            # stops above where the throw ends (no trip to the fixed upstream
+            # wait point). The belt-order rule keeps the wait point.
+            rest = self.skip_rest if (self.decide_fn is not None and not steps) else None
+            self._request([{"kind": "throw"}] + steps, kinds, ["throw"] + desc, rest=rest)
             return
         if not items:
             return
@@ -502,11 +511,14 @@ class PieceRunner(CycleThrowRunner):
         self.log.info(f"[pieces] id={obj.track_id} {obj.class_name}: {why}; thrown instead")
         return True
 
-    def _request(self, steps: list, kinds: dict, desc: list) -> None:
+    def _request(self, steps: list, kinds: dict, desc: list, rest: str | None = None) -> None:
         self._rid += 1
         self._pending = {"rid": self._rid, "kinds": kinds, "desc": desc,
                          "t_sent": self.mono()}
-        self._send({"t": "plan", "rid": self._rid, "steps": steps})
+        msg = {"t": "plan", "rid": self._rid, "steps": steps}
+        if rest:
+            msg["rest"] = rest
+        self._send(msg)
 
     # planner time (monotonic - t0) <-> ctx clock (wall)
     def _wall(self) -> float:

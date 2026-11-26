@@ -69,10 +69,24 @@ class PieceStack:
         return self.decider
 
     def policy_decider(self, spec: str):
-        """A decider running a policy (``heuristic``, ``upstream`` or a .zip)."""
+        """A decider running a policy (``heuristic``, ``upstream`` or a .zip).
+
+        GP8_PIECE_TEST_SKIP_HOLDING=1 (tests only): skip every decision made
+        while an object is held, to exercise what a policy's skip does."""
         from gp8_control.rl.piece_policy import load_policy
 
-        return self.make_decider(policy=load_policy(spec, self.max_objects), log=self.log)
+        decider = self.make_decider(policy=load_policy(spec, self.max_objects), log=self.log)
+        if os.environ.get("GP8_PIECE_TEST_SKIP_HOLDING", "0") not in ("0", ""):
+            def skip_holding(runner, cands, t_from):
+                if runner.arm is not None and runner.arm.get("kind") == "obj":
+                    if self.log:
+                        self.log("[policy] test: skip while holding")
+                    return None
+                return decider(runner, cands, t_from)
+            skip_holding.log = decider.log
+            skip_holding.n = 0
+            return skip_holding
+        return decider
 
     def build(self, decide_fn=None) -> PieceRunner:
         self.runner = PieceRunner(
