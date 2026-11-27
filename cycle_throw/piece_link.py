@@ -216,7 +216,7 @@ def main():
     cmds = {}
     st = dict(k_def=None, buf=None)
     jq: "queue.Queue" = queue.Queue()
-    ev = dict(nlp=[], inv=[], picked=[], releases=[], pushes=0, p2p=[])
+    ev = dict(nlp=[], inv=[], picked=[], releases=[], pushes=0, p2p=[], rest_defaults={})
     zo = lambda o: float(o.get("z", top))                                              # noqa: E731
     load = S.load
     CHMAX = int(os.environ.get("GP8_PIECE_CHUNK", "500"))                # samples per command chunk at most
@@ -506,6 +506,54 @@ def main():
         p = tcp(q)
         return M.ik(np.array([p[0], p[1], H]))
 
+    def q_hold(q, why=None):
+        """Rest at the travel height above where the arm is -- or, when that is
+        beyond the planner IK's reach (a throw ends 0.70-0.77 m out), at the
+        closest reachable point in the same direction (radius r_hi 0.65, then
+        5 cm steps in). None if none lands (the caller uses the wait point)."""
+        p = tcp(q)
+        r = float(np.hypot(p[0], p[1]))
+        ang = float(np.arctan2(p[1], p[0]))
+        for rr in [min(r, float(R["r_hi"]))] + [x for x in (0.60, 0.55, 0.50) if x < min(r, R["r_hi"])]:
+            target = np.array([rr * np.cos(ang), rr * np.sin(ang), H])
+            if target[0] < 0.25:
+                continue
+            try:
+                qh = np.asarray(M.ik(target), float)
+                ph = tcp(qh)
+            except Exception as e:  # noqa: BLE001
+                if why is not None:
+                    why.append(f"IK failed at r {rr:.2f}: {type(e).__name__}")
+                continue
+            if np.all(np.isfinite(qh)) and np.linalg.norm(ph - target) <= 0.01:
+                return qh
+            if why is not None:
+                why.append(f"IK off at r {rr:.2f}")
+        return None
+
+    def post_throw_rest(F, nxt, ob, why):
+        """Where the arm waits after a throw that does not go straight on, in
+        order of preference: above the next object where it first becomes
+        pickable, above the next push's backswing (its hover pose), above where
+        the throw ends (q_hold). Yields (q, label) candidates."""
+        if nxt is not None and nxt.get("kind") == "push":
+            yield np.asarray(nxt["q_hover"], float) * SG, f"above the next push ({nxt.get('id')})"
+        elif ob is not None:
+            t_w = max(F[0] + 0.5, t_enter(ob))
+            y_w = ob["y0"] + vy * t_w
+            if abs(y_w) <= float(O.yr(ob["x"])):
+                try:
+                    q_o = np.asarray(M.ik(np.array([ob["x"], y_w, H])), float)
+                    if np.all(np.isfinite(q_o)):
+                        yield q_o, f"above the next object ({ob['id']})"
+                except Exception as e:  # noqa: BLE001
+                    why.append(f"no pose above object {ob['id']}: {type(e).__name__}")
+            else:
+                why.append(f"object {ob['id']} out of reach")
+        qh = q_hold(F[1], why)
+        if qh is not None:
+            yield qh, "where the throw ended"
+
     def push_geo(stp):
         U = np.asarray(stp["U"], float) * SG
         Sr = filtered(U)
@@ -644,10 +692,15 @@ def main():
                 skipped.append([o["id"], "pick timing did not settle"])
         # No pick. After a push the arm already rests above its stroke end (the
         # lift): stay there for the next push or pick. Otherwise (nothing done,
-        # or the lift did not solve) rest at the fixed wait point.
+        # or the lift did not solve) rest above where the arm is (q_hold); the
+        # fixed wait point only if that cannot be reached.
         if taken and chained:
             return ("rest", np.asarray(state[0], float), t, r_free), taken, skipped
-        q_wp = M.ik(np.array([xw_end, yin(xw_end), H])) if not taken else q_lift(state[0])
+        # q_hold, not the bare planner IK: a push stroke can end ~0.75 m out
+        # (push reach 0.70) where the IK raises and the whole plan failed.
+        q_wp = q_hold(state[0])
+        if q_wp is None:
+            q_wp = M.ik(np.array([xw_end, yin(xw_end), H]))
         if out_of_time():
             return None
         mv = solve_moves([(f"{name} -> rest", *state, q_wp, z6, zlo(state[0]), 0.249)])[0]
@@ -734,15 +787,33 @@ def main():
             ev["releases"].append(t_rel)
             tcut = float(c["tt"][IW1])
             F = (ts + tcut, c["Q"][IW1], c["V"][IW1], c["A"][IW1])
-            # The safe default goes out at once, lazily: rt_cont's own end at the
-            # fixed wait point (one fast solve). A better plan replaces it only
-            # if it is ready before the default's first chunk is due; however
-            # long planning takes, the arm never waits on it.
-            srv.call("add_rest.py", ["end", fn("c.npz")], env)
-            E = load(fn("c_end.npz"))
-            tag = "%02d" % round(xw_end * 100)
-            fallback = dict(tt=E["tt_" + tag], Q=E["Q_" + tag], V=E["V_" + tag], A=E["A_" + tag],
-                            J=E["J_" + tag])
+            # The safe default goes out at once, lazily (one move from the
+            # release-window end). A better plan replaces it only if it is
+            # ready before the default's first chunk is due; however long
+            # planning takes, the arm never waits on it. Where it waits: above
+            # the next object (pick) or the next push's backswing, else where
+            # the throw ends (post_throw_rest). The fixed upstream wait point
+            # (rt_cont's own end) only if none of those can be reached.
+            fallback, rest_at = None, None
+            why_r: list = []
+            for q_r, label in post_throw_rest(F, nxt, ob, why_r):
+                mv = solve_moves([(f"{name} -> {label}", F[1], F[2], F[3], q_r, z6,
+                                   zlo(F[1]), 0.249)])[0]
+                if mv is not None:
+                    fallback, rest_at = {k: mv[k] for k in ("tt", "Q", "V", "A", "J")}, label
+                    kind_ = label.split(" (")[0]
+                    ev["rest_defaults"][kind_] = ev["rest_defaults"].get(kind_, 0) + 1
+                    break
+                why_r.append(f"no move to {label}")
+            if fallback is None:
+                log(f"{name}: no rest near the work ({'; '.join(why_r)}); the fixed wait point")
+                ev["rest_defaults"]["the fixed wait point"] = ev["rest_defaults"].get("the fixed wait point", 0) + 1
+                rest_at = "the fixed wait point"
+                srv.call("add_rest.py", ["end", fn("c.npz")], env)
+                E = load(fn("c_end.npz"))
+                tag = "%02d" % round(xw_end * 100)
+                fallback = dict(tt=E["tt_" + tag], Q=E["Q_" + tag], V=E["V_" + tag],
+                                A=E["A_" + tag], J=E["J_" + tag])
             buf.add(ts, c, t_cut=tcut)
             suction(False, t_rel)
             t_fb = buf.add(ts + tcut, fallback)
@@ -761,14 +832,16 @@ def main():
                                t_rest=t_fb, r_free=k_cut + 1)
             pl.keys += keys
             thrown = oa["id"]
-            r = plan_steps(pl, F, steps, name, lambda: F[0], lambda: k_a * DT - COMMIT_AHEAD)
+            # nothing after the throw: the default (post_throw_rest) is the plan
+            r = None if not steps else plan_steps(
+                pl, F, steps, name, lambda: F[0], lambda: k_a * DT - COMMIT_AHEAD)
             useful = r is not None and (r[1] or r[0][0] == "obj")
             if not (useful and cq_replace_from(k_a)):
                 arm.clear()
                 arm.update(arm_default)
-                why = ("planning ran out of time" if (r is None or useful) else None)
+                why = ("planning ran out of time" if steps and (r is None or useful) else None)
                 skipped = ([[i, why] for i in step_ids] if why else (r[2] if r else []))
-                log(f"{name}: object {oa['id']} thrown; at the fixed wait point at {t_fb:.2f}"
+                log(f"{name}: object {oa['id']} thrown; waiting {rest_at} at {t_fb:.2f}"
                     + (f" (steps not ready in time, moves take {batch_est():.2f} s)" if why else "")
                     + (f"; skipped {skipped}" if skipped else ""))
                 return True, "", [], skipped
@@ -905,6 +978,7 @@ def main():
             command_pieces=len(ev["inv"]),
             not_solved=sum(1 for x in ev["inv"] if not x.get("ok", True)),
             max_fit_rad=max([x["err_rad"] for x in ev["inv"]] or [0.0]),
+            rest_defaults=dict(ev["rest_defaults"]),
             error=ev.get("error"))})
     except Exception:  # noqa: BLE001
         send({"t": "error", "msg": traceback.format_exc()[-1500:]})

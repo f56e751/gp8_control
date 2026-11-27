@@ -301,6 +301,8 @@ class PieceRunner(CycleThrowRunner):
             if tp < ts - self.ahead:
                 return
             steps, kinds, desc = self._steps(items, ts + 0.6, exclude=int(arm["id"]))
+            # Nothing next (a policy's skip, or no object): the link waits where
+            # the throw ends; otherwise above the next object / push.
             self._request([{"kind": "throw"}] + steps, kinds, ["throw"] + desc)
             return
         if not items:
